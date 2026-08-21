@@ -4,6 +4,7 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 build_dir="$repo_root/build"
+report_dir="$repo_root/profiles/reports"
 benchmark="${1:-swiglu}"
 ncu_bin="/usr/local/cuda/bin/ncu"
 
@@ -36,11 +37,25 @@ cmake \
 cmake --build "$build_dir" --target "$test_target" "$benchmark_target" -j
 ctest --test-dir "$build_dir" --output-on-failure -R "^${benchmark}$"
 
+mkdir -p "$report_dir"
+report_arguments=()
 for workload in "${workloads[@]}"; do
-    printf '\n%s profile: %s=%s\n' "$benchmark" "$workload_name" "$workload"
+    report="$report_dir/${benchmark}_${workload_name}_${workload}.ncu-rep"
+    printf 'Profiling %s: %s=%s\n' "$benchmark" "$workload_name" "$workload"
     "$ncu_bin" \
         --section LaunchStats \
         --section SpeedOfLight \
+        --section Occupancy \
+        --section MemoryWorkloadAnalysis \
+        --metrics dram__bytes_read.sum,dram__bytes_write.sum \
         --kernel-name "$kernel_pattern" \
-        "$build_dir/$benchmark_target" "$workload"
+        --export "$report" \
+        --force-overwrite \
+        "$build_dir/$benchmark_target" "$workload" \
+        > /dev/null
+    report_arguments+=("${workload_name}=${workload}" "$report")
 done
+
+printf '\nNsight Compute summary: %s\n' "$benchmark"
+python3 "$repo_root/scripts/extract_ncu.py" "$ncu_bin" "${report_arguments[@]}"
+printf '\nReports: %s/%s_%s_*.ncu-rep\n' "$report_dir" "$benchmark" "$workload_name"
