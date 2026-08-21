@@ -13,26 +13,35 @@ endif()
 
 find_package(CUDAToolkit REQUIRED)
 
-add_library(dscuda_rmsnorm STATIC
+add_library(dscuda_kernels STATIC
     kernels/cuda_common.cu
     kernels/rmsnorm.cu
+    kernels/swiglu.cu
     reference/rmsnorm_cpu.cpp
+    reference/swiglu_cpu.cpp
 )
 
-target_include_directories(dscuda_rmsnorm
+target_include_directories(dscuda_kernels
     PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/include
         ${CMAKE_CURRENT_SOURCE_DIR}/reference
 )
 
-target_link_libraries(dscuda_rmsnorm PUBLIC CUDA::cudart)
-set_target_properties(dscuda_rmsnorm PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+target_link_libraries(dscuda_kernels PUBLIC CUDA::cudart)
+set_target_properties(dscuda_kernels PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 
 add_executable(test_rmsnorm tests/test_rmsnorm.cu)
-target_link_libraries(test_rmsnorm PRIVATE dscuda_rmsnorm)
+target_link_libraries(test_rmsnorm PRIVATE dscuda_kernels)
 
 add_executable(benchmark_rmsnorm benchmarks/benchmark_rmsnorm.cu)
-target_link_libraries(benchmark_rmsnorm PRIVATE dscuda_rmsnorm)
+target_link_libraries(benchmark_rmsnorm PRIVATE dscuda_kernels)
+
+add_executable(test_swiglu tests/test_swiglu.cu)
+target_link_libraries(test_swiglu PRIVATE dscuda_kernels)
+
+add_executable(benchmark_swiglu benchmarks/benchmark_swiglu.cu)
+target_link_libraries(benchmark_swiglu PRIVATE dscuda_kernels)
 
 enable_testing()
 add_test(NAME rmsnorm COMMAND test_rmsnorm)
+add_test(NAME swiglu COMMAND test_swiglu)
