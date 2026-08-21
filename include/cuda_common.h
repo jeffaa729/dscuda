@@ -17,20 +17,4 @@ void synchronize(cudaStream_t stream = nullptr);
 cudaDeviceProp device_properties(int device = 0);
 void print_device_summary(int device = 0);
 
-class CudaEventTimer {
-public:
-    CudaEventTimer();
-    ~CudaEventTimer();
-
-    CudaEventTimer(const CudaEventTimer&) = delete;
-    CudaEventTimer& operator=(const CudaEventTimer&) = delete;
-
-    void start(cudaStream_t stream = nullptr);
-    float stop(cudaStream_t stream = nullptr);
-
-private:
-    cudaEvent_t start_event_{};
-    cudaEvent_t stop_event_{};
-};
-
 }  // namespace dscuda
