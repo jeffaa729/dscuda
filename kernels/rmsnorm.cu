@@ -1,5 +1,5 @@
-// Implements RMSNorm by scaling activations with their inverse root-mean-square and a learned per-channel weight.
-// Its backward path computes activation and scale gradients using reduction kernels with FP32 accumulation.
+// Implements vectorized FP32 RMSNorm by scaling activations with their inverse root-mean-square and a learned per-channel weight.
+// Its backward path uses FP32 accumulation; vector access assumes aligned rows and hidden sizes divisible by four.
 
 #include "cuda_common.h"
 #include "rmsnorm.h"
@@ -9,6 +9,8 @@ namespace {
 
 constexpr int kWarpSize = 32;
 constexpr int kBlockSize = 256;
+constexpr int kForwardVectorWidth = 4;
+constexpr int kBackwardVectorWidth = 2;
 
 template <int kWidth = kWarpSize>
 __device__ __forceinline__ float warp_reduce_sum_f32(float value) {
@@ -50,11 +52,16 @@ __global__ void rmsnorm_forward_kernel(
     __shared__ float shared_scale;
     const int row = blockIdx.x;
     const int offset = row * hidden_size;
+    const int vector_size = hidden_size / kForwardVectorWidth;
+    const auto* input_vectors = reinterpret_cast<const float4*>(input + offset);
+    const auto* weight_vectors = reinterpret_cast<const float4*>(weight);
+    auto* output_vectors = reinterpret_cast<float4*>(output + offset);
 
     float local_sum = 0.0F;
-    for (int column = threadIdx.x; column < hidden_size; column += blockDim.x) {
-        const float value = input[offset + column];
-        local_sum += value * value;
+    for (int column = threadIdx.x; column < vector_size; column += blockDim.x) {
+        const float4 value = input_vectors[column];
+        local_sum += value.x * value.x + value.y * value.y +
+                     value.z * value.z + value.w * value.w;
     }
     local_sum = block_reduce_sum_f32(local_sum);
 
@@ -64,8 +71,14 @@ __global__ void rmsnorm_forward_kernel(
     }
     __syncthreads();
 
-    for (int column = threadIdx.x; column < hidden_size; column += blockDim.x) {
-        output[offset + column] = input[offset + column] * shared_scale * weight[column];
+    for (int column = threadIdx.x; column < vector_size; column += blockDim.x) {
+        const float4 value = input_vectors[column];
+        const float4 channel_weight = weight_vectors[column];
+        output_vectors[column] = make_float4(
+            value.x * shared_scale * channel_weight.x,
+            value.y * shared_scale * channel_weight.y,
+            value.z * shared_scale * channel_weight.z,
+            value.w * shared_scale * channel_weight.w);
     }
 }
 
@@ -80,12 +93,21 @@ __global__ void rmsnorm_backward_kernel(
     __shared__ float shared_correction;
     const int row = blockIdx.x;
     const int offset = row * hidden_size;
+    const int vector_size = hidden_size / kBackwardVectorWidth;
     const float scale = inverse_rms[row];
+    const auto* output_gradient_vectors =
+        reinterpret_cast<const float2*>(output_gradient + offset);
+    const auto* input_vectors = reinterpret_cast<const float2*>(input + offset);
+    const auto* weight_vectors = reinterpret_cast<const float2*>(weight);
 
     float local_projection = 0.0F;
-    for (int column = threadIdx.x; column < hidden_size; column += blockDim.x) {
-        const int index = offset + column;
-        local_projection += output_gradient[index] * weight[column] * input[index];
+    for (int column = threadIdx.x; column < vector_size; column += blockDim.x) {
+        const float2 output_gradient_value = output_gradient_vectors[column];
+        const float2 input_value = input_vectors[column];
+        const float2 channel_weight = weight_vectors[column];
+        local_projection +=
+            output_gradient_value.x * channel_weight.x * input_value.x +
+            output_gradient_value.y * channel_weight.y * input_value.y;
     }
     local_projection = block_reduce_sum_f32(local_projection);
 
