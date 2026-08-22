@@ -34,6 +34,19 @@ def read_report(ncu, report):
 
 
 def kernel_name(full_name):
+    matmul = re.search(r"matmul(?:_tensor_core)?_kernel<([^>]*)>", full_name)
+    if matmul:
+        flags = matmul.group(1).replace("(bool)", "").replace(" ", "")
+        names = {
+            "0,0,0": "forward",
+            "false,false,false": "forward",
+            "0,1,1": "left_backward",
+            "false,true,true": "left_backward",
+            "1,0,1": "right_backward",
+            "true,false,true": "right_backward",
+        }
+        return names.get(flags, "matmul")
+
     match = re.search(r"([a-z0-9_]+)_(forward|backward)_kernel", full_name)
     return match.group(2) if match else full_name.split("(", 1)[0]
 
@@ -47,18 +60,26 @@ def value_with_unit(metrics, section, metric):
     return f"{metric_value} {unit}".strip()
 
 
+def duration_us(metrics):
+    metric_value, unit = metrics.get(
+        ("GPU Speed Of Light Throughput", "Duration"), ("0", "us")
+    )
+    factors = {"ns": 0.001, "us": 1.0, "ms": 1000.0, "s": 1_000_000.0}
+    return float(metric_value.replace(",", "")) * factors[unit]
+
+
 def print_performance(rows):
     print("\nPerformance")
     print(
-        f"{'workload':<20} {'kernel':<9} {'time us':>10} {'mem GB/s':>10} "
+        f"{'workload':<20} {'kernel':<14} {'time':>12} {'memory':>14} "
         f"{'DRAM %':>8} {'SM %':>8} {'occupancy %':>12}"
     )
     for workload, kernel in rows:
         metrics = kernel["metrics"]
         print(
-            f"{workload:<20} {kernel['name']:<9} "
-            f"{value(metrics, 'GPU Speed Of Light Throughput', 'Duration'):>10} "
-            f"{value(metrics, 'Memory Workload Analysis', 'Memory Throughput'):>10} "
+            f"{workload:<20} {kernel['name']:<14} "
+            f"{value_with_unit(metrics, 'GPU Speed Of Light Throughput', 'Duration'):>12} "
+            f"{value_with_unit(metrics, 'Memory Workload Analysis', 'Memory Throughput'):>14} "
             f"{value(metrics, 'GPU Speed Of Light Throughput', 'DRAM Throughput'):>8} "
             f"{value(metrics, 'GPU Speed Of Light Throughput', 'Compute (SM) Throughput'):>8} "
             f"{value(metrics, 'Occupancy', 'Achieved Occupancy'):>12}"
@@ -68,20 +89,60 @@ def print_performance(rows):
 def print_memory(rows):
     print("\nMemory behavior")
     print(
-        f"{'workload':<20} {'kernel':<9} {'DRAM read':>13} {'DRAM write':>13} "
-        f"{'L1 hit %':>9} {'L2 hit %':>9} {'regs':>6} {'shared/block':>14} {'spills':>8}"
+        f"{'workload':<20} {'kernel':<14} {'DRAM read':>13} {'DRAM write':>13} "
+        f"{'L1 hit %':>9} {'L2 hit %':>9} {'regs':>6} {'static/block':>14} "
+        f"{'dynamic/block':>14} {'spills':>8}"
     )
     for workload, kernel in rows:
         metrics = kernel["metrics"]
         print(
-            f"{workload:<20} {kernel['name']:<9} "
+            f"{workload:<20} {kernel['name']:<14} "
             f"{value_with_unit(metrics, 'Command line profiler metrics', 'dram__bytes_read.sum'):>13} "
             f"{value_with_unit(metrics, 'Command line profiler metrics', 'dram__bytes_write.sum'):>13} "
             f"{value(metrics, 'Memory Workload Analysis', 'L1/TEX Hit Rate'):>9} "
             f"{value(metrics, 'Memory Workload Analysis', 'L2 Hit Rate'):>9} "
             f"{value(metrics, 'Launch Statistics', 'Registers Per Thread'):>6} "
+            f"{value_with_unit(metrics, 'Launch Statistics', 'Static Shared Memory Per Block'):>14} "
             f"{value_with_unit(metrics, 'Launch Statistics', 'Dynamic Shared Memory Per Block'):>14} "
             f"{value(metrics, 'Memory Workload Analysis', 'Local Memory Spilling Requests'):>8}"
+        )
+
+
+def print_comparison(rows):
+    measurements = {}
+    for workload, kernel in rows:
+        if "/" not in workload:
+            continue
+        shape, backend = workload.rsplit("/", 1)
+        measurements[(shape, kernel["name"], backend)] = duration_us(kernel["metrics"])
+
+    comparisons = []
+    for shape, operation, backend in measurements:
+        if backend != "fp32":
+            continue
+        comparisons.append(
+            (
+                shape,
+                operation,
+                measurements.get((shape, operation, "fp32")),
+                measurements.get((shape, operation, "cublas_fp32")),
+                measurements.get((shape, operation, "bf16")),
+                measurements.get((shape, operation, "cublas_bf16")),
+            )
+        )
+
+    if not comparisons:
+        return
+
+    print("\nMatmul backend comparison")
+    print(
+        f"{'workload':<20} {'kernel':<14} {'CUDA FP32 us':>14} "
+        f"{'cuBLAS FP32 us':>15} {'BF16 Tensor us':>15} {'cuBLAS BF16 us':>15}"
+    )
+    for shape, operation, fp32, cublas_fp32, bf16, cublas_bf16 in comparisons:
+        print(
+            f"{shape:<20} {operation:<14} {fp32:>14.2f} "
+            f"{cublas_fp32:>15.2f} {bf16:>15.2f} {cublas_bf16:>15.2f}"
         )
 
 
@@ -91,10 +152,16 @@ def main():
     for index in range(2, len(sys.argv), 2):
         workload = sys.argv[index]
         report = sys.argv[index + 1]
-        rows.extend((workload, kernel) for kernel in read_report(ncu, report))
+        kernels = read_report(ncu, report)
+        if "/cublas" in workload:
+            operations = ["forward", "left_backward", "right_backward"]
+            for operation, kernel in zip(operations, kernels):
+                kernel["name"] = operation
+        rows.extend((workload, kernel) for kernel in kernels)
 
     print_performance(rows)
     print_memory(rows)
+    print_comparison(rows)
 
 
 if __name__ == "__main__":
