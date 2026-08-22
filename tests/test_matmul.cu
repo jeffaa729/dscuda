@@ -1,5 +1,5 @@
-// Compares aligned FP32 CUDA matrix-multiplication forward and backward results with the scalar CPU reference.
-// The rectangular test shape catches indexing and transpose errors in output, left-gradient, and right-gradient calculations.
+// Compares native FP32 CUDA Core and BF16 Tensor Core matrix multiplication with matching scalar CPU references.
+// A rectangular aligned shape exercises transpose modes, while nonzero FP32 gradients verify accumulation semantics.
 
 #include "cuda_common.h"
 #include "matmul.h"
@@ -45,18 +45,39 @@ bool run_test() {
     std::vector<float> output_gradient(kOutputElements);
 
     for (int index = 0; index < kLeftElements; ++index) {
-        left[index] = static_cast<float>((index * 17) % 101 - 50) / 64.0F;
+        left[index] = static_cast<float>((index * 17) % 101 - 50) / 63.0F;
     }
     for (int index = 0; index < kRightElements; ++index) {
-        right[index] = static_cast<float>((index * 23) % 97 - 48) / 64.0F;
+        right[index] = static_cast<float>((index * 23) % 97 - 48) / 61.0F;
     }
     for (int index = 0; index < kOutputElements; ++index) {
-        output_gradient[index] = static_cast<float>((index * 29) % 89 - 44) / 64.0F;
+        output_gradient[index] = static_cast<float>((index * 29) % 89 - 44) / 59.0F;
+    }
+
+    std::vector<__nv_bfloat16> bf16_left(kLeftElements);
+    std::vector<__nv_bfloat16> bf16_right(kRightElements);
+    std::vector<__nv_bfloat16> bf16_output_gradient(kOutputElements);
+    std::vector<float> quantized_left(kLeftElements);
+    std::vector<float> quantized_right(kRightElements);
+    std::vector<float> quantized_output_gradient(kOutputElements);
+    for (int index = 0; index < kLeftElements; ++index) {
+        bf16_left[index] = __float2bfloat16(left[index]);
+        quantized_left[index] = __bfloat162float(bf16_left[index]);
+    }
+    for (int index = 0; index < kRightElements; ++index) {
+        bf16_right[index] = __float2bfloat16(right[index]);
+        quantized_right[index] = __bfloat162float(bf16_right[index]);
+    }
+    for (int index = 0; index < kOutputElements; ++index) {
+        bf16_output_gradient[index] = __float2bfloat16(output_gradient[index]);
+        quantized_output_gradient[index] = __bfloat162float(bf16_output_gradient[index]);
     }
 
     std::vector<float> cpu_output(kOutputElements);
-    std::vector<float> cpu_left_gradient(kLeftElements, 0.0F);
-    std::vector<float> cpu_right_gradient(kRightElements, 0.0F);
+    std::vector<float> initial_left_gradient(kLeftElements, 0.25F);
+    std::vector<float> initial_right_gradient(kRightElements, -0.125F);
+    std::vector<float> cpu_left_gradient = initial_left_gradient;
+    std::vector<float> cpu_right_gradient = initial_right_gradient;
     dscuda::matmul_forward_cpu(
         cpu_output.data(), left.data(), right.data(), kM, kN, kK);
     dscuda::matmul_backward_cpu(
@@ -65,6 +86,26 @@ bool run_test() {
         output_gradient.data(),
         left.data(),
         right.data(),
+        kM,
+        kN,
+        kK);
+
+    std::vector<float> bf16_cpu_output(kOutputElements);
+    std::vector<float> bf16_cpu_left_gradient = initial_left_gradient;
+    std::vector<float> bf16_cpu_right_gradient = initial_right_gradient;
+    dscuda::matmul_forward_cpu(
+        bf16_cpu_output.data(),
+        quantized_left.data(),
+        quantized_right.data(),
+        kM,
+        kN,
+        kK);
+    dscuda::matmul_backward_cpu(
+        bf16_cpu_left_gradient.data(),
+        bf16_cpu_right_gradient.data(),
+        quantized_output_gradient.data(),
+        quantized_left.data(),
+        quantized_right.data(),
         kM,
         kN,
         kK);
@@ -79,6 +120,12 @@ bool run_test() {
         static_cast<float*>(dscuda::device_malloc(kLeftElements * sizeof(float)));
     auto* gpu_right_gradient =
         static_cast<float*>(dscuda::device_malloc(kRightElements * sizeof(float)));
+    auto* gpu_bf16_left = static_cast<__nv_bfloat16*>(
+        dscuda::device_malloc(kLeftElements * sizeof(__nv_bfloat16)));
+    auto* gpu_bf16_right = static_cast<__nv_bfloat16*>(
+        dscuda::device_malloc(kRightElements * sizeof(__nv_bfloat16)));
+    auto* gpu_bf16_output_gradient = static_cast<__nv_bfloat16*>(
+        dscuda::device_malloc(kOutputElements * sizeof(__nv_bfloat16)));
 
     CUDA_CHECK(cudaMemcpy(
         gpu_left, left.data(), kLeftElements * sizeof(float), cudaMemcpyHostToDevice));
@@ -89,12 +136,35 @@ bool run_test() {
         output_gradient.data(),
         kOutputElements * sizeof(float),
         cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemset(gpu_left_gradient, 0, kLeftElements * sizeof(float)));
-    CUDA_CHECK(cudaMemset(gpu_right_gradient, 0, kRightElements * sizeof(float)));
+    CUDA_CHECK(cudaMemcpy(
+        gpu_bf16_left,
+        bf16_left.data(),
+        kLeftElements * sizeof(__nv_bfloat16),
+        cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(
+        gpu_bf16_right,
+        bf16_right.data(),
+        kRightElements * sizeof(__nv_bfloat16),
+        cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(
+        gpu_bf16_output_gradient,
+        bf16_output_gradient.data(),
+        kOutputElements * sizeof(__nv_bfloat16),
+        cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(
+        gpu_left_gradient,
+        initial_left_gradient.data(),
+        kLeftElements * sizeof(float),
+        cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(
+        gpu_right_gradient,
+        initial_right_gradient.data(),
+        kRightElements * sizeof(float),
+        cudaMemcpyHostToDevice));
 
-    dscuda::matmul_forward_cuda(
+    dscuda::matmul_fp32_forward_cuda(
         gpu_output, gpu_left, gpu_right, kM, kN, kK);
-    dscuda::matmul_backward_cuda(
+    dscuda::matmul_fp32_backward_cuda(
         gpu_left_gradient,
         gpu_right_gradient,
         gpu_output_gradient,
@@ -124,6 +194,52 @@ bool run_test() {
         kRightElements * sizeof(float),
         cudaMemcpyDeviceToHost));
 
+    CUDA_CHECK(cudaMemcpy(
+        gpu_left_gradient,
+        initial_left_gradient.data(),
+        kLeftElements * sizeof(float),
+        cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(
+        gpu_right_gradient,
+        initial_right_gradient.data(),
+        kRightElements * sizeof(float),
+        cudaMemcpyHostToDevice));
+
+    dscuda::matmul_bf16_forward_cuda(
+        gpu_output, gpu_bf16_left, gpu_bf16_right, kM, kN, kK);
+    dscuda::matmul_bf16_backward_cuda(
+        gpu_left_gradient,
+        gpu_right_gradient,
+        gpu_bf16_output_gradient,
+        gpu_bf16_left,
+        gpu_bf16_right,
+        kM,
+        kN,
+        kK);
+    dscuda::synchronize();
+
+    std::vector<float> bf16_output(kOutputElements);
+    std::vector<float> bf16_left_gradient(kLeftElements);
+    std::vector<float> bf16_right_gradient(kRightElements);
+    CUDA_CHECK(cudaMemcpy(
+        bf16_output.data(),
+        gpu_output,
+        kOutputElements * sizeof(float),
+        cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(
+        bf16_left_gradient.data(),
+        gpu_left_gradient,
+        kLeftElements * sizeof(float),
+        cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(
+        bf16_right_gradient.data(),
+        gpu_right_gradient,
+        kRightElements * sizeof(float),
+        cudaMemcpyDeviceToHost));
+
+    dscuda::device_free(gpu_bf16_output_gradient);
+    dscuda::device_free(gpu_bf16_right);
+    dscuda::device_free(gpu_bf16_left);
     dscuda::device_free(gpu_right_gradient);
     dscuda::device_free(gpu_left_gradient);
     dscuda::device_free(gpu_output);
@@ -132,9 +248,12 @@ bool run_test() {
     dscuda::device_free(gpu_left);
 
     bool passed = true;
-    passed &= check("forward output", cpu_output, gpu_output_host, 2.0e-4F);
-    passed &= check("left gradient", cpu_left_gradient, gpu_left_gradient_host, 3.0e-4F);
-    passed &= check("right gradient", cpu_right_gradient, gpu_right_gradient_host, 3.0e-4F);
+    passed &= check("FP32 forward", cpu_output, gpu_output_host, 2.0e-4F);
+    passed &= check("FP32 left grad", cpu_left_gradient, gpu_left_gradient_host, 3.0e-4F);
+    passed &= check("FP32 right grad", cpu_right_gradient, gpu_right_gradient_host, 3.0e-4F);
+    passed &= check("BF16 forward", bf16_cpu_output, bf16_output, 2.0e-4F);
+    passed &= check("BF16 left grad", bf16_cpu_left_gradient, bf16_left_gradient, 3.0e-4F);
+    passed &= check("BF16 right grad", bf16_cpu_right_gradient, bf16_right_gradient, 3.0e-4F);
     return passed;
 }
 

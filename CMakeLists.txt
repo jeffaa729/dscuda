@@ -15,6 +15,7 @@ find_package(CUDAToolkit REQUIRED)
 
 add_library(dscuda_kernels STATIC
     kernels/cuda_common.cu
+    kernels/matmul.cu
     kernels/rmsnorm.cu
     kernels/swiglu.cu
     reference/matmul_cpu.cpp
@@ -45,6 +46,13 @@ target_link_libraries(test_swiglu PRIVATE dscuda_kernels)
 add_executable(benchmark_swiglu benchmarks/benchmark_swiglu.cu)
 target_link_libraries(benchmark_swiglu PRIVATE dscuda_kernels)
 
+add_executable(test_matmul tests/test_matmul.cu)
+target_link_libraries(test_matmul PRIVATE dscuda_kernels)
+
+add_executable(benchmark_matmul benchmarks/benchmark_matmul.cu)
+target_link_libraries(benchmark_matmul PRIVATE dscuda_kernels CUDA::cublas)
+
 enable_testing()
 add_test(NAME rmsnorm COMMAND test_rmsnorm)
 add_test(NAME swiglu COMMAND test_swiglu)
+add_test(NAME matmul COMMAND test_matmul)
