@@ -17,7 +17,10 @@ add_library(dscuda_kernels STATIC
     kernels/cuda_common.cu
     kernels/rmsnorm.cu
     kernels/swiglu.cu
+    reference/matmul_cpu.cpp
     reference/rmsnorm_cpu.cpp
+    reference/rope_cpu.cpp
+    reference/softmax_cpu.cpp
     reference/swiglu_cpu.cpp
 )
 
