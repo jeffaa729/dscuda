@@ -30,8 +30,22 @@ case "$benchmark" in
         workload_name="size"
         workloads=(2048 4096 8192)
         ;;
+    rope)
+        test_target="test_rope"
+        benchmark_target="benchmark_rope"
+        kernel_pattern="regex:rope_.*_kernel"
+        workload_name="sequence"
+        workloads=(512 2048 8192)
+        ;;
+    softmax)
+        test_target="test_softmax"
+        benchmark_target="benchmark_softmax"
+        kernel_pattern="regex:causal_softmax_.*_kernel"
+        workload_name="sequence"
+        workloads=(128 512 1024)
+        ;;
     *)
-        echo "usage: bash scripts/profile.sh {rmsnorm|swiglu|matmul}" >&2
+        echo "usage: bash scripts/profile.sh {rmsnorm|swiglu|matmul|rope|softmax}" >&2
         exit 1
         ;;
 esac
@@ -64,6 +78,11 @@ for workload in "${workloads[@]}"; do
             profile_label="${workload_name}=${workload}"
             benchmark_arguments=("$workload")
             active_kernel_pattern="$kernel_pattern"
+            if [[ "$benchmark" == "rope" ]]; then
+                benchmark_arguments=(4 "$workload" 16 128 64)
+            elif [[ "$benchmark" == "softmax" ]]; then
+                benchmark_arguments=(1 8 "$workload" 0.125)
+            fi
             if [[ "$benchmark" == "matmul" ]]; then
                 benchmark_arguments=(
                     "$workload" "$workload" "$workload" "$backend" "$operation"

@@ -4,6 +4,8 @@
 #include "cuda_common.h"
 #include "rope.h"
 
+#include <cuda_profiler_api.h>
+
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -65,6 +67,7 @@ int main(int argc, char** argv) {
             heads,
             head_size,
             rotary_size);
+        CUDA_CHECK(cudaProfilerStart());
         dscuda::rope_forward_cuda(
             gpu_output,
             gpu_input,
@@ -86,6 +89,7 @@ int main(int argc, char** argv) {
             head_size,
             rotary_size);
         dscuda::synchronize();
+        CUDA_CHECK(cudaProfilerStop());
 
         dscuda::device_free(gpu_sine);
         dscuda::device_free(gpu_cosine);

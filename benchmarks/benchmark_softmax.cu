@@ -4,6 +4,8 @@
 #include "cuda_common.h"
 #include "softmax.h"
 
+#include <cuda_profiler_api.h>
+
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
@@ -45,6 +47,7 @@ int main(int argc, char** argv) {
             heads,
             sequence_length,
             scale);
+        CUDA_CHECK(cudaProfilerStart());
         dscuda::causal_softmax_forward_cuda(
             gpu_probabilities,
             gpu_logits,
@@ -61,6 +64,7 @@ int main(int argc, char** argv) {
             sequence_length,
             scale);
         dscuda::synchronize();
+        CUDA_CHECK(cudaProfilerStop());
 
         dscuda::device_free(gpu_logits_gradient);
         dscuda::device_free(gpu_probabilities_gradient);
