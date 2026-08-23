@@ -17,6 +17,8 @@ add_library(dscuda_kernels STATIC
     kernels/cuda_common.cu
     kernels/matmul.cu
     kernels/rmsnorm.cu
+    kernels/rope.cu
+    kernels/softmax.cu
     kernels/swiglu.cu
     reference/matmul_cpu.cpp
     reference/rmsnorm_cpu.cpp
@@ -52,7 +54,21 @@ target_link_libraries(test_matmul PRIVATE dscuda_kernels)
 add_executable(benchmark_matmul benchmarks/benchmark_matmul.cu)
 target_link_libraries(benchmark_matmul PRIVATE dscuda_kernels CUDA::cublas)
 
+add_executable(test_rope tests/test_rope.cu)
+target_link_libraries(test_rope PRIVATE dscuda_kernels)
+
+add_executable(benchmark_rope benchmarks/benchmark_rope.cu)
+target_link_libraries(benchmark_rope PRIVATE dscuda_kernels)
+
+add_executable(test_softmax tests/test_softmax.cu)
+target_link_libraries(test_softmax PRIVATE dscuda_kernels)
+
+add_executable(benchmark_softmax benchmarks/benchmark_softmax.cu)
+target_link_libraries(benchmark_softmax PRIVATE dscuda_kernels)
+
 enable_testing()
 add_test(NAME rmsnorm COMMAND test_rmsnorm)
 add_test(NAME swiglu COMMAND test_swiglu)
 add_test(NAME matmul COMMAND test_matmul)
+add_test(NAME rope COMMAND test_rope)
+add_test(NAME softmax COMMAND test_softmax)

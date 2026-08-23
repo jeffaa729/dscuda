@@ -15,7 +15,7 @@ namespace {
 
 constexpr int kM = 128;
 constexpr int kN = 256;
-constexpr int kK = 64;
+constexpr int kK = 128;
 constexpr int kLeftElements = kM * kK;
 constexpr int kRightElements = kK * kN;
 constexpr int kOutputElements = kM * kN;

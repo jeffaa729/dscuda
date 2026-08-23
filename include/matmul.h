@@ -27,6 +27,24 @@ void matmul_fp32_backward_cuda(
     int K,
     cudaStream_t stream = nullptr);
 
+void matmul_fp32_left_backward_cuda(
+    float* left_gradient,
+    const float* output_gradient,
+    const float* right,
+    int M,
+    int N,
+    int K,
+    cudaStream_t stream = nullptr);
+
+void matmul_fp32_right_backward_cuda(
+    float* right_gradient,
+    const float* left,
+    const float* output_gradient,
+    int M,
+    int N,
+    int K,
+    cudaStream_t stream = nullptr);
+
 // Multiplies native BF16 operands on Tensor Cores and writes FP32 output; M, N, and K are multiples of 16.
 void matmul_bf16_forward_cuda(
     float* output,
@@ -44,6 +62,24 @@ void matmul_bf16_backward_cuda(
     const __nv_bfloat16* output_gradient,
     const __nv_bfloat16* left,
     const __nv_bfloat16* right,
+    int M,
+    int N,
+    int K,
+    cudaStream_t stream = nullptr);
+
+void matmul_bf16_left_backward_cuda(
+    float* left_gradient,
+    const __nv_bfloat16* output_gradient,
+    const __nv_bfloat16* right,
+    int M,
+    int N,
+    int K,
+    cudaStream_t stream = nullptr);
+
+void matmul_bf16_right_backward_cuda(
+    float* right_gradient,
+    const __nv_bfloat16* left,
+    const __nv_bfloat16* output_gradient,
     int M,
     int N,
     int K,
