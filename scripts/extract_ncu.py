@@ -34,9 +34,15 @@ def read_report(ncu, report):
 
 
 def kernel_name(full_name):
-    matmul = re.search(r"matmul(?:_tensor_core)?_kernel<([^>]*)>", full_name)
+    matmul = re.search(
+        r"matmul(?:_tensor_core(?:_mma|_edge)?)?_kernel<([^>]*)>",
+        full_name,
+    )
     if matmul:
-        flags = matmul.group(1).replace("(bool)", "").replace(" ", "")
+        arguments = (
+            matmul.group(1).replace("(bool)", "").replace(" ", "").split(",")
+        )
+        flags = ",".join(arguments[-3:])
         names = {
             "0,0,0": "forward",
             "false,false,false": "forward",
@@ -137,23 +143,39 @@ def print_comparison(rows):
     print("\nMatmul backend comparison")
     print(
         f"{'workload':<20} {'kernel':<14} {'CUDA FP32 us':>14} "
-        f"{'cuBLAS FP32 us':>15} {'BF16 Tensor us':>15} {'cuBLAS BF16 us':>15}"
+        f"{'cuBLAS FP32 us':>15} {'FP32 %':>8} {'BF16 Tensor us':>15} "
+        f"{'cuBLAS BF16 us':>15} {'BF16 %':>8}"
     )
     for shape, operation, fp32, cublas_fp32, bf16, cublas_bf16 in comparisons:
+        fp32_percent = 100.0 * cublas_fp32 / fp32
+        bf16_percent = 100.0 * cublas_bf16 / bf16
         print(
             f"{shape:<20} {operation:<14} {fp32:>14.2f} "
-            f"{cublas_fp32:>15.2f} {bf16:>15.2f} {cublas_bf16:>15.2f}"
+            f"{cublas_fp32:>15.2f} {fp32_percent:>8.1f} {bf16:>15.2f} "
+            f"{cublas_bf16:>15.2f} {bf16_percent:>8.1f}"
         )
 
 
 def main():
     ncu = sys.argv[1]
     rows = []
-    for index in range(2, len(sys.argv), 2):
+    for index in range(2, len(sys.argv), 3):
         workload = sys.argv[index]
-        report = sys.argv[index + 1]
-        kernels = read_report(ncu, report)
-        if "/cublas" in workload:
+        speed_kernels = read_report(ncu, sys.argv[index + 1])
+        metric_kernels = read_report(ncu, sys.argv[index + 2])
+        if len(speed_kernels) != len(metric_kernels):
+            raise RuntimeError(f"report kernel count mismatch for {workload}")
+        kernels = []
+        for speed_kernel, metric_kernel in zip(speed_kernels, metric_kernels):
+            merged = metric_kernel["metrics"].copy()
+            merged.update(speed_kernel["metrics"])
+            kernels.append({"name": speed_kernel["name"], "metrics": merged})
+        operation = workload.rsplit("/", 1)[-1]
+        if operation in {"forward", "left_backward", "right_backward"}:
+            workload = workload.rsplit("/", 1)[0]
+            for kernel in kernels:
+                kernel["name"] = operation
+        elif "/cublas" in workload:
             operations = ["forward", "left_backward", "right_backward"]
             for operation, kernel in zip(operations, kernels):
                 kernel["name"] = operation
