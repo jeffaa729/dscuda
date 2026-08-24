@@ -106,7 +106,10 @@ __global__ void matmul_kernel(
     int inner_size,
     int left_stride,
     int right_stride,
-    int output_stride) {
+    int output_stride,
+    int left_batch_stride,
+    int right_batch_stride,
+    int output_batch_stride) {
     constexpr int kWarpsPerRow = kBN / kWN;
     constexpr int kNumThreads = (kBM / kWM) * (kBN / kWN) * 32;
     constexpr int kLeftLoads = (kBM * BK / VECTOR_WIDTH) / kNumThreads;
@@ -124,6 +127,10 @@ __global__ void matmul_kernel(
     // shared_right[stage][inner][column].
     __shared__ float shared_left[2 * BK * kBM];
     __shared__ float shared_right[2 * BK * kBN];
+
+    left += blockIdx.z * left_batch_stride;
+    right += blockIdx.z * right_batch_stride;
+    output += blockIdx.z * output_batch_stride;
 
     const int tid = threadIdx.x;
     const int warp_id = tid / 32;
@@ -1077,11 +1084,16 @@ void launch_matmul_config(
     int left_stride,
     int right_stride,
     int output_stride,
-    cudaStream_t stream) {
+    cudaStream_t stream,
+    int batch_count = 1,
+    int left_batch_stride = 0,
+    int right_batch_stride = 0,
+    int output_batch_stride = 0) {
     constexpr int kNumThreads = (kBM / kWM) * (kBN / kWN) * 32;
     const dim3 blocks(
         (output_columns + kBN - 1) / kBN,
-        (output_rows + kBM - 1) / kBM);
+        (output_rows + kBM - 1) / kBM,
+        batch_count);
     matmul_kernel<
         kBM,
         kBN,
@@ -1101,7 +1113,10 @@ void launch_matmul_config(
             inner_size,
             left_stride,
             right_stride,
-            output_stride);
+            output_stride,
+            left_batch_stride,
+            right_batch_stride,
+            output_batch_stride);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -1116,7 +1131,11 @@ void launch_matmul(
     int left_stride,
     int right_stride,
     int output_stride,
-    cudaStream_t stream) {
+    cudaStream_t stream,
+    int batch_count = 1,
+    int left_batch_stride = 0,
+    int right_batch_stride = 0,
+    int output_batch_stride = 0) {
     // A 512x512 GEMM has only sixteen 128x128 blocks, so use the smaller
     // configuration to keep every SM supplied with multiple warps.
     if (output_rows <= 512 && output_columns <= 512) {
@@ -1139,7 +1158,11 @@ void launch_matmul(
             left_stride,
             right_stride,
             output_stride,
-            stream);
+            stream,
+            batch_count,
+            left_batch_stride,
+            right_batch_stride,
+            output_batch_stride);
     } else {
         launch_matmul_config<
             BM,
@@ -1160,7 +1183,11 @@ void launch_matmul(
             left_stride,
             right_stride,
             output_stride,
-            stream);
+            stream,
+            batch_count,
+            left_batch_stride,
+            right_batch_stride,
+            output_batch_stride);
     }
 }
 
@@ -1293,6 +1320,68 @@ void launch_tensor_core_matmul(
 }
 
 }  // namespace
+
+void matmul_fp32_strided_batched_cuda(
+    float* output,
+    const float* left,
+    const float* right,
+    int M,
+    int N,
+    int K,
+    int batch_count,
+    int left_batch_stride,
+    int right_batch_stride,
+    int output_batch_stride,
+    bool transpose_left,
+    bool transpose_right,
+    bool accumulate,
+    cudaStream_t stream) {
+    const int left_stride = transpose_left ? M : K;
+    const int right_stride = transpose_right ? K : N;
+
+#define LAUNCH_FP32_BATCHED(TL, TR, ACC)                                        \
+    launch_matmul<TL, TR, ACC>(                                                \
+        output,                                                               \
+        left,                                                                 \
+        right,                                                                \
+        M,                                                                    \
+        N,                                                                    \
+        K,                                                                    \
+        left_stride,                                                          \
+        right_stride,                                                         \
+        N,                                                                    \
+        stream,                                                               \
+        batch_count,                                                          \
+        left_batch_stride,                                                    \
+        right_batch_stride,                                                   \
+        output_batch_stride)
+
+    if (transpose_left) {
+        if (transpose_right) {
+            if (accumulate) {
+                LAUNCH_FP32_BATCHED(true, true, true);
+            } else {
+                LAUNCH_FP32_BATCHED(true, true, false);
+            }
+        } else if (accumulate) {
+            LAUNCH_FP32_BATCHED(true, false, true);
+        } else {
+            LAUNCH_FP32_BATCHED(true, false, false);
+        }
+    } else if (transpose_right) {
+        if (accumulate) {
+            LAUNCH_FP32_BATCHED(false, true, true);
+        } else {
+            LAUNCH_FP32_BATCHED(false, true, false);
+        }
+    } else if (accumulate) {
+        LAUNCH_FP32_BATCHED(false, false, true);
+    } else {
+        LAUNCH_FP32_BATCHED(false, false, false);
+    }
+
+#undef LAUNCH_FP32_BATCHED
+}
 
 void matmul_fp32_forward_cuda(
     float* output,

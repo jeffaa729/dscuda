@@ -5,6 +5,24 @@
 
 namespace dscuda {
 
+// Computes a strided batch of logical matrix products. Transposed operands are
+// stored as [K, M] for the left matrix or [N, K] for the right matrix.
+void matmul_fp32_strided_batched_cuda(
+    float* output,
+    const float* left,
+    const float* right,
+    int M,
+    int N,
+    int K,
+    int batch_count,
+    int left_batch_stride,
+    int right_batch_stride,
+    int output_batch_stride,
+    bool transpose_left,
+    bool transpose_right,
+    bool accumulate,
+    cudaStream_t stream = nullptr);
+
 // Computes output[M, N] = left[M, K] * right[K, N].
 void matmul_fp32_forward_cuda(
     float* output,

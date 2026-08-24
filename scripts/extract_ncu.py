@@ -44,17 +44,21 @@ def kernel_name(full_name):
         )
         flags = ",".join(arguments[-3:])
         names = {
-            "0,0,0": "forward",
-            "false,false,false": "forward",
-            "0,1,1": "left_backward",
-            "false,true,true": "left_backward",
-            "1,0,1": "right_backward",
-            "true,false,true": "right_backward",
+            "0,0,0": "matmul_fwd",
+            "false,false,false": "matmul_fwd",
+            "0,1,1": "matmul_dinput",
+            "false,true,true": "matmul_dinput",
+            "1,0,1": "matmul_dweight",
+            "true,false,true": "matmul_dweight",
         }
         return names.get(flags, "matmul")
 
     match = re.search(r"([a-z0-9_]+)_(forward|backward)_kernel", full_name)
-    return match.group(2) if match else full_name.split("(", 1)[0]
+    if match:
+        direction = "fwd" if match.group(2) == "forward" else "bwd"
+        return f"{match.group(1)}_{direction}"
+    match = re.search(r"attention_(pack_qkv|unpack_output|pack_backward|unpack_gradients)_kernel", full_name)
+    return f"attention_{match.group(1)}" if match else full_name.split("(", 1)[0]
 
 
 def value(metrics, section, metric):
@@ -72,6 +76,119 @@ def duration_us(metrics):
     )
     factors = {"ns": 0.001, "us": 1.0, "ms": 1000.0, "s": 1_000_000.0}
     return float(metric_value.replace(",", "")) * factors[unit]
+
+
+def bytes_value(metrics, metric):
+    metric_value, unit = metrics.get(
+        ("Command line profiler metrics", metric), ("0", "byte")
+    )
+    factors = {
+        "byte": 1.0,
+        "Kbyte": 1_000.0,
+        "Mbyte": 1_000_000.0,
+        "Gbyte": 1_000_000_000.0,
+    }
+    return float(metric_value.replace(",", "")) * factors.get(unit, 1.0)
+
+
+def print_aggregate(rows):
+    workloads = {}
+    for workload, kernel in rows:
+        workloads.setdefault(workload, []).append(kernel)
+
+    groups = [(workload, kernels) for workload, kernels in workloads.items() if len(kernels) > 1]
+    if not groups:
+        return
+
+    print("\nEnd-to-end kernel totals")
+    print(
+        f"{'workload':<20} {'launches':>9} {'time ms':>12} "
+        f"{'DRAM read MB':>14} {'DRAM write MB':>15} {'effective GB/s':>16}"
+    )
+    for workload, kernels in groups:
+        total_us = sum(duration_us(kernel["metrics"]) for kernel in kernels)
+        read_bytes = sum(
+            bytes_value(kernel["metrics"], "dram__bytes_read.sum")
+            for kernel in kernels
+        )
+        write_bytes = sum(
+            bytes_value(kernel["metrics"], "dram__bytes_write.sum")
+            for kernel in kernels
+        )
+        bandwidth = (read_bytes + write_bytes) / (total_us * 1_000.0)
+        print(
+            f"{workload:<20} {len(kernels):>9} {total_us / 1000.0:>12.3f} "
+            f"{read_bytes / 1_000_000.0:>14.2f} "
+            f"{write_bytes / 1_000_000.0:>15.2f} {bandwidth:>16.2f}"
+        )
+
+
+def numeric_value(metrics, section, metric):
+    metric_value = value(metrics, section, metric)
+    if metric_value == "-":
+        return 0.0
+    return float(metric_value.replace(",", ""))
+
+
+def stage_name(kernel):
+    name = kernel["name"]
+    if name.startswith("matmul"):
+        return "matmul"
+    if name.startswith("rmsnorm"):
+        return "rmsnorm"
+    if name.startswith("rope"):
+        return "rope"
+    if name.startswith("causal_softmax"):
+        return "softmax"
+    if name.startswith("attention"):
+        return "attention_layout"
+    if name.startswith("swiglu"):
+        return "swiglu"
+    if name.startswith("residual"):
+        return "residual"
+    return "other"
+
+
+def print_stage_totals(rows):
+    grouped = {}
+    workload_totals = {}
+    for workload, kernel in rows:
+        grouped.setdefault((workload, stage_name(kernel)), []).append(kernel)
+        workload_totals[workload] = workload_totals.get(workload, 0.0) + duration_us(
+            kernel["metrics"]
+        )
+
+    print("\nStage totals")
+    print(
+        f"{'workload':<20} {'stage':<18} {'launches':>9} {'time us':>11} "
+        f"{'time %':>8} {'DRAM read MB':>13} {'SM %':>8} "
+        f"{'occupancy %':>12} {'L2 hit %':>9}"
+    )
+    for (workload, stage), kernels in grouped.items():
+        durations = [duration_us(kernel["metrics"]) for kernel in kernels]
+        total_us = sum(durations)
+        read_bytes = sum(
+            bytes_value(kernel["metrics"], "dram__bytes_read.sum")
+            for kernel in kernels
+        )
+
+        def weighted(section, metric):
+            return sum(
+                duration * numeric_value(kernel["metrics"], section, metric)
+                for duration, kernel in zip(durations, kernels)
+            ) / total_us
+
+        sm = weighted(
+            "GPU Speed Of Light Throughput", "Compute (SM) Throughput"
+        )
+        occupancy = weighted("Occupancy", "Achieved Occupancy")
+        l2_hit = weighted("Memory Workload Analysis", "L2 Hit Rate")
+        print(
+            f"{workload:<20} {stage:<18} {len(kernels):>9} {total_us:>11.2f} "
+            f"{100.0 * total_us / workload_totals[workload]:>8.1f} "
+            f"{read_bytes / 1_000_000.0:>13.2f} {sm:>8.2f} "
+            f"{occupancy:>12.2f} {l2_hit:>9.2f}"
+        )
 
 
 def print_performance(rows):
@@ -181,8 +298,15 @@ def main():
                 kernel["name"] = operation
         rows.extend((workload, kernel) for kernel in kernels)
 
-    print_performance(rows)
-    print_memory(rows)
+    print_aggregate(rows)
+    workload_counts = {}
+    for workload, _ in rows:
+        workload_counts[workload] = workload_counts.get(workload, 0) + 1
+    if max(workload_counts.values()) > 12:
+        print_stage_totals(rows)
+    else:
+        print_performance(rows)
+        print_memory(rows)
     print_comparison(rows)
 
 
