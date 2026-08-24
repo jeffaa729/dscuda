@@ -12,6 +12,13 @@ if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
 endif()
 
 find_package(CUDAToolkit REQUIRED)
+find_package(Python3 COMPONENTS Interpreter)
+
+add_library(dscuda_data STATIC
+    src/dataset.cpp
+    src/tokenizer.cpp
+)
+target_include_directories(dscuda_data PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
 add_library(dscuda_kernels STATIC
     kernels/adamw.cu
@@ -119,6 +126,12 @@ target_link_libraries(benchmark_cross_entropy PRIVATE dscuda_kernels)
 add_executable(benchmark_global_norm benchmarks/benchmark_global_norm.cu)
 target_link_libraries(benchmark_global_norm PRIVATE dscuda_kernels)
 
+add_executable(test_tokenizer tests/test_tokenizer.cpp)
+target_link_libraries(test_tokenizer PRIVATE dscuda_data)
+
+add_executable(test_dataset tests/test_dataset.cpp)
+target_link_libraries(test_dataset PRIVATE dscuda_data)
+
 enable_testing()
 add_test(NAME rmsnorm COMMAND test_rmsnorm)
 add_test(NAME swiglu COMMAND test_swiglu)
@@ -132,3 +145,11 @@ add_test(NAME embedding COMMAND test_embedding)
 add_test(NAME adamw COMMAND test_adamw)
 add_test(NAME cross_entropy COMMAND test_cross_entropy)
 add_test(NAME global_norm COMMAND test_global_norm)
+add_test(NAME tokenizer_cpp COMMAND test_tokenizer)
+add_test(NAME dataset COMMAND test_dataset)
+if(Python3_Interpreter_FOUND)
+    add_test(
+        NAME tokenizer_python
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_tokenizer.py
+    )
+endif()

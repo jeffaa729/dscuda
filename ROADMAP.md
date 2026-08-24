@@ -8,9 +8,10 @@ The project will first build a complete, trainable DeepSeek-V3-style model and t
 - Complete: vectorized token-embedding lookup and atomic repeated-token gradient accumulation.
 - Complete: vectorized FP32 AdamW with bias correction, decoupled weight decay, and persistent first/second moments.
 - Complete: fused stable vocabulary cross-entropy with log-sum-exp recomputation, plus global gradient norm and clipping.
+- Complete: from-scratch byte-level BPE training, shared Python/C++ tokenizer serialization, TinyStories preparation, and contiguous shifted-token batch loading.
 - Complete: a pre-norm dense block with `RMSNorm -> QKV -> RoPE -> attention -> output projection -> residual -> RMSNorm -> gate/up -> SwiGLU -> down -> residual`.
 - Complete: scalar CPU recomputation, accumulated input and parameter gradients, finite-difference checks, and Nsight Compute workloads at sequence lengths 64, 128, and 256.
-- Next boundary: language-model head and repeated-block model assembly for a trainable dense GPT baseline.
+- Next boundary: language-model head, repeated-block model assembly, and the dense GPT training loop using the prepared TinyStories token streams.
 
 ## Phase 1: Core training runtime
 
