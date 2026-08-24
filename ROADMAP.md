@@ -5,14 +5,15 @@ The project will first build a complete, trainable DeepSeek-V3-style model and t
 ## Current checkpoint: dense transformer block
 
 - Complete: FP32 matmul, RMSNorm, RoPE, causal softmax, composed dense causal attention, SwiGLU, and residual forward/backward operators.
+- Complete: vectorized token-embedding lookup and atomic repeated-token gradient accumulation.
 - Complete: a pre-norm dense block with `RMSNorm -> QKV -> RoPE -> attention -> output projection -> residual -> RMSNorm -> gate/up -> SwiGLU -> down -> residual`.
 - Complete: scalar CPU recomputation, accumulated input and parameter gradients, finite-difference checks, and Nsight Compute workloads at sequence lengths 64, 128, and 256.
-- Next boundary: embedding, language-model head, cross-entropy, optimizer, and repeated-block model assembly for a trainable dense GPT baseline.
+- Next boundary: language-model head, cross-entropy, optimizer, and repeated-block model assembly for a trainable dense GPT baseline.
 
 ## Phase 1: Core training runtime
 
 - Complete the shared tensor, allocator, parameter, checkpoint, and CUDA utility code.
-- Implement embedding lookup and embedding-gradient accumulation.
+- Integrate token embedding with repeated transformer blocks and a tied language-model head.
 - Implement cross-entropy, global gradient norm, gradient clipping, and an AdamW baseline.
 - Assemble a small dense GPT-2-style model as the first end-to-end training check.
 

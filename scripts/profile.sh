@@ -58,8 +58,15 @@ case "$benchmark" in
         workload_name="sequence"
         workloads=(64 128 256)
         ;;
+    embedding)
+        test_target="test_embedding"
+        benchmark_target="benchmark_embedding"
+        kernel_pattern="regex:embedding_.*_kernel"
+        workload_name="tokens"
+        workloads=(512 2048 8192)
+        ;;
     *)
-        echo "usage: bash scripts/profile.sh {rmsnorm|swiglu|matmul|rope|softmax|attention|transformer_block}" >&2
+        echo "usage: bash scripts/profile.sh {rmsnorm|swiglu|matmul|rope|softmax|attention|transformer_block|embedding}" >&2
         exit 1
         ;;
 esac
@@ -100,6 +107,8 @@ for workload in "${workloads[@]}"; do
                 benchmark_arguments=(2 "$workload" 8 64 0.125)
             elif [[ "$benchmark" == "transformer_block" ]]; then
                 benchmark_arguments=(2 "$workload" 512 8 1536)
+            elif [[ "$benchmark" == "embedding" ]]; then
+                benchmark_arguments=("$workload" 1024 32768)
             fi
             if [[ "$benchmark" == "matmul" ]]; then
                 benchmark_arguments=(
