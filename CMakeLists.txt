@@ -14,12 +14,14 @@ endif()
 find_package(CUDAToolkit REQUIRED)
 
 add_library(dscuda_kernels STATIC
+    kernels/attention.cu
     kernels/cuda_common.cu
     kernels/matmul.cu
     kernels/rmsnorm.cu
     kernels/rope.cu
     kernels/softmax.cu
     kernels/swiglu.cu
+    reference/attention_cpu.cpp
     reference/matmul_cpu.cpp
     reference/rmsnorm_cpu.cpp
     reference/rope_cpu.cpp
@@ -66,9 +68,16 @@ target_link_libraries(test_softmax PRIVATE dscuda_kernels)
 add_executable(benchmark_softmax benchmarks/benchmark_softmax.cu)
 target_link_libraries(benchmark_softmax PRIVATE dscuda_kernels)
 
+add_executable(test_attention tests/test_attention.cu)
+target_link_libraries(test_attention PRIVATE dscuda_kernels)
+
+add_executable(benchmark_attention benchmarks/benchmark_attention.cu)
+target_link_libraries(benchmark_attention PRIVATE dscuda_kernels)
+
 enable_testing()
 add_test(NAME rmsnorm COMMAND test_rmsnorm)
 add_test(NAME swiglu COMMAND test_swiglu)
 add_test(NAME matmul COMMAND test_matmul)
 add_test(NAME rope COMMAND test_rope)
 add_test(NAME softmax COMMAND test_softmax)
+add_test(NAME attention COMMAND test_attention)

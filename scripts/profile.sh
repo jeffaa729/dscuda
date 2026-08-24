@@ -44,8 +44,15 @@ case "$benchmark" in
         workload_name="sequence"
         workloads=(128 512 1024)
         ;;
+    attention)
+        test_target="test_attention"
+        benchmark_target="benchmark_attention"
+        kernel_pattern="regex:(attention_.*_kernel|.*matmul_kernel.*|causal_softmax_.*_kernel)"
+        workload_name="sequence"
+        workloads=(128 256 512)
+        ;;
     *)
-        echo "usage: bash scripts/profile.sh {rmsnorm|swiglu|matmul|rope|softmax}" >&2
+        echo "usage: bash scripts/profile.sh {rmsnorm|swiglu|matmul|rope|softmax|attention}" >&2
         exit 1
         ;;
 esac
@@ -82,6 +89,8 @@ for workload in "${workloads[@]}"; do
                 benchmark_arguments=(4 "$workload" 16 128 64)
             elif [[ "$benchmark" == "softmax" ]]; then
                 benchmark_arguments=(1 8 "$workload" 0.125)
+            elif [[ "$benchmark" == "attention" ]]; then
+                benchmark_arguments=(2 "$workload" 8 64 0.125)
             fi
             if [[ "$benchmark" == "matmul" ]]; then
                 benchmark_arguments=(
