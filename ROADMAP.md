@@ -2,11 +2,18 @@
 
 The project will first build a complete, trainable DeepSeek-V3-style model and then add selected DeepSeek-V4 mechanisms. Each operation should have a CPU reference, CUDA forward and backward implementations when training requires them, correctness tests, and an Nsight Compute benchmark where the operation is performance-critical.
 
+## Current checkpoint: dense transformer block
+
+- Complete: FP32 matmul, RMSNorm, RoPE, causal softmax, composed dense causal attention, SwiGLU, and residual forward/backward operators.
+- Complete: a pre-norm dense block with `RMSNorm -> QKV -> RoPE -> attention -> output projection -> residual -> RMSNorm -> gate/up -> SwiGLU -> down -> residual`.
+- Complete: scalar CPU recomputation, accumulated input and parameter gradients, finite-difference checks, and Nsight Compute workloads at sequence lengths 64, 128, and 256.
+- Next boundary: embedding, language-model head, cross-entropy, optimizer, and repeated-block model assembly for a trainable dense GPT baseline.
+
 ## Phase 1: Core training runtime
 
 - Complete the shared tensor, allocator, parameter, checkpoint, and CUDA utility code.
 - Implement embedding lookup and embedding-gradient accumulation.
-- Implement residual addition, cross-entropy, global gradient norm, gradient clipping, and an AdamW baseline.
+- Implement cross-entropy, global gradient norm, gradient clipping, and an AdamW baseline.
 - Assemble a small dense GPT-2-style model as the first end-to-end training check.
 
 ## Phase 2: DeepSeek-V3 path

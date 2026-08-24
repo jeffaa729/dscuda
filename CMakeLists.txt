@@ -18,15 +18,19 @@ add_library(dscuda_kernels STATIC
     kernels/cuda_common.cu
     kernels/matmul.cu
     kernels/rmsnorm.cu
+    kernels/residual.cu
     kernels/rope.cu
     kernels/softmax.cu
     kernels/swiglu.cu
+    kernels/transformer_block.cu
     reference/attention_cpu.cpp
     reference/matmul_cpu.cpp
     reference/rmsnorm_cpu.cpp
+    reference/residual_cpu.cpp
     reference/rope_cpu.cpp
     reference/softmax_cpu.cpp
     reference/swiglu_cpu.cpp
+    reference/transformer_block_cpu.cpp
 )
 
 target_include_directories(dscuda_kernels
@@ -74,6 +78,15 @@ target_link_libraries(test_attention PRIVATE dscuda_kernels)
 add_executable(benchmark_attention benchmarks/benchmark_attention.cu)
 target_link_libraries(benchmark_attention PRIVATE dscuda_kernels)
 
+add_executable(test_residual tests/test_residual.cu)
+target_link_libraries(test_residual PRIVATE dscuda_kernels)
+
+add_executable(test_transformer_block tests/test_transformer_block.cu)
+target_link_libraries(test_transformer_block PRIVATE dscuda_kernels)
+
+add_executable(benchmark_transformer_block benchmarks/benchmark_transformer_block.cu)
+target_link_libraries(benchmark_transformer_block PRIVATE dscuda_kernels)
+
 enable_testing()
 add_test(NAME rmsnorm COMMAND test_rmsnorm)
 add_test(NAME swiglu COMMAND test_swiglu)
@@ -81,3 +94,5 @@ add_test(NAME matmul COMMAND test_matmul)
 add_test(NAME rope COMMAND test_rope)
 add_test(NAME softmax COMMAND test_softmax)
 add_test(NAME attention COMMAND test_attention)
+add_test(NAME residual COMMAND test_residual)
+add_test(NAME transformer_block COMMAND test_transformer_block)

@@ -51,8 +51,15 @@ case "$benchmark" in
         workload_name="sequence"
         workloads=(128 256 512)
         ;;
+    transformer_block)
+        test_target="test_transformer_block"
+        benchmark_target="benchmark_transformer_block"
+        kernel_pattern="regex:(rmsnorm_.*_kernel|rope_.*_kernel|attention_.*_kernel|causal_softmax_.*_kernel|swiglu_.*_kernel|residual_.*_kernel|.*matmul_kernel.*)"
+        workload_name="sequence"
+        workloads=(64 128 256)
+        ;;
     *)
-        echo "usage: bash scripts/profile.sh {rmsnorm|swiglu|matmul|rope|softmax|attention}" >&2
+        echo "usage: bash scripts/profile.sh {rmsnorm|swiglu|matmul|rope|softmax|attention|transformer_block}" >&2
         exit 1
         ;;
 esac
@@ -91,6 +98,8 @@ for workload in "${workloads[@]}"; do
                 benchmark_arguments=(1 8 "$workload" 0.125)
             elif [[ "$benchmark" == "attention" ]]; then
                 benchmark_arguments=(2 "$workload" 8 64 0.125)
+            elif [[ "$benchmark" == "transformer_block" ]]; then
+                benchmark_arguments=(2 "$workload" 512 8 1536)
             fi
             if [[ "$benchmark" == "matmul" ]]; then
                 benchmark_arguments=(
@@ -127,7 +136,7 @@ for workload in "${workloads[@]}"; do
                 > /dev/null
             "$ncu_bin" \
                 --profile-from-start off \
-                --cache-control none \
+                --cache-control all \
                 --section LaunchStats \
                 --section Occupancy \
                 --section MemoryWorkloadAnalysis \
