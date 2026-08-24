@@ -65,8 +65,15 @@ case "$benchmark" in
         workload_name="tokens"
         workloads=(512 2048 8192)
         ;;
+    adamw)
+        test_target="test_adamw"
+        benchmark_target="benchmark_adamw"
+        kernel_pattern="regex:adamw_.*_kernel"
+        workload_name="elements"
+        workloads=(1048576 4194304 16777216)
+        ;;
     *)
-        echo "usage: bash scripts/profile.sh {rmsnorm|swiglu|matmul|rope|softmax|attention|transformer_block|embedding}" >&2
+        echo "usage: bash scripts/profile.sh {rmsnorm|swiglu|matmul|rope|softmax|attention|transformer_block|embedding|adamw}" >&2
         exit 1
         ;;
 esac

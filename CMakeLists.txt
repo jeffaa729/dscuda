@@ -14,6 +14,7 @@ endif()
 find_package(CUDAToolkit REQUIRED)
 
 add_library(dscuda_kernels STATIC
+    kernels/adamw.cu
     kernels/attention.cu
     kernels/cuda_common.cu
     kernels/embedding.cu
@@ -28,6 +29,7 @@ add_library(dscuda_kernels STATIC
     reference/embedding_cpu.cpp
     reference/matmul_cpu.cpp
     reference/rmsnorm_cpu.cpp
+    reference/optimizer_cpu.cpp
     reference/residual_cpu.cpp
     reference/rope_cpu.cpp
     reference/softmax_cpu.cpp
@@ -95,6 +97,12 @@ target_link_libraries(test_embedding PRIVATE dscuda_kernels)
 add_executable(benchmark_embedding benchmarks/benchmark_embedding.cu)
 target_link_libraries(benchmark_embedding PRIVATE dscuda_kernels)
 
+add_executable(test_adamw tests/test_adamw.cu)
+target_link_libraries(test_adamw PRIVATE dscuda_kernels)
+
+add_executable(benchmark_adamw benchmarks/benchmark_adamw.cu)
+target_link_libraries(benchmark_adamw PRIVATE dscuda_kernels)
+
 enable_testing()
 add_test(NAME rmsnorm COMMAND test_rmsnorm)
 add_test(NAME swiglu COMMAND test_swiglu)
@@ -105,3 +113,4 @@ add_test(NAME attention COMMAND test_attention)
 add_test(NAME residual COMMAND test_residual)
 add_test(NAME transformer_block COMMAND test_transformer_block)
 add_test(NAME embedding COMMAND test_embedding)
+add_test(NAME adamw COMMAND test_adamw)
