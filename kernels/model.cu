@@ -342,22 +342,64 @@ void DenseGptModel::load_parameters(const std::vector<float>& parameters) {
     model.forward_ready = false;
 }
 
-float DenseGptModel::forward(
-    const std::vector<int>& input_tokens,
-    const std::vector<int>& target_tokens) {
+ModelTrainingState DenseGptModel::training_state_to_host() const {
+    const Implementation& model = *implementation_;
+    ModelTrainingState state;
+    state.parameters.resize(model.layout.elements);
+    state.first_moment.resize(model.layout.elements);
+    state.second_moment.resize(model.layout.elements);
+    CUDA_CHECK(cudaMemcpy(
+        state.parameters.data(),
+        model.parameters,
+        model.layout.elements * sizeof(float),
+        cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(
+        state.first_moment.data(),
+        model.first_moment,
+        model.layout.elements * sizeof(float),
+        cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(
+        state.second_moment.data(),
+        model.second_moment,
+        model.layout.elements * sizeof(float),
+        cudaMemcpyDeviceToHost));
+    return state;
+}
+
+void DenseGptModel::load_training_state(const ModelTrainingState& state) {
     Implementation& model = *implementation_;
-    if (input_tokens.size() != static_cast<std::size_t>(model.rows)
-        || target_tokens.size() != static_cast<std::size_t>(model.rows)) {
-        throw std::runtime_error("training batch has the wrong number of tokens");
+    if (state.parameters.size() != model.layout.elements
+        || state.first_moment.size() != model.layout.elements
+        || state.second_moment.size() != model.layout.elements) {
+        throw std::runtime_error("checkpoint model state has the wrong size");
+    }
+    CUDA_CHECK(cudaMemcpy(
+        model.parameters,
+        state.parameters.data(),
+        model.layout.elements * sizeof(float),
+        cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(
+        model.first_moment,
+        state.first_moment.data(),
+        model.layout.elements * sizeof(float),
+        cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(
+        model.second_moment,
+        state.second_moment.data(),
+        model.layout.elements * sizeof(float),
+        cudaMemcpyHostToDevice));
+    model.forward_ready = false;
+}
+
+void DenseGptModel::run_model_forward(
+    const std::vector<int>& input_tokens) {
+    Implementation& model = *implementation_;
+    if (input_tokens.size() != static_cast<std::size_t>(model.rows)) {
+        throw std::runtime_error("model input has the wrong number of tokens");
     }
     CUDA_CHECK(cudaMemcpy(
         model.input_tokens,
         input_tokens.data(),
-        model.rows * sizeof(int),
-        cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(
-        model.target_tokens,
-        target_tokens.data(),
         model.rows * sizeof(int),
         cudaMemcpyHostToDevice));
 
@@ -412,6 +454,22 @@ float DenseGptModel::forward(
         false,
         true,
         false);
+    model.forward_ready = false;
+}
+
+float DenseGptModel::forward(
+    const std::vector<int>& input_tokens,
+    const std::vector<int>& target_tokens) {
+    Implementation& model = *implementation_;
+    if (target_tokens.size() != static_cast<std::size_t>(model.rows)) {
+        throw std::runtime_error("training target has the wrong number of tokens");
+    }
+    run_model_forward(input_tokens);
+    CUDA_CHECK(cudaMemcpy(
+        model.target_tokens,
+        target_tokens.data(),
+        model.rows * sizeof(int),
+        cudaMemcpyHostToDevice));
     cross_entropy_forward_cuda(
         model.mean_loss,
         model.logsumexp,
@@ -586,6 +644,37 @@ std::vector<float> DenseGptModel::logits_to_host() const {
     CUDA_CHECK(cudaMemcpy(
         result.data(),
         model.logits,
+        result.size() * sizeof(float),
+        cudaMemcpyDeviceToHost));
+    return result;
+}
+
+int DenseGptModel::vocabulary_size() const {
+    return implementation_->config.vocabulary_size;
+}
+
+int DenseGptModel::maximum_context_length() const {
+    return implementation_->config.sequence_length;
+}
+
+std::vector<float> DenseGptModel::forward_last_logits(
+    const std::vector<int>& tokens) {
+    Implementation& model = *implementation_;
+    if (model.config.batch_size != 1 || tokens.empty()
+        || tokens.size() > static_cast<std::size_t>(model.config.sequence_length)) {
+        throw std::runtime_error(
+            "generation requires B=1 and a non-empty context within T");
+    }
+    std::vector<int> padded(model.config.sequence_length, 0);
+    std::copy(tokens.begin(), tokens.end(), padded.begin());
+    run_model_forward(padded);
+
+    std::vector<float> result(model.config.vocabulary_size);
+    const std::size_t offset =
+        (tokens.size() - 1) * model.config.vocabulary_size;
+    CUDA_CHECK(cudaMemcpy(
+        result.data(),
+        model.logits + offset,
         result.size() * sizeof(float),
         cudaMemcpyDeviceToHost));
     return result;

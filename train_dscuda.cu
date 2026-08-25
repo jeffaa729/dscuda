@@ -2,15 +2,16 @@
 // The executable reports loss, gradient norm, throughput, parameter count, and allocated model memory while reusing the same model path for both modes.
 
 #include "cuda_common.h"
+#include "checkpoint.h"
 #include "dataset.h"
 #include "model.h"
 #include "tokenizer.h"
 
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <exception>
-#include <random>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -20,6 +21,8 @@ namespace {
 struct Options {
     std::string mode = "overfit";
     std::string data_directory = "data/tinystories";
+    std::string output_directory = "checkpoints/tinystories";
+    std::string resume_checkpoint;
     int steps = 0;
     int batch_size = 0;
     int sequence_length = 0;
@@ -30,7 +33,9 @@ struct Options {
     int rotary_size = 0;
     float learning_rate = 0.0F;
     float maximum_gradient_norm = 1.0F;
+    float peak_tflops = 14.56F;
     int log_interval = 10;
+    int checkpoint_interval = 100;
     unsigned int seed = 1337;
 };
 
@@ -57,6 +62,10 @@ Options parse_options(int argc, char** argv) {
             options.mode = value();
         } else if (argument == "--data-dir") {
             options.data_directory = value();
+        } else if (argument == "--output-dir") {
+            options.output_directory = value();
+        } else if (argument == "--resume") {
+            options.resume_checkpoint = value();
         } else if (argument == "--steps") {
             options.steps = parse_int(value());
         } else if (argument == "--batch") {
@@ -77,18 +86,24 @@ Options parse_options(int argc, char** argv) {
             options.learning_rate = parse_float(value());
         } else if (argument == "--max-grad-norm") {
             options.maximum_gradient_norm = parse_float(value());
+        } else if (argument == "--peak-tflops") {
+            options.peak_tflops = parse_float(value());
         } else if (argument == "--log-every") {
             options.log_interval = parse_int(value());
+        } else if (argument == "--checkpoint-every") {
+            options.checkpoint_interval = parse_int(value());
         } else if (argument == "--seed") {
             options.seed = static_cast<unsigned int>(parse_int(value()));
         } else if (argument == "--help") {
             std::printf(
                 "Usage: train_dscuda [options]\n"
                 "  --mode overfit|tinystories\n"
-                "  --data-dir PATH\n"
+                "  --data-dir PATH --output-dir PATH --resume PATH\n"
                 "  --steps N --batch N --seq N --layers N\n"
                 "  --hidden N --heads N --ffn N --rotary N\n"
-                "  --lr VALUE --max-grad-norm VALUE --log-every N --seed N\n");
+                "  --lr VALUE --max-grad-norm VALUE --peak-tflops VALUE\n"
+                "  --log-every N\n"
+                "  --checkpoint-every N --seed N\n");
             std::exit(0);
         } else {
             throw std::runtime_error("unknown option: " + argument);
@@ -98,6 +113,21 @@ Options parse_options(int argc, char** argv) {
         throw std::runtime_error("--mode must be overfit or tinystories");
     }
     return options;
+}
+
+std::uint64_t splitmix64(std::uint64_t value) {
+    value += 0x9e3779b97f4a7c15ULL;
+    value = (value ^ (value >> 30U)) * 0xbf58476d1ce4e5b9ULL;
+    value = (value ^ (value >> 27U)) * 0x94d049bb133111ebULL;
+    return value ^ (value >> 31U);
+}
+
+std::size_t training_sample_start(
+    std::uint64_t seed,
+    std::uint64_t step,
+    std::size_t possible_starts) {
+    return static_cast<std::size_t>(
+        splitmix64(seed + step) % possible_starts);
 }
 
 int use_default(int value, int fallback) {
@@ -125,9 +155,19 @@ dscuda::ModelConfig make_config(
     };
 }
 
-void print_model_summary(
+double training_flops_per_token(
     const dscuda::ModelConfig& config,
     const dscuda::ModelMemoryReport& memory) {
+    return 6.0 * static_cast<double>(memory.parameter_elements)
+        + 12.0 * config.layers * config.heads
+            * (config.hidden_size / config.heads)
+            * config.sequence_length;
+}
+
+void print_model_summary(
+    const dscuda::ModelConfig& config,
+    const dscuda::ModelMemoryReport& memory,
+    double peak_tflops) {
     std::printf(
         "Model: L=%d H=%d heads=%d FFN=%d, B=%d T=%d V=%d\n",
         config.layers,
@@ -141,6 +181,32 @@ void print_model_summary(
         "Parameters: %.3f M, allocated model memory: %.1f MiB\n",
         static_cast<double>(memory.parameter_elements) / 1.0e6,
         static_cast<double>(memory.total_bytes) / (1024.0 * 1024.0));
+
+    std::printf(
+        "Model FLOPs/token: %.2f MFLOPs, peak used for MFU: %.2f TFLOP/s\n",
+        training_flops_per_token(config, memory) / 1.0e6,
+        peak_tflops);
+}
+
+struct TrainingPerformance {
+    double tokens_per_second;
+    double achieved_tflops;
+    double mfu_percent;
+};
+
+TrainingPerformance training_performance(
+    std::uint64_t tokens,
+    double seconds,
+    double flops_per_token,
+    double peak_tflops) {
+    const double tokens_per_second = tokens / seconds;
+    const double achieved_tflops =
+        flops_per_token * tokens_per_second / 1.0e12;
+    return {
+        tokens_per_second,
+        achieved_tflops,
+        100.0 * achieved_tflops / peak_tflops,
+    };
 }
 
 int run_overfit(const Options& options) {
@@ -159,32 +225,48 @@ int run_overfit(const Options& options) {
 
     dscuda::DenseGptModel model(config);
     model.initialize(options.seed);
-    print_model_summary(config, model.memory_report());
+    const dscuda::ModelMemoryReport memory = model.memory_report();
+    const double flops_per_token =
+        training_flops_per_token(config, memory);
+    print_model_summary(config, memory, options.peak_tflops);
     const dscuda::AdamWConfig optimizer{
         learning_rate, 0.9F, 0.95F, 1.0e-8F, 0.0F};
 
     float initial_loss = 0.0F;
-    const auto start = std::chrono::steady_clock::now();
+    double training_seconds = 0.0;
+    std::uint64_t training_tokens = 0;
     for (int step = 1; step <= steps; ++step) {
+        const auto step_start = std::chrono::steady_clock::now();
         const dscuda::TrainStepResult result = model.train_step(
             inputs,
             targets,
             step,
             optimizer,
             options.maximum_gradient_norm);
+        training_seconds += std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - step_start).count();
+        training_tokens += rows;
         if (step == 1) {
             initial_loss = result.loss;
         }
         if (step == 1 || step % options.log_interval == 0 || step == steps) {
-            const double seconds = std::chrono::duration<double>(
-                std::chrono::steady_clock::now() - start).count();
+            const TrainingPerformance performance = training_performance(
+                training_tokens,
+                training_seconds,
+                flops_per_token,
+                options.peak_tflops);
             std::printf(
-                "step %4d/%d  loss %.6f  grad %.4f  %.0f tokens/s\n",
+                "step %4d/%d  loss %.6f  grad %.4f  %.0f tokens/s  "
+                "%.3f TFLOP/s  %.1f%% MFU\n",
                 step,
                 steps,
                 result.loss,
                 result.gradient_norm,
-                static_cast<double>(step) * rows / seconds);
+                performance.tokens_per_second,
+                performance.achieved_tflops,
+                performance.mfu_percent);
+            training_seconds = 0.0;
+            training_tokens = 0;
         }
     }
     const float final_loss = model.forward(inputs, targets);
@@ -205,8 +287,19 @@ int run_tinystories(const Options& options) {
     const dscuda::Tokenizer tokenizer(tokenizer_path);
     const dscuda::TokenDataset train(train_path);
     const dscuda::TokenDataset validation(validation_path);
-    const dscuda::ModelConfig config =
+    std::uint64_t completed_steps = 0;
+    dscuda::ModelConfig config =
         make_config(options, tokenizer.vocabulary_size());
+    if (!options.resume_checkpoint.empty()) {
+        const dscuda::CheckpointMetadata metadata =
+            dscuda::read_checkpoint_metadata(options.resume_checkpoint);
+        config = metadata.config;
+        completed_steps = metadata.step;
+        if (config.vocabulary_size != tokenizer.vocabulary_size()) {
+            throw std::runtime_error(
+                "checkpoint vocabulary does not match tokenizer");
+        }
+    }
     const int steps = use_default(options.steps, 1000);
     const float learning_rate = use_default(options.learning_rate, 3.0e-4F);
     const std::size_t rows =
@@ -216,8 +309,19 @@ int run_tinystories(const Options& options) {
     }
 
     dscuda::DenseGptModel model(config);
-    model.initialize(options.seed);
-    print_model_summary(config, model.memory_report());
+    if (options.resume_checkpoint.empty()) {
+        model.initialize(options.seed);
+    } else {
+        dscuda::load_dense_gpt_checkpoint(options.resume_checkpoint, model);
+        std::printf(
+            "Resumed checkpoint %s at step %llu\n",
+            options.resume_checkpoint.c_str(),
+            static_cast<unsigned long long>(completed_steps));
+    }
+    const dscuda::ModelMemoryReport memory = model.memory_report();
+    const double flops_per_token =
+        training_flops_per_token(config, memory);
+    print_model_summary(config, memory, options.peak_tflops);
     std::printf(
         "Dataset: %zu training tokens, %zu validation tokens\n",
         train.token_count(),
@@ -225,9 +329,6 @@ int run_tinystories(const Options& options) {
     const dscuda::AdamWConfig optimizer{
         learning_rate, 0.9F, 0.95F, 1.0e-8F, 0.1F};
 
-    std::mt19937_64 generator(options.seed);
-    std::uniform_int_distribution<std::size_t> sample_start(
-        0, train.token_count() - rows - 1);
     std::vector<int> inputs;
     std::vector<int> targets;
     std::vector<int> validation_inputs;
@@ -239,35 +340,68 @@ int run_tinystories(const Options& options) {
         validation_inputs,
         validation_targets);
 
-    const auto start = std::chrono::steady_clock::now();
-    for (int step = 1; step <= steps; ++step) {
+    double training_seconds = 0.0;
+    std::uint64_t training_tokens = 0;
+    for (std::uint64_t step = completed_steps + 1;
+         step <= static_cast<std::uint64_t>(steps);
+         ++step) {
         train.get_batch(
-            sample_start(generator),
+            training_sample_start(
+                options.seed,
+                step,
+                train.token_count() - rows),
             config.batch_size,
             config.sequence_length,
             inputs,
             targets);
+        const auto step_start = std::chrono::steady_clock::now();
         const dscuda::TrainStepResult result = model.train_step(
             inputs,
             targets,
-            step,
+            static_cast<int>(step),
             optimizer,
             options.maximum_gradient_norm);
+        training_seconds += std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - step_start).count();
+        training_tokens += rows;
 
-        if (step == 1 || step % options.log_interval == 0 || step == steps) {
+        if (step == completed_steps + 1
+            || step % static_cast<std::uint64_t>(options.log_interval) == 0
+            || step == static_cast<std::uint64_t>(steps)) {
             const float validation_loss =
                 model.forward(validation_inputs, validation_targets);
-            const double seconds = std::chrono::duration<double>(
-                std::chrono::steady_clock::now() - start).count();
+            const TrainingPerformance performance = training_performance(
+                training_tokens,
+                training_seconds,
+                flops_per_token,
+                options.peak_tflops);
             std::printf(
                 "step %5d/%d  train %.5f  val %.5f  grad %.3f  "
-                "%.0f tokens/s\n",
-                step,
+                "%.0f tokens/s  %.3f TFLOP/s  %.1f%% MFU\n",
+                static_cast<int>(step),
                 steps,
                 result.loss,
                 validation_loss,
                 result.gradient_norm,
-                static_cast<double>(step) * rows / seconds);
+                performance.tokens_per_second,
+                performance.achieved_tflops,
+                performance.mfu_percent);
+            training_seconds = 0.0;
+            training_tokens = 0;
+        }
+
+        if (options.checkpoint_interval > 0
+            && (step % static_cast<std::uint64_t>(
+                    options.checkpoint_interval) == 0
+                || step == static_cast<std::uint64_t>(steps))) {
+            const std::string checkpoint_directory =
+                dscuda::checkpoint_step_directory(
+                    options.output_directory, step);
+            dscuda::save_dense_gpt_checkpoint(
+                checkpoint_directory, model, step);
+            std::printf(
+                "Saved checkpoint: %s\n",
+                checkpoint_directory.c_str());
         }
     }
     return 0;

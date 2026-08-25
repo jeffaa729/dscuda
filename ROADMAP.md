@@ -1,10 +1,10 @@
 # dscuda Roadmap
 ## Phase 1: Core training runtime
 
-- Complete the shared tensor, allocator, parameter, checkpoint, and CUDA utility code.
-- Integrate token embedding with repeated transformer blocks and a tied language-model head.
-- Integrate cross-entropy, global gradient clipping, and AdamW into the training loop.
-- Assemble a small dense GPT-2-style model as the first end-to-end training check.
+- [x] Complete the shared tensor, allocator, parameter, checkpoint, and CUDA utility code.
+- [x] Integrate token embedding with repeated transformer blocks and a tied language-model head.
+- [x] Integrate cross-entropy, global gradient clipping, and AdamW into the training loop.
+- [x] Assemble, train, checkpoint, resume, and sample from a small dense GPT-2-style model.
 
 ## Phase 2: DeepSeek-V3 path
 

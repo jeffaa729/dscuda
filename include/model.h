@@ -1,5 +1,6 @@
 #pragma once
 
+#include "generation.h"
 #include "optimizer.h"
 #include "transformer_block.h"
 
@@ -53,6 +54,12 @@ struct TrainStepResult {
     float gradient_norm;
 };
 
+struct ModelTrainingState {
+    std::vector<float> parameters;
+    std::vector<float> first_moment;
+    std::vector<float> second_moment;
+};
+
 ModelParameterLayout make_model_parameter_layout(const ModelConfig& config);
 
 TransformerBlockParameters model_block_parameters(
@@ -67,7 +74,7 @@ TransformerBlockGradients model_block_gradients(
 
 // Owns all persistent FP32 parameters, optimizer state, saved activations, and
 // reusable backward workspace for a dense pre-norm causal language model.
-class DenseGptModel {
+class DenseGptModel : public AutoregressiveModel {
 public:
     explicit DenseGptModel(const ModelConfig& config);
     ~DenseGptModel();
@@ -77,6 +84,8 @@ public:
 
     void initialize(std::uint64_t seed = 1337);
     void load_parameters(const std::vector<float>& parameters);
+    ModelTrainingState training_state_to_host() const;
+    void load_training_state(const ModelTrainingState& state);
 
     float forward(
         const std::vector<int>& input_tokens,
@@ -94,11 +103,18 @@ public:
     std::vector<float> gradients_to_host() const;
     std::vector<float> logits_to_host() const;
 
+    int vocabulary_size() const override;
+    int maximum_context_length() const override;
+    std::vector<float> forward_last_logits(
+        const std::vector<int>& tokens) override;
+
     const ModelConfig& config() const;
     const ModelParameterLayout& parameter_layout() const;
     ModelMemoryReport memory_report() const;
 
 private:
+    void run_model_forward(const std::vector<int>& input_tokens);
+
     struct Implementation;
     std::unique_ptr<Implementation> implementation_;
 };

@@ -47,17 +47,68 @@ loss is below `0.10` and less than five percent of its initial value.
     --log-every 5
 ```
 
-## Default initial model
+## Train the default model and save checkpoints
 
 ```bash
 ./build/train_dscuda \
     --mode tinystories \
     --data-dir data/tinystories \
-    --steps 1000 \
-    --log-every 10
+    --steps 3000 \
+    --log-every 100 \
+    --checkpoint-every 1000 \
+    --output-dir checkpoints/tinystories
 ```
 
 The default TinyStories configuration is `L=4`, `H=256`, four heads,
 `FFN=768`, `B=4`, and `T=256`, which is approximately 4.46 million parameters.
 Use the command-line shape options to scale only after the fixed-batch test
 continues to pass.
+
+Each log line reports training-only tokens/s, achieved TFLOP/s, and estimated
+model FLOPs utilization (MFU). The default `--peak-tflops 14.56` is the nominal
+FP32 peak used for the RTX 4060 Laptop GPU; pass the appropriate FP32 or BF16
+Tensor Core peak when running a different GPU or precision. FLOPs/token uses
+the dense Transformer estimate `6N + 12LHQT` and intentionally excludes
+elementwise and optimizer operations.
+
+Each `step_XXXXXXXX` checkpoint contains a versioned architecture header,
+parameters, both AdamW moment buffers, the completed step, and a `DONE` marker.
+The marker is written last, so an interrupted `.part` file is never treated as
+a resumable checkpoint.
+
+## Resume training
+
+`--steps` is the final global step, not the number of additional steps:
+
+```bash
+./build/train_dscuda \
+    --mode tinystories \
+    --data-dir data/tinystories \
+    --resume checkpoints/tinystories/step_00003000 \
+    --steps 6000 \
+    --log-every 100 \
+    --checkpoint-every 1000 \
+    --output-dir checkpoints/tinystories
+```
+
+Training windows are derived from the seed and global step. Resuming with the
+same seed therefore continues the data order without serializing a C++ random
+engine implementation.
+
+## Generate text
+
+```bash
+./build/generate_dscuda \
+    --checkpoint checkpoints/tinystories/step_00003000 \
+    --tokenizer data/tinystories/tokenizer.bin \
+    --prompt "Once upon a time" \
+    --tokens 100 \
+    --temperature 0.75 \
+    --top-k 30 \
+    --seed 1337
+```
+
+The sampler supports greedy decoding with `--temperature 0`, or stable
+temperature plus top-k multinomial sampling. This first correctness-oriented
+generator recomputes the prefix for every token and stops at the model context
+length (`T=256` by default); a KV cache is a later performance optimization.
