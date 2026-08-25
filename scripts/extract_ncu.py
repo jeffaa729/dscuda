@@ -58,7 +58,10 @@ def kernel_name(full_name):
         direction = "fwd" if match.group(2) == "forward" else "bwd"
         return f"{match.group(1)}_{direction}"
     match = re.search(r"attention_(pack_qkv|unpack_output|pack_backward|unpack_gradients)_kernel", full_name)
-    return f"attention_{match.group(1)}" if match else full_name.split("(", 1)[0]
+    if match:
+        return f"attention_{match.group(1)}"
+    match = re.search(r"([a-z0-9_]+)_kernel", full_name)
+    return match.group(1) if match else full_name.split("(", 1)[0]
 
 
 def value(metrics, section, metric):

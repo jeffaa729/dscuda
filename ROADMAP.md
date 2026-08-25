@@ -1,20 +1,10 @@
 # dscuda Roadmap
-
-The project will first build a complete, trainable DeepSeek-V3-style model and then add selected DeepSeek-V4 mechanisms. Each operation should have a CPU reference, CUDA forward and backward implementations when training requires them, correctness tests, and an Nsight Compute benchmark where the operation is performance-critical.
-
-## Current checkpoint: dense transformer block
-
-- Complete: FP32 matmul, RMSNorm, RoPE, causal softmax, composed dense causal attention, SwiGLU, and residual forward/backward operators.
-- Complete: a pre-norm dense block with `RMSNorm -> QKV -> RoPE -> attention -> output projection -> residual -> RMSNorm -> gate/up -> SwiGLU -> down -> residual`.
-- Complete: scalar CPU recomputation, accumulated input and parameter gradients, finite-difference checks, and Nsight Compute workloads at sequence lengths 64, 128, and 256.
-- Next boundary: embedding, language-model head, cross-entropy, optimizer, and repeated-block model assembly for a trainable dense GPT baseline.
-
 ## Phase 1: Core training runtime
 
-- Complete the shared tensor, allocator, parameter, checkpoint, and CUDA utility code.
-- Implement embedding lookup and embedding-gradient accumulation.
-- Implement cross-entropy, global gradient norm, gradient clipping, and an AdamW baseline.
-- Assemble a small dense GPT-2-style model as the first end-to-end training check.
+- [x] Complete the shared tensor, allocator, parameter, checkpoint, and CUDA utility code.
+- [x] Integrate token embedding with repeated transformer blocks and a tied language-model head.
+- [x] Integrate cross-entropy, global gradient clipping, and AdamW into the training loop.
+- [x] Assemble, train, checkpoint, resume, and sample from a small dense GPT-2-style model.
 
 ## Phase 2: DeepSeek-V3 path
 
@@ -57,19 +47,6 @@ The project will first build a complete, trainable DeepSeek-V3-style model and t
 - Add the small sequence-wise expert-balance loss.
 - Add token-ID hash routing for the initial MoE blocks as a separate routing mode.
 
-## Phase 4: Systems extensions
-
-- Add deterministic sparse-attention backward using separate partial-gradient buffers followed by a fixed-order reduction.
-- Add multi-GPU expert parallelism, then overlap dispatch, expert GEMM, and combine in waves.
-- Add context parallelism only after single-GPU compressed attention is correct and benchmarked.
-- Treat activation checkpointing, heterogeneous KV-cache management, and on-disk KV cache as optional stretch work.
-
-## Explicitly out of scope
-
-- FP4 kernels and FP4 quantization-aware training.
-- Reproducing trillion-parameter training scale.
-- Implementing every production serving optimization in FlashMLA or DeepSeek's distributed infrastructure.
-
 ## Final demonstration
 
 Train a small GPT baseline, a DeepSeek-V3-style MLA plus MoE model, and a V4-style hybrid-compressed-attention variant on the same dataset. Report correctness, validation loss, tokens per second, peak training memory, KV-cache bytes per token, and attention FLOPs as context length grows; the V4 demonstration should emphasize exact compression and scaling properties rather than claiming frontier-model quality at small scale.
@@ -79,9 +56,3 @@ Train a small GPT baseline, a DeepSeek-V3-style MLA plus MoE model, and a V4-sty
 - DeepSeek-V3 Technical Report: https://arxiv.org/abs/2412.19437
 - DeepSeek-V4 Technical Report: https://arxiv.org/abs/2606.19348
 - FlashMLA: https://github.com/deepseek-ai/FlashMLA
-
-## Attention implementation references
-
-- Use LeetCUDA's split-Q FlashAttention-2 kernel as the primary SM89 implementation reference for `cp.async`, `ldmatrix`, MMA tiling, and online softmax.
-- Also study `C:\Users\Jeff\Downloads\flash_attn.cu` for its BF16 causal mask, grouped-query head mapping, `[B, S, H, D]` layout, lazy online-softmax rescaling, and predicated output writeback.
-- Do not directly port that second kernel to the current RTX 4060 target: its TMA bulk copies and `mbarrier` synchronization require Hopper-class SM90 hardware. It is forward-only, fixes the head dimension to 128, assumes equal QK/V dimensions, and does not save log-sum-exp for backward.

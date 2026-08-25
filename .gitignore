@@ -1,3 +1,7 @@
 build/
 build-*/
 profiles/reports/
+data/
+checkpoints/
+__pycache__/
+*.pyc

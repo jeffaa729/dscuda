@@ -12,11 +12,25 @@ if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
 endif()
 
 find_package(CUDAToolkit REQUIRED)
+find_package(Python3 COMPONENTS Interpreter)
+
+add_library(dscuda_data STATIC
+    src/dataset.cpp
+    src/tokenizer.cpp
+)
+target_include_directories(dscuda_data PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
 add_library(dscuda_kernels STATIC
+    src/checkpoint.cpp
+    src/generation.cpp
+    kernels/adamw.cu
     kernels/attention.cu
+    kernels/cross_entropy.cu
     kernels/cuda_common.cu
+    kernels/embedding.cu
+    kernels/global_norm.cu
     kernels/matmul.cu
+    kernels/model.cu
     kernels/rmsnorm.cu
     kernels/residual.cu
     kernels/rope.cu
@@ -24,8 +38,13 @@ add_library(dscuda_kernels STATIC
     kernels/swiglu.cu
     kernels/transformer_block.cu
     reference/attention_cpu.cpp
+    reference/cross_entropy_cpu.cpp
+    reference/embedding_cpu.cpp
+    reference/global_norm_cpu.cpp
     reference/matmul_cpu.cpp
+    reference/model_cpu.cpp
     reference/rmsnorm_cpu.cpp
+    reference/optimizer_cpu.cpp
     reference/residual_cpu.cpp
     reference/rope_cpu.cpp
     reference/softmax_cpu.cpp
@@ -87,6 +106,51 @@ target_link_libraries(test_transformer_block PRIVATE dscuda_kernels)
 add_executable(benchmark_transformer_block benchmarks/benchmark_transformer_block.cu)
 target_link_libraries(benchmark_transformer_block PRIVATE dscuda_kernels)
 
+add_executable(test_embedding tests/test_embedding.cu)
+target_link_libraries(test_embedding PRIVATE dscuda_kernels)
+
+add_executable(benchmark_embedding benchmarks/benchmark_embedding.cu)
+target_link_libraries(benchmark_embedding PRIVATE dscuda_kernels)
+
+add_executable(test_adamw tests/test_adamw.cu)
+target_link_libraries(test_adamw PRIVATE dscuda_kernels)
+
+add_executable(benchmark_adamw benchmarks/benchmark_adamw.cu)
+target_link_libraries(benchmark_adamw PRIVATE dscuda_kernels)
+
+add_executable(test_cross_entropy tests/test_cross_entropy.cu)
+target_link_libraries(test_cross_entropy PRIVATE dscuda_kernels)
+
+add_executable(test_global_norm tests/test_global_norm.cu)
+target_link_libraries(test_global_norm PRIVATE dscuda_kernels)
+
+add_executable(benchmark_cross_entropy benchmarks/benchmark_cross_entropy.cu)
+target_link_libraries(benchmark_cross_entropy PRIVATE dscuda_kernels)
+
+add_executable(benchmark_global_norm benchmarks/benchmark_global_norm.cu)
+target_link_libraries(benchmark_global_norm PRIVATE dscuda_kernels)
+
+add_executable(test_tokenizer tests/test_tokenizer.cpp)
+target_link_libraries(test_tokenizer PRIVATE dscuda_data)
+
+add_executable(test_dataset tests/test_dataset.cpp)
+target_link_libraries(test_dataset PRIVATE dscuda_data)
+
+add_executable(test_model tests/test_model.cu)
+target_link_libraries(test_model PRIVATE dscuda_kernels)
+
+add_executable(train_dscuda train_dscuda.cu)
+target_link_libraries(train_dscuda PRIVATE dscuda_kernels dscuda_data)
+
+add_executable(generate_dscuda generate_dscuda.cu)
+target_link_libraries(generate_dscuda PRIVATE dscuda_kernels dscuda_data)
+
+add_executable(test_checkpoint tests/test_checkpoint.cu)
+target_link_libraries(test_checkpoint PRIVATE dscuda_kernels)
+
+add_executable(test_generation tests/test_generation.cpp)
+target_link_libraries(test_generation PRIVATE dscuda_kernels)
+
 enable_testing()
 add_test(NAME rmsnorm COMMAND test_rmsnorm)
 add_test(NAME swiglu COMMAND test_swiglu)
@@ -96,3 +160,18 @@ add_test(NAME softmax COMMAND test_softmax)
 add_test(NAME attention COMMAND test_attention)
 add_test(NAME residual COMMAND test_residual)
 add_test(NAME transformer_block COMMAND test_transformer_block)
+add_test(NAME embedding COMMAND test_embedding)
+add_test(NAME adamw COMMAND test_adamw)
+add_test(NAME cross_entropy COMMAND test_cross_entropy)
+add_test(NAME global_norm COMMAND test_global_norm)
+add_test(NAME tokenizer_cpp COMMAND test_tokenizer)
+add_test(NAME dataset COMMAND test_dataset)
+add_test(NAME model COMMAND test_model)
+add_test(NAME checkpoint COMMAND test_checkpoint)
+add_test(NAME generation COMMAND test_generation)
+if(Python3_Interpreter_FOUND)
+    add_test(
+        NAME tokenizer_python
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_tokenizer.py
+    )
+endif()
