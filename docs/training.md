@@ -50,13 +50,7 @@ loss is below `0.10` and less than five percent of its initial value.
 ## Train the default model and save checkpoints
 
 ```bash
-./build/train_dscuda \
-    --mode tinystories \
-    --data-dir data/tinystories \
-    --steps 3000 \
-    --log-every 100 \
-    --checkpoint-every 1000 \
-    --output-dir checkpoints/tinystories
+./build/train_dscuda --config configs/tinystories.conf
 ```
 
 The default TinyStories configuration is `L=4`, `H=256`, four heads,
@@ -64,12 +58,71 @@ The default TinyStories configuration is `L=4`, `H=256`, four heads,
 Use the command-line shape options to scale only after the fixed-batch test
 continues to pass.
 
+For the larger 8-layer, 512-hidden model:
+
+```bash
+./build/train_dscuda --config configs/dense_gpt_8l_512h.conf
+```
+
+Configuration files use one `name = value` setting per line. Command-line
+values override the file, so a short check does not require editing it:
+
+```bash
+./build/train_dscuda \
+    --config configs/dense_gpt_8l_512h.conf \
+    --steps 10 --checkpoint-every 0
+```
+
 Each log line reports training-only tokens/s, achieved TFLOP/s, and estimated
 model FLOPs utilization (MFU). The default `--peak-tflops 14.56` is the nominal
 FP32 peak used for the RTX 4060 Laptop GPU; pass the appropriate FP32 or BF16
 Tensor Core peak when running a different GPU or precision. FLOPs/token uses
 the dense Transformer estimate `6N + 12LHQT` and intentionally excludes
 elementwise and optimizer operations.
+
+## FP32 versus BF16 mixed precision
+
+Select the matrix backend with `precision = fp32` or `precision = bf16` in a
+config file. The BF16 path keeps FP32 master parameters, AdamW moments,
+gradients, residual activations, normalization, causal attention softmax, and
+loss. It uses BF16 Tensor Core operands with FP32 accumulation for every block
+linear projection and the tied vocabulary head.
+
+Train the BF16 model with:
+
+```bash
+./build/train_dscuda --config configs/tinystories_bf16.conf
+```
+
+The larger BF16 model also has a complete config:
+
+```bash
+./build/train_dscuda --config configs/dense_gpt_8l_512h_bf16.conf
+```
+
+Compare both backends on identical initialization, data order, shape, and
+training steps:
+
+```bash
+bash scripts/compare_precision.sh 200
+```
+
+Pass a second argument to compare another model configuration:
+
+```bash
+bash scripts/compare_precision.sh 200 configs/dense_gpt_8l_512h.conf
+```
+
+The script discards the first timed step as warm-up and prints one table with
+loss, tokens/s, achieved TFLOP/s, MFU, allocated memory, and relative
+throughput. FP32 uses a 14.56 TFLOP/s peak and BF16 uses a 58.25 TFLOP/s dense
+Tensor Core peak for the RTX 4060 Laptop GPU. MFU is an architectural estimate:
+the BF16 numerator includes the complete Transformer FLOPs estimate even though
+non-matmul kernels still execute in FP32.
+
+This first mixed-precision stage uses slightly more memory because it retains
+the complete FP32 training state and adds BF16 parameter shadows plus conversion
+workspace. Moving saved activations to BF16 is a separate optimization.
 
 Each `step_XXXXXXXX` checkpoint contains a versioned architecture header,
 parameters, both AdamW moment buffers, the completed step, and a `DONE` marker.

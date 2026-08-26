@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
 #include <cstddef>
@@ -42,6 +43,18 @@ struct TransformerBlockGradients {
     float* down_weight;
 };
 
+// BF16 shadows are needed only for matrix weights; RMSNorm continues to read
+// the FP32 master parameters from TransformerBlockParameters.
+struct TransformerBlockBf16Parameters {
+    const __nv_bfloat16* query_weight;
+    const __nv_bfloat16* key_weight;
+    const __nv_bfloat16* value_weight;
+    const __nv_bfloat16* output_weight;
+    const __nv_bfloat16* gate_weight;
+    const __nv_bfloat16* up_weight;
+    const __nv_bfloat16* down_weight;
+};
+
 // The activation buffer holds every value required by backward plus the
 // temporary storage used by the composed attention forward pass.
 std::size_t transformer_block_activation_elements(
@@ -74,6 +87,36 @@ void transformer_block_backward_cuda(
     const float* sine,
     const float* activations,
     float* workspace,
+    const TransformerBlockConfig& config,
+    cudaStream_t stream = nullptr);
+
+// Runs linear projections on BF16 Tensor Cores while retaining FP32
+// activations, normalization, attention softmax, residuals, and gradients.
+void transformer_block_forward_bf16_cuda(
+    float* output,
+    const float* input,
+    const TransformerBlockParameters& parameters,
+    const TransformerBlockBf16Parameters& bf16_parameters,
+    const float* cosine,
+    const float* sine,
+    float* activations,
+    __nv_bfloat16* conversion_workspace,
+    const TransformerBlockConfig& config,
+    cudaStream_t stream = nullptr);
+
+void transformer_block_backward_bf16_cuda(
+    float* input_gradient,
+    const TransformerBlockGradients& parameter_gradients,
+    const float* output_gradient,
+    const float* input,
+    const TransformerBlockParameters& parameters,
+    const TransformerBlockBf16Parameters& bf16_parameters,
+    const float* cosine,
+    const float* sine,
+    const float* activations,
+    float* workspace,
+    __nv_bfloat16* conversion_workspace_a,
+    __nv_bfloat16* conversion_workspace_b,
     const TransformerBlockConfig& config,
     cudaStream_t stream = nullptr);
 

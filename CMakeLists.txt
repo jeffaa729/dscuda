@@ -139,6 +139,9 @@ target_link_libraries(test_dataset PRIVATE dscuda_data)
 add_executable(test_model tests/test_model.cu)
 target_link_libraries(test_model PRIVATE dscuda_kernels)
 
+add_executable(test_model_bf16 tests/test_model_bf16.cu)
+target_link_libraries(test_model_bf16 PRIVATE dscuda_kernels)
+
 add_executable(train_dscuda train_dscuda.cu)
 target_link_libraries(train_dscuda PRIVATE dscuda_kernels dscuda_data)
 
@@ -167,6 +170,7 @@ add_test(NAME global_norm COMMAND test_global_norm)
 add_test(NAME tokenizer_cpp COMMAND test_tokenizer)
 add_test(NAME dataset COMMAND test_dataset)
 add_test(NAME model COMMAND test_model)
+add_test(NAME model_bf16 COMMAND test_model_bf16)
 add_test(NAME checkpoint COMMAND test_checkpoint)
 add_test(NAME generation COMMAND test_generation)
 if(Python3_Interpreter_FOUND)

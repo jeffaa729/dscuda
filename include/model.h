@@ -11,6 +11,11 @@
 
 namespace dscuda {
 
+enum class ModelPrecision {
+    fp32,
+    bf16,
+};
+
 struct ModelConfig {
     int batch_size;
     int sequence_length;
@@ -72,11 +77,18 @@ TransformerBlockGradients model_block_gradients(
     const ModelParameterLayout& layout,
     int layer);
 
-// Owns all persistent FP32 parameters, optimizer state, saved activations, and
-// reusable backward workspace for a dense pre-norm causal language model.
+TransformerBlockBf16Parameters model_block_bf16_parameters(
+    const __nv_bfloat16* parameters,
+    const ModelParameterLayout& layout,
+    int layer);
+
+// Owns FP32 master parameters, optimizer state, saved activations, and reusable
+// workspace, with an optional BF16 shadow used by Tensor Core linear layers.
 class DenseGptModel : public AutoregressiveModel {
 public:
-    explicit DenseGptModel(const ModelConfig& config);
+    explicit DenseGptModel(
+        const ModelConfig& config,
+        ModelPrecision precision = ModelPrecision::fp32);
     ~DenseGptModel();
 
     DenseGptModel(const DenseGptModel&) = delete;
@@ -109,6 +121,7 @@ public:
         const std::vector<int>& tokens) override;
 
     const ModelConfig& config() const;
+    ModelPrecision precision() const;
     const ModelParameterLayout& parameter_layout() const;
     ModelMemoryReport memory_report() const;
 

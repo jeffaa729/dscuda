@@ -202,6 +202,106 @@ void linear_weight_gradient(
         stream);
 }
 
+void linear_forward(
+    float* output,
+    const float* input,
+    const float* weight,
+    const __nv_bfloat16* bf16_weight,
+    int rows,
+    int output_size,
+    int input_size,
+    __nv_bfloat16* conversion_workspace,
+    cudaStream_t stream) {
+    if (bf16_weight == nullptr) {
+        matmul_fp32_forward_cuda(
+            output, input, weight, rows, output_size, input_size, stream);
+        return;
+    }
+    convert_fp32_to_bf16_cuda(
+        conversion_workspace,
+        input,
+        static_cast<std::size_t>(rows) * input_size,
+        stream);
+    matmul_bf16_forward_cuda(
+        output,
+        conversion_workspace,
+        bf16_weight,
+        rows,
+        output_size,
+        input_size,
+        stream);
+}
+
+void linear_backward(
+    float* input_gradient,
+    float* weight_gradient,
+    const float* output_gradient,
+    const float* input,
+    const float* weight,
+    const __nv_bfloat16* bf16_weight,
+    int rows,
+    int input_size,
+    int output_size,
+    bool accumulate_input,
+    __nv_bfloat16* conversion_workspace_a,
+    __nv_bfloat16* conversion_workspace_b,
+    cudaStream_t stream) {
+    if (bf16_weight == nullptr) {
+        linear_input_gradient(
+            input_gradient,
+            output_gradient,
+            weight,
+            rows,
+            input_size,
+            output_size,
+            accumulate_input,
+            stream);
+        linear_weight_gradient(
+            weight_gradient,
+            input,
+            output_gradient,
+            rows,
+            input_size,
+            output_size,
+            stream);
+        return;
+    }
+
+    convert_fp32_to_bf16_cuda(
+        conversion_workspace_a,
+        input,
+        static_cast<std::size_t>(rows) * input_size,
+        stream);
+    convert_fp32_to_bf16_cuda(
+        conversion_workspace_b,
+        output_gradient,
+        static_cast<std::size_t>(rows) * output_size,
+        stream);
+    if (!accumulate_input) {
+        CUDA_CHECK(cudaMemsetAsync(
+            input_gradient,
+            0,
+            static_cast<std::size_t>(rows) * input_size * sizeof(float),
+            stream));
+    }
+    matmul_bf16_left_backward_cuda(
+        input_gradient,
+        conversion_workspace_b,
+        bf16_weight,
+        rows,
+        output_size,
+        input_size,
+        stream);
+    matmul_bf16_right_backward_cuda(
+        weight_gradient,
+        conversion_workspace_a,
+        conversion_workspace_b,
+        rows,
+        output_size,
+        input_size,
+        stream);
+}
+
 }  // namespace
 
 std::size_t transformer_block_activation_elements(
@@ -235,13 +335,15 @@ std::size_t transformer_block_backward_workspace_elements(
                config.head_size);
 }
 
-void transformer_block_forward_cuda(
+void transformer_block_forward_impl(
     float* output,
     const float* input,
     const TransformerBlockParameters& parameters,
+    const TransformerBlockBf16Parameters* bf16_parameters,
     const float* cosine,
     const float* sine,
     float* activations,
+    __nv_bfloat16* conversion_workspace,
     const TransformerBlockConfig& config,
     cudaStream_t stream) {
     const int rows = config.batch_size * config.sequence_length;
@@ -258,29 +360,35 @@ void transformer_block_forward_cuda(
         config.hidden_size,
         config.epsilon,
         stream);
-    matmul_fp32_forward_cuda(
+    linear_forward(
         saved.query,
         saved.norm1,
         parameters.query_weight,
+        bf16_parameters == nullptr ? nullptr : bf16_parameters->query_weight,
         rows,
         config.hidden_size,
         config.hidden_size,
+        conversion_workspace,
         stream);
-    matmul_fp32_forward_cuda(
+    linear_forward(
         saved.key,
         saved.norm1,
         parameters.key_weight,
+        bf16_parameters == nullptr ? nullptr : bf16_parameters->key_weight,
         rows,
         config.hidden_size,
         config.hidden_size,
+        conversion_workspace,
         stream);
-    matmul_fp32_forward_cuda(
+    linear_forward(
         saved.value,
         saved.norm1,
         parameters.value_weight,
+        bf16_parameters == nullptr ? nullptr : bf16_parameters->value_weight,
         rows,
         config.hidden_size,
         config.hidden_size,
+        conversion_workspace,
         stream);
     rope_forward_cuda(
         saved.query,
@@ -317,13 +425,15 @@ void transformer_block_forward_cuda(
         config.head_size,
         config.attention_scale,
         stream);
-    matmul_fp32_forward_cuda(
+    linear_forward(
         output,
         saved.attention_output,
         parameters.output_weight,
+        bf16_parameters == nullptr ? nullptr : bf16_parameters->output_weight,
         rows,
         config.hidden_size,
         config.hidden_size,
+        conversion_workspace,
         stream);
     residual_forward_cuda(
         saved.residual1, input, output, activation_elements, stream);
@@ -336,46 +446,55 @@ void transformer_block_forward_cuda(
         config.hidden_size,
         config.epsilon,
         stream);
-    matmul_fp32_forward_cuda(
+    linear_forward(
         saved.gate,
         saved.norm2,
         parameters.gate_weight,
+        bf16_parameters == nullptr ? nullptr : bf16_parameters->gate_weight,
         rows,
         config.ffn_size,
         config.hidden_size,
+        conversion_workspace,
         stream);
-    matmul_fp32_forward_cuda(
+    linear_forward(
         saved.up,
         saved.norm2,
         parameters.up_weight,
+        bf16_parameters == nullptr ? nullptr : bf16_parameters->up_weight,
         rows,
         config.ffn_size,
         config.hidden_size,
+        conversion_workspace,
         stream);
     swiglu_forward_cuda(
         saved.hidden, saved.gate, saved.up, ffn_elements, stream);
-    matmul_fp32_forward_cuda(
+    linear_forward(
         output,
         saved.hidden,
         parameters.down_weight,
+        bf16_parameters == nullptr ? nullptr : bf16_parameters->down_weight,
         rows,
         config.hidden_size,
         config.ffn_size,
+        conversion_workspace,
         stream);
     residual_forward_cuda(
         output, saved.residual1, output, activation_elements, stream);
 }
 
-void transformer_block_backward_cuda(
+void transformer_block_backward_impl(
     float* input_gradient,
     const TransformerBlockGradients& parameter_gradients,
     const float* output_gradient,
     const float* input,
     const TransformerBlockParameters& parameters,
+    const TransformerBlockBf16Parameters* bf16_parameters,
     const float* cosine,
     const float* sine,
     const float* activations,
     float* workspace,
+    __nv_bfloat16* conversion_workspace_a,
+    __nv_bfloat16* conversion_workspace_b,
     const TransformerBlockConfig& config,
     cudaStream_t stream) {
     const int rows = config.batch_size * config.sequence_length;
@@ -390,22 +509,19 @@ void transformer_block_backward_cuda(
         activation_elements * sizeof(float),
         cudaMemcpyDeviceToDevice,
         stream));
-    linear_input_gradient(
+    linear_backward(
         gradient.hidden_gradient,
+        parameter_gradients.down_weight,
         output_gradient,
+        saved.hidden,
         parameters.down_weight,
+        bf16_parameters == nullptr ? nullptr : bf16_parameters->down_weight,
         rows,
         config.ffn_size,
         config.hidden_size,
         false,
-        stream);
-    linear_weight_gradient(
-        parameter_gradients.down_weight,
-        saved.hidden,
-        output_gradient,
-        rows,
-        config.ffn_size,
-        config.hidden_size,
+        conversion_workspace_a,
+        conversion_workspace_b,
         stream);
     swiglu_backward_cuda(
         gradient.gate_gradient,
@@ -416,39 +532,33 @@ void transformer_block_backward_cuda(
         ffn_elements,
         stream);
 
-    linear_input_gradient(
+    linear_backward(
         gradient.norm2_gradient,
+        parameter_gradients.gate_weight,
         gradient.gate_gradient,
+        saved.norm2,
         parameters.gate_weight,
+        bf16_parameters == nullptr ? nullptr : bf16_parameters->gate_weight,
         rows,
         config.hidden_size,
         config.ffn_size,
         false,
+        conversion_workspace_a,
+        conversion_workspace_b,
         stream);
-    linear_input_gradient(
+    linear_backward(
         gradient.norm2_gradient,
+        parameter_gradients.up_weight,
         gradient.up_gradient,
+        saved.norm2,
         parameters.up_weight,
+        bf16_parameters == nullptr ? nullptr : bf16_parameters->up_weight,
         rows,
         config.hidden_size,
         config.ffn_size,
         true,
-        stream);
-    linear_weight_gradient(
-        parameter_gradients.gate_weight,
-        saved.norm2,
-        gradient.gate_gradient,
-        rows,
-        config.hidden_size,
-        config.ffn_size,
-        stream);
-    linear_weight_gradient(
-        parameter_gradients.up_weight,
-        saved.norm2,
-        gradient.up_gradient,
-        rows,
-        config.hidden_size,
-        config.ffn_size,
+        conversion_workspace_a,
+        conversion_workspace_b,
         stream);
     rmsnorm_backward_cuda(
         gradient.residual1_gradient,
@@ -472,22 +582,19 @@ void transformer_block_backward_cuda(
         gradient.residual1_gradient,
         activation_elements,
         stream);
-    linear_input_gradient(
+    linear_backward(
         gradient.attention_output_gradient,
+        parameter_gradients.output_weight,
         gradient.attention_projection_gradient,
+        saved.attention_output,
         parameters.output_weight,
+        bf16_parameters == nullptr ? nullptr : bf16_parameters->output_weight,
         rows,
         config.hidden_size,
         config.hidden_size,
         false,
-        stream);
-    linear_weight_gradient(
-        parameter_gradients.output_weight,
-        saved.attention_output,
-        gradient.attention_projection_gradient,
-        rows,
-        config.hidden_size,
-        config.hidden_size,
+        conversion_workspace_a,
+        conversion_workspace_b,
         stream);
 
     CUDA_CHECK(cudaMemsetAsync(
@@ -539,56 +646,47 @@ void transformer_block_backward_cuda(
         config.rotary_size,
         stream);
 
-    linear_input_gradient(
+    linear_backward(
         gradient.norm1_gradient,
+        parameter_gradients.query_weight,
         gradient.query_gradient,
+        saved.norm1,
         parameters.query_weight,
+        bf16_parameters == nullptr ? nullptr : bf16_parameters->query_weight,
         rows,
         config.hidden_size,
         config.hidden_size,
         false,
+        conversion_workspace_a,
+        conversion_workspace_b,
         stream);
-    linear_input_gradient(
+    linear_backward(
         gradient.norm1_gradient,
-        gradient.key_gradient,
-        parameters.key_weight,
-        rows,
-        config.hidden_size,
-        config.hidden_size,
-        true,
-        stream);
-    linear_input_gradient(
-        gradient.norm1_gradient,
-        gradient.value_gradient,
-        parameters.value_weight,
-        rows,
-        config.hidden_size,
-        config.hidden_size,
-        true,
-        stream);
-    linear_weight_gradient(
-        parameter_gradients.query_weight,
-        saved.norm1,
-        gradient.query_gradient,
-        rows,
-        config.hidden_size,
-        config.hidden_size,
-        stream);
-    linear_weight_gradient(
         parameter_gradients.key_weight,
-        saved.norm1,
         gradient.key_gradient,
-        rows,
-        config.hidden_size,
-        config.hidden_size,
-        stream);
-    linear_weight_gradient(
-        parameter_gradients.value_weight,
         saved.norm1,
-        gradient.value_gradient,
+        parameters.key_weight,
+        bf16_parameters == nullptr ? nullptr : bf16_parameters->key_weight,
         rows,
         config.hidden_size,
         config.hidden_size,
+        true,
+        conversion_workspace_a,
+        conversion_workspace_b,
+        stream);
+    linear_backward(
+        gradient.norm1_gradient,
+        parameter_gradients.value_weight,
+        gradient.value_gradient,
+        saved.norm1,
+        parameters.value_weight,
+        bf16_parameters == nullptr ? nullptr : bf16_parameters->value_weight,
+        rows,
+        config.hidden_size,
+        config.hidden_size,
+        true,
+        conversion_workspace_a,
+        conversion_workspace_b,
         stream);
     rmsnorm_backward_cuda(
         input_gradient,
@@ -599,6 +697,113 @@ void transformer_block_backward_cuda(
         saved.inverse_rms1,
         rows,
         config.hidden_size,
+        stream);
+}
+
+void transformer_block_forward_cuda(
+    float* output,
+    const float* input,
+    const TransformerBlockParameters& parameters,
+    const float* cosine,
+    const float* sine,
+    float* activations,
+    const TransformerBlockConfig& config,
+    cudaStream_t stream) {
+    transformer_block_forward_impl(
+        output,
+        input,
+        parameters,
+        nullptr,
+        cosine,
+        sine,
+        activations,
+        nullptr,
+        config,
+        stream);
+}
+
+void transformer_block_backward_cuda(
+    float* input_gradient,
+    const TransformerBlockGradients& parameter_gradients,
+    const float* output_gradient,
+    const float* input,
+    const TransformerBlockParameters& parameters,
+    const float* cosine,
+    const float* sine,
+    const float* activations,
+    float* workspace,
+    const TransformerBlockConfig& config,
+    cudaStream_t stream) {
+    transformer_block_backward_impl(
+        input_gradient,
+        parameter_gradients,
+        output_gradient,
+        input,
+        parameters,
+        nullptr,
+        cosine,
+        sine,
+        activations,
+        workspace,
+        nullptr,
+        nullptr,
+        config,
+        stream);
+}
+
+void transformer_block_forward_bf16_cuda(
+    float* output,
+    const float* input,
+    const TransformerBlockParameters& parameters,
+    const TransformerBlockBf16Parameters& bf16_parameters,
+    const float* cosine,
+    const float* sine,
+    float* activations,
+    __nv_bfloat16* conversion_workspace,
+    const TransformerBlockConfig& config,
+    cudaStream_t stream) {
+    transformer_block_forward_impl(
+        output,
+        input,
+        parameters,
+        &bf16_parameters,
+        cosine,
+        sine,
+        activations,
+        conversion_workspace,
+        config,
+        stream);
+}
+
+void transformer_block_backward_bf16_cuda(
+    float* input_gradient,
+    const TransformerBlockGradients& parameter_gradients,
+    const float* output_gradient,
+    const float* input,
+    const TransformerBlockParameters& parameters,
+    const TransformerBlockBf16Parameters& bf16_parameters,
+    const float* cosine,
+    const float* sine,
+    const float* activations,
+    float* workspace,
+    __nv_bfloat16* conversion_workspace_a,
+    __nv_bfloat16* conversion_workspace_b,
+    const TransformerBlockConfig& config,
+    cudaStream_t stream) {
+    transformer_block_backward_impl(
+        input_gradient,
+        parameter_gradients,
+        output_gradient,
+        input,
+        parameters,
+        &bf16_parameters,
+        cosine,
+        sine,
+        activations,
+        workspace,
+        conversion_workspace_a,
+        conversion_workspace_b,
+        config,
         stream);
 }
 

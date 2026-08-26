@@ -129,10 +129,37 @@ TransformerBlockGradients model_block_gradients(
     };
 }
 
+TransformerBlockBf16Parameters model_block_bf16_parameters(
+    const __nv_bfloat16* parameters,
+    const ModelParameterLayout& layout,
+    int layer) {
+    const ModelBlockOffsets& block = layout.blocks[layer];
+    return {
+        parameters + block.query,
+        parameters + block.key,
+        parameters + block.value,
+        parameters + block.output,
+        parameters + block.gate,
+        parameters + block.up,
+        parameters + block.down,
+    };
+}
+
 struct DenseGptModel::Implementation {
-    explicit Implementation(const ModelConfig& model_config)
-        : config(model_config), layout(make_model_parameter_layout(config)) {
+    explicit Implementation(
+        const ModelConfig& model_config,
+        ModelPrecision model_precision)
+        : config(model_config),
+          layout(make_model_parameter_layout(config)),
+          precision(model_precision) {
         rows = config.batch_size * config.sequence_length;
+        if (precision == ModelPrecision::bf16
+            && (rows % 16 != 0 || config.hidden_size % 16 != 0
+                || config.ffn_size % 16 != 0
+                || config.vocabulary_size % 16 != 0)) {
+            throw std::runtime_error(
+                "BF16 model dimensions must be multiples of 16");
+        }
         activation_elements =
             static_cast<std::size_t>(rows) * config.hidden_size;
         logits_elements =
@@ -155,6 +182,11 @@ struct DenseGptModel::Implementation {
             transformer_block_backward_workspace_elements(block_config);
         norm_workspace_elements = global_norm_workspace_elements(
             static_cast<int>(layout.elements));
+        bf16_conversion_elements = static_cast<std::size_t>(rows)
+            * std::max({
+                config.hidden_size,
+                config.ffn_size,
+                config.vocabulary_size});
 
         parameters = allocate<float>(layout.elements);
         gradients = allocate<float>(layout.elements);
@@ -184,6 +216,13 @@ struct DenseGptModel::Implementation {
         block_workspace = allocate<float>(block_workspace_elements);
         gradient_norm = allocate<float>(1);
         norm_workspace = allocate<float>(norm_workspace_elements);
+        if (precision == ModelPrecision::bf16) {
+            bf16_parameters = allocate<__nv_bfloat16>(layout.elements);
+            bf16_conversion_a =
+                allocate<__nv_bfloat16>(bf16_conversion_elements);
+            bf16_conversion_b =
+                allocate<__nv_bfloat16>(bf16_conversion_elements);
+        }
 
         std::vector<float> host_cosine(frequencies);
         std::vector<float> host_sine(frequencies);
@@ -211,7 +250,19 @@ struct DenseGptModel::Implementation {
             cudaMemcpyHostToDevice));
     }
 
+    void refresh_bf16_parameters() {
+        if (precision == ModelPrecision::bf16) {
+            convert_fp32_to_bf16_cuda(
+                bf16_parameters, parameters, layout.elements);
+        }
+    }
+
     ~Implementation() {
+        if (bf16_parameters != nullptr) {
+            device_free(bf16_conversion_b);
+            device_free(bf16_conversion_a);
+            device_free(bf16_parameters);
+        }
         device_free(norm_workspace);
         device_free(gradient_norm);
         device_free(block_workspace);
@@ -237,6 +288,7 @@ struct DenseGptModel::Implementation {
 
     ModelConfig config;
     ModelParameterLayout layout;
+    ModelPrecision precision = ModelPrecision::fp32;
     TransformerBlockConfig block_config{};
     int rows = 0;
     std::size_t activation_elements = 0;
@@ -244,6 +296,7 @@ struct DenseGptModel::Implementation {
     std::size_t block_activation_elements = 0;
     std::size_t block_workspace_elements = 0;
     std::size_t norm_workspace_elements = 0;
+    std::size_t bf16_conversion_elements = 0;
 
     float* parameters = nullptr;
     float* gradients = nullptr;
@@ -266,11 +319,16 @@ struct DenseGptModel::Implementation {
     float* block_workspace = nullptr;
     float* gradient_norm = nullptr;
     float* norm_workspace = nullptr;
+    __nv_bfloat16* bf16_parameters = nullptr;
+    __nv_bfloat16* bf16_conversion_a = nullptr;
+    __nv_bfloat16* bf16_conversion_b = nullptr;
     bool forward_ready = false;
 };
 
-DenseGptModel::DenseGptModel(const ModelConfig& config)
-    : implementation_(std::make_unique<Implementation>(config)) {}
+DenseGptModel::DenseGptModel(
+    const ModelConfig& config,
+    ModelPrecision precision)
+    : implementation_(std::make_unique<Implementation>(config, precision)) {}
 
 DenseGptModel::~DenseGptModel() = default;
 
@@ -339,6 +397,7 @@ void DenseGptModel::load_parameters(const std::vector<float>& parameters) {
         parameters.data(),
         parameters.size() * sizeof(float),
         cudaMemcpyHostToDevice));
+    model.refresh_bf16_parameters();
     model.forward_ready = false;
 }
 
@@ -388,6 +447,7 @@ void DenseGptModel::load_training_state(const ModelTrainingState& state) {
         state.second_moment.data(),
         model.layout.elements * sizeof(float),
         cudaMemcpyHostToDevice));
+    model.refresh_bf16_parameters();
     model.forward_ready = false;
 }
 
@@ -419,14 +479,30 @@ void DenseGptModel::run_model_forward(
         float* activations =
             model.block_activations + static_cast<std::size_t>(layer)
                 * model.block_activation_elements;
-        transformer_block_forward_cuda(
-            output,
-            input,
-            model_block_parameters(model.parameters, model.layout, layer),
-            model.cosine,
-            model.sine,
-            activations,
-            model.block_config);
+        const TransformerBlockParameters parameters =
+            model_block_parameters(model.parameters, model.layout, layer);
+        if (model.precision == ModelPrecision::bf16) {
+            transformer_block_forward_bf16_cuda(
+                output,
+                input,
+                parameters,
+                model_block_bf16_parameters(
+                    model.bf16_parameters, model.layout, layer),
+                model.cosine,
+                model.sine,
+                activations,
+                model.bf16_conversion_a,
+                model.block_config);
+        } else {
+            transformer_block_forward_cuda(
+                output,
+                input,
+                parameters,
+                model.cosine,
+                model.sine,
+                activations,
+                model.block_config);
+        }
     }
 
     const float* final_input =
@@ -440,20 +516,37 @@ void DenseGptModel::run_model_forward(
         model.rows,
         model.config.hidden_size,
         model.config.rms_epsilon);
-    matmul_fp32_strided_batched_cuda(
-        model.logits,
-        model.final_norm,
-        model.parameters + model.layout.token_embedding,
-        model.rows,
-        model.config.vocabulary_size,
-        model.config.hidden_size,
-        1,
-        0,
-        0,
-        0,
-        false,
-        true,
-        false);
+    if (model.precision == ModelPrecision::bf16) {
+        convert_fp32_to_bf16_cuda(
+            model.bf16_conversion_a,
+            model.final_norm,
+            model.activation_elements);
+        matmul_bf16_strided_cuda(
+            model.logits,
+            model.bf16_conversion_a,
+            model.bf16_parameters + model.layout.token_embedding,
+            model.rows,
+            model.config.vocabulary_size,
+            model.config.hidden_size,
+            false,
+            true,
+            false);
+    } else {
+        matmul_fp32_strided_batched_cuda(
+            model.logits,
+            model.final_norm,
+            model.parameters + model.layout.token_embedding,
+            model.rows,
+            model.config.vocabulary_size,
+            model.config.hidden_size,
+            1,
+            0,
+            0,
+            0,
+            false,
+            true,
+            false);
+    }
     model.forward_ready = false;
 }
 
@@ -504,27 +597,55 @@ void DenseGptModel::backward() {
         model.target_tokens,
         model.rows,
         model.config.vocabulary_size);
-    matmul_fp32_forward_cuda(
-        model.activation_gradient_a,
-        model.logits_gradient,
-        model.parameters + model.layout.token_embedding,
-        model.rows,
-        model.config.hidden_size,
-        model.config.vocabulary_size);
-    matmul_fp32_strided_batched_cuda(
-        model.gradients + model.layout.token_embedding,
-        model.logits_gradient,
-        model.final_norm,
-        model.config.vocabulary_size,
-        model.config.hidden_size,
-        model.rows,
-        1,
-        0,
-        0,
-        0,
-        true,
-        false,
-        true);
+    if (model.precision == ModelPrecision::bf16) {
+        convert_fp32_to_bf16_cuda(
+            model.bf16_conversion_a,
+            model.logits_gradient,
+            model.logits_elements);
+        convert_fp32_to_bf16_cuda(
+            model.bf16_conversion_b,
+            model.final_norm,
+            model.activation_elements);
+        matmul_bf16_forward_cuda(
+            model.activation_gradient_a,
+            model.bf16_conversion_a,
+            model.bf16_parameters + model.layout.token_embedding,
+            model.rows,
+            model.config.hidden_size,
+            model.config.vocabulary_size);
+        matmul_bf16_strided_cuda(
+            model.gradients + model.layout.token_embedding,
+            model.bf16_conversion_a,
+            model.bf16_conversion_b,
+            model.config.vocabulary_size,
+            model.config.hidden_size,
+            model.rows,
+            true,
+            false,
+            true);
+    } else {
+        matmul_fp32_forward_cuda(
+            model.activation_gradient_a,
+            model.logits_gradient,
+            model.parameters + model.layout.token_embedding,
+            model.rows,
+            model.config.hidden_size,
+            model.config.vocabulary_size);
+        matmul_fp32_strided_batched_cuda(
+            model.gradients + model.layout.token_embedding,
+            model.logits_gradient,
+            model.final_norm,
+            model.config.vocabulary_size,
+            model.config.hidden_size,
+            model.rows,
+            1,
+            0,
+            0,
+            0,
+            true,
+            false,
+            true);
+    }
 
     CUDA_CHECK(cudaMemset(
         model.activation_gradient_b,
@@ -556,17 +677,39 @@ void DenseGptModel::backward() {
         const float* activations =
             model.block_activations + static_cast<std::size_t>(layer)
                 * model.block_activation_elements;
-        transformer_block_backward_cuda(
-            input_gradient,
-            model_block_gradients(model.gradients, model.layout, layer),
-            output_gradient,
-            input,
-            model_block_parameters(model.parameters, model.layout, layer),
-            model.cosine,
-            model.sine,
-            activations,
-            model.block_workspace,
-            model.block_config);
+        const TransformerBlockGradients gradients =
+            model_block_gradients(model.gradients, model.layout, layer);
+        const TransformerBlockParameters parameters =
+            model_block_parameters(model.parameters, model.layout, layer);
+        if (model.precision == ModelPrecision::bf16) {
+            transformer_block_backward_bf16_cuda(
+                input_gradient,
+                gradients,
+                output_gradient,
+                input,
+                parameters,
+                model_block_bf16_parameters(
+                    model.bf16_parameters, model.layout, layer),
+                model.cosine,
+                model.sine,
+                activations,
+                model.block_workspace,
+                model.bf16_conversion_a,
+                model.bf16_conversion_b,
+                model.block_config);
+        } else {
+            transformer_block_backward_cuda(
+                input_gradient,
+                gradients,
+                output_gradient,
+                input,
+                parameters,
+                model.cosine,
+                model.sine,
+                activations,
+                model.block_workspace,
+                model.block_config);
+        }
         std::swap(output_gradient, input_gradient);
     }
 
@@ -612,6 +755,7 @@ TrainStepResult DenseGptModel::train_step(
         static_cast<int>(model.layout.elements),
         step,
         optimizer);
+    model.refresh_bf16_parameters();
     synchronize();
     return {loss, norm};
 }
@@ -684,6 +828,10 @@ const ModelConfig& DenseGptModel::config() const {
     return implementation_->config;
 }
 
+ModelPrecision DenseGptModel::precision() const {
+    return implementation_->precision;
+}
+
 const ModelParameterLayout& DenseGptModel::parameter_layout() const {
     return implementation_->layout;
 }
@@ -707,7 +855,15 @@ ModelMemoryReport DenseGptModel::memory_report() const {
         * sizeof(float);
     const std::size_t token_bytes =
         static_cast<std::size_t>(2 * model.rows) * sizeof(int);
-    return {model.layout.elements, saved, workspace, float_bytes + token_bytes};
+    const std::size_t bf16_bytes = model.precision == ModelPrecision::bf16
+        ? (model.layout.elements + 2 * model.bf16_conversion_elements)
+            * sizeof(__nv_bfloat16)
+        : 0;
+    return {
+        model.layout.elements,
+        saved,
+        workspace,
+        float_bytes + token_bytes + bf16_bytes};
 }
 
 }  // namespace dscuda

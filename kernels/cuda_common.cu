@@ -8,6 +8,22 @@
 #include <stdexcept>
 
 namespace dscuda {
+namespace {
+
+constexpr int kConversionThreads = 256;
+
+__global__ void convert_fp32_to_bf16_kernel(
+    __nv_bfloat16* output,
+    const float* input,
+    std::size_t elements) {
+    const std::size_t index =
+        static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index < elements) {
+        output[index] = __float2bfloat16(input[index]);
+    }
+}
+
+}  // namespace
 
 void cuda_check(cudaError_t result, const char* expression, const char* file, int line) {
     if (result == cudaSuccess) {
@@ -49,6 +65,18 @@ void print_device_summary(int device) {
         properties.major,
         properties.minor,
         static_cast<double>(properties.totalGlobalMem) / (1024.0 * 1024.0 * 1024.0));
+}
+
+void convert_fp32_to_bf16_cuda(
+    __nv_bfloat16* output,
+    const float* input,
+    std::size_t elements,
+    cudaStream_t stream) {
+    const int blocks = static_cast<int>(
+        (elements + kConversionThreads - 1) / kConversionThreads);
+    convert_fp32_to_bf16_kernel<<<blocks, kConversionThreads, 0, stream>>>(
+        output, input, elements);
+    CUDA_CHECK(cudaGetLastError());
 }
 
 }  // namespace dscuda
