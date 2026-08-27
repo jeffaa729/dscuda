@@ -148,7 +148,9 @@ def numeric_value(metrics, section, metric):
 def stage_name(kernel):
     name = kernel["name"]
     if name.startswith("matmul"):
-        return "matmul"
+        return "gemm"
+    if name.startswith("convert_fp32_to_bf16"):
+        return "bf16_conversion"
     if name.startswith("rmsnorm"):
         return "rmsnorm"
     if name.startswith("rope"):
@@ -163,6 +165,14 @@ def stage_name(kernel):
         return "swiglu"
     if name.startswith("residual"):
         return "residual"
+    if name.startswith("cross_entropy"):
+        return "loss"
+    if name.startswith("embedding"):
+        return "embedding"
+    if name.startswith("global_norm") or name.startswith("clip_gradients"):
+        return "gradient_norm"
+    if name.startswith("adamw"):
+        return "optimizer"
     return "other"
 
 

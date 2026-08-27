@@ -120,9 +120,10 @@ Tensor Core peak for the RTX 4060 Laptop GPU. MFU is an architectural estimate:
 the BF16 numerator includes the complete Transformer FLOPs estimate even though
 non-matmul kernels still execute in FP32.
 
-This first mixed-precision stage uses slightly more memory because it retains
-the complete FP32 training state and adds BF16 parameter shadows plus conversion
-workspace. Moving saved activations to BF16 is a separate optimization.
+This mixed-precision stage retains the complete FP32 training state and adds
+BF16 parameter shadows plus conversion workspace. Flash2 additionally retains
+the BF16 Q/K/V tensors consumed by forward so backward can reuse them instead
+of converting the saved FP32 tensors again.
 
 ## Fused causal attention
 
@@ -153,9 +154,10 @@ fallback. On the RTX 4060 Laptop test system, Nsight Compute measured:
 | 512 | 1.293 ms | 0.312 ms | 151.44 MB | 24.30 MB |
 
 For the default four-layer TinyStories configuration at `B=4`, `T=256`, and
-`H=256`, a short identical-data comparison measured 104,917 tokens/s and
-282.7 MiB with composed attention versus 121,431 tokens/s and 223.7 MiB with
-the fused Tensor Core path.
+`H=256`, a short identical-data comparison measured 100,908 tokens/s and
+274.7 MiB with composed attention versus 123,623 tokens/s and 221.7 MiB with
+the fused Tensor Core path. Tokens/s varies with laptop power and clock state,
+so use the full-step Nsight report for kernel-level attribution.
 
 Reproduce the fused-kernel profile and overwrite its previous reports with:
 
@@ -163,9 +165,33 @@ Reproduce the fused-kernel profile and overwrite its previous reports with:
 bash scripts/profile.sh flash_attention
 ```
 
-The next performance step is reducing the current 197-220 registers per thread,
-double-buffering K/V tile loads, and adding Tensor Core dispatches for more head
-dimensions without complicating the reference path.
+Profile one complete BF16 training step in both attention modes with:
+
+```bash
+bash scripts/profile.sh training_step
+```
+
+The benchmark warms the model once, captures one complete forward, backward,
+gradient-clipping, AdamW, and BF16-weight-refresh step, overwrites the previous
+reports, and prints totals grouped by GEMM, conversion, attention, loss,
+optimizer, normalization, and elementwise stages. After retaining BF16 Q/K/V
+for backward, the RTX 4060 Laptop profile measured:
+
+| attention | launches | GPU kernel time | BF16 conversion time | GEMM time | attention time |
+|---|---:|---:|---:|---:|---:|
+| composed | 285 | 6.287 ms | 0.905 ms | 3.113 ms | 0.615 ms |
+| Flash2 | 261 | 5.545 ms | 1.025 ms | 2.342 ms | 0.511 ms |
+
+Persisting Q/K/V removes three backward conversions per layer. For this
+four-layer model, Flash2 conversion launches fell from 112 to 100 and total
+profiled kernel time fell from 5.599 ms to 5.545 ms. The remaining twelve
+Flash2-only conversions are the forward Q/K/V casts because the projection
+GEMMs still write FP32 activations.
+
+The next dataflow optimization is making Q/K/V projection GEMMs write BF16,
+then applying RoPE in BF16 or while Flash2 loads Q/K. After that, reduce the
+current 197-220 attention registers per thread, double-buffer K/V tile loads,
+and add Tensor Core dispatches for more head dimensions.
 
 Each `step_XXXXXXXX` checkpoint contains a versioned architecture header,
 parameters, both AdamW moment buffers, the completed step, and a `DONE` marker.

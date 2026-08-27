@@ -7,6 +7,8 @@
 - [x] Assemble, train, checkpoint, resume, and sample from a small dense GPT-2-style model.
 - [x] Add selectable composed and fused causal attention training paths with online softmax, saved log-sum-exp, backward recomputation, and FP32/BF16 inputs.
 - [x] Move the D=64 fused attention forward and backward tile products to BF16 Tensor Core MMA and benchmark against the composed baseline.
+- [x] Add a full BF16 training-step Nsight profile and persist Flash2 Q/K/V operands so backward does not reconvert them.
+- [ ] Make Q/K/V projection GEMMs write BF16 directly and combine their rotary transform with the fused-attention load path.
 - [ ] Reduce fused-attention register pressure, pipeline K/V loads, and add Tensor Core shapes beyond D=64.
 
 ## Phase 2: DeepSeek-V3 path

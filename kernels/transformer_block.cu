@@ -368,7 +368,7 @@ void transformer_block_forward_impl(
     float* activations,
     __nv_bfloat16* conversion_workspace_a,
     __nv_bfloat16* conversion_workspace_b,
-    __nv_bfloat16* conversion_workspace_c,
+    __nv_bfloat16* saved_attention_qkv,
     const TransformerBlockConfig& config,
     cudaStream_t stream) {
     const int rows = config.batch_size * config.sequence_length;
@@ -452,27 +452,30 @@ void transformer_block_forward_impl(
                 config.attention_scale,
                 stream);
         } else {
+            __nv_bfloat16* saved_query = saved_attention_qkv;
+            __nv_bfloat16* saved_key = saved_query + activation_elements;
+            __nv_bfloat16* saved_value = saved_key + activation_elements;
             convert_fp32_to_bf16_cuda(
-                conversion_workspace_a,
+                saved_query,
                 saved.query,
                 activation_elements,
                 stream);
             convert_fp32_to_bf16_cuda(
-                conversion_workspace_b,
+                saved_key,
                 saved.key,
                 activation_elements,
                 stream);
             convert_fp32_to_bf16_cuda(
-                conversion_workspace_c,
+                saved_value,
                 saved.value,
                 activation_elements,
                 stream);
             flash_attention_forward_bf16_cuda(
                 saved.attention_output,
                 saved.attention_auxiliary,
-                conversion_workspace_a,
-                conversion_workspace_b,
-                conversion_workspace_c,
+                saved_query,
+                saved_key,
+                saved_value,
                 config.batch_size,
                 config.sequence_length,
                 config.heads,
@@ -565,7 +568,7 @@ void transformer_block_backward_impl(
     float* workspace,
     __nv_bfloat16* conversion_workspace_a,
     __nv_bfloat16* conversion_workspace_b,
-    __nv_bfloat16* conversion_workspace_c,
+    const __nv_bfloat16* saved_attention_qkv,
     const TransformerBlockConfig& config,
     cudaStream_t stream) {
     const int rows = config.batch_size * config.sequence_length;
@@ -692,21 +695,11 @@ void transformer_block_backward_impl(
                 config.attention_scale,
                 stream);
         } else {
-            convert_fp32_to_bf16_cuda(
-                conversion_workspace_a,
-                saved.query,
-                activation_elements,
-                stream);
-            convert_fp32_to_bf16_cuda(
-                conversion_workspace_b,
-                saved.key,
-                activation_elements,
-                stream);
-            convert_fp32_to_bf16_cuda(
-                conversion_workspace_c,
-                saved.value,
-                activation_elements,
-                stream);
+            const __nv_bfloat16* saved_query = saved_attention_qkv;
+            const __nv_bfloat16* saved_key =
+                saved_query + activation_elements;
+            const __nv_bfloat16* saved_value =
+                saved_key + activation_elements;
             flash_attention_backward_bf16_cuda(
                 gradient.rotated_query_gradient,
                 gradient.rotated_key_gradient,
@@ -714,9 +707,9 @@ void transformer_block_backward_impl(
                 gradient.attention_output_gradient,
                 saved.attention_output,
                 saved.attention_auxiliary,
-                conversion_workspace_a,
-                conversion_workspace_b,
-                conversion_workspace_c,
+                saved_query,
+                saved_key,
+                saved_value,
                 config.batch_size,
                 config.sequence_length,
                 config.heads,
@@ -888,7 +881,7 @@ void transformer_block_forward_bf16_cuda(
     float* activations,
     __nv_bfloat16* conversion_workspace_a,
     __nv_bfloat16* conversion_workspace_b,
-    __nv_bfloat16* conversion_workspace_c,
+    __nv_bfloat16* saved_attention_qkv,
     const TransformerBlockConfig& config,
     cudaStream_t stream) {
     transformer_block_forward_impl(
@@ -901,7 +894,7 @@ void transformer_block_forward_bf16_cuda(
         activations,
         conversion_workspace_a,
         conversion_workspace_b,
-        conversion_workspace_c,
+        saved_attention_qkv,
         config,
         stream);
 }
@@ -919,7 +912,7 @@ void transformer_block_backward_bf16_cuda(
     float* workspace,
     __nv_bfloat16* conversion_workspace_a,
     __nv_bfloat16* conversion_workspace_b,
-    __nv_bfloat16* conversion_workspace_c,
+    const __nv_bfloat16* saved_attention_qkv,
     const TransformerBlockConfig& config,
     cudaStream_t stream) {
     transformer_block_backward_impl(
@@ -935,7 +928,7 @@ void transformer_block_backward_bf16_cuda(
         workspace,
         conversion_workspace_a,
         conversion_workspace_b,
-        conversion_workspace_c,
+        saved_attention_qkv,
         config,
         stream);
 }

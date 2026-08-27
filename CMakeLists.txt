@@ -104,6 +104,9 @@ target_link_libraries(benchmark_attention PRIVATE dscuda_kernels)
 add_executable(benchmark_flash_attention benchmarks/benchmark_flash_attention.cu)
 target_link_libraries(benchmark_flash_attention PRIVATE dscuda_kernels)
 
+add_executable(benchmark_training_step benchmarks/benchmark_training_step.cu)
+target_link_libraries(benchmark_training_step PRIVATE dscuda_kernels)
+
 add_executable(test_residual tests/test_residual.cu)
 target_link_libraries(test_residual PRIVATE dscuda_kernels)
 

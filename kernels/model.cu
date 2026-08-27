@@ -193,6 +193,10 @@ struct DenseGptModel::Implementation {
                 config.hidden_size,
                 config.ffn_size,
                 config.vocabulary_size});
+        bf16_attention_activation_elements =
+            config.attention == AttentionImplementation::flash2
+            ? 3 * activation_elements
+            : 0;
 
         parameters = allocate<float>(layout.elements);
         gradients = allocate<float>(layout.elements);
@@ -228,8 +232,11 @@ struct DenseGptModel::Implementation {
                 allocate<__nv_bfloat16>(bf16_conversion_elements);
             bf16_conversion_b =
                 allocate<__nv_bfloat16>(bf16_conversion_elements);
-            bf16_conversion_c =
-                allocate<__nv_bfloat16>(bf16_conversion_elements);
+            if (bf16_attention_activation_elements != 0) {
+                bf16_attention_activations = allocate<__nv_bfloat16>(
+                    static_cast<std::size_t>(config.layers)
+                    * bf16_attention_activation_elements);
+            }
         }
 
         std::vector<float> host_cosine(frequencies);
@@ -267,7 +274,9 @@ struct DenseGptModel::Implementation {
 
     ~Implementation() {
         if (bf16_parameters != nullptr) {
-            device_free(bf16_conversion_c);
+            if (bf16_attention_activations != nullptr) {
+                device_free(bf16_attention_activations);
+            }
             device_free(bf16_conversion_b);
             device_free(bf16_conversion_a);
             device_free(bf16_parameters);
@@ -306,6 +315,7 @@ struct DenseGptModel::Implementation {
     std::size_t block_workspace_elements = 0;
     std::size_t norm_workspace_elements = 0;
     std::size_t bf16_conversion_elements = 0;
+    std::size_t bf16_attention_activation_elements = 0;
 
     float* parameters = nullptr;
     float* gradients = nullptr;
@@ -331,7 +341,7 @@ struct DenseGptModel::Implementation {
     __nv_bfloat16* bf16_parameters = nullptr;
     __nv_bfloat16* bf16_conversion_a = nullptr;
     __nv_bfloat16* bf16_conversion_b = nullptr;
-    __nv_bfloat16* bf16_conversion_c = nullptr;
+    __nv_bfloat16* bf16_attention_activations = nullptr;
     bool forward_ready = false;
 };
 
@@ -503,7 +513,11 @@ void DenseGptModel::run_model_forward(
                 activations,
                 model.bf16_conversion_a,
                 model.bf16_conversion_b,
-                model.bf16_conversion_c,
+                model.bf16_attention_activations == nullptr
+                    ? nullptr
+                    : model.bf16_attention_activations
+                        + static_cast<std::size_t>(layer)
+                            * model.bf16_attention_activation_elements,
                 model.block_config);
         } else {
             transformer_block_forward_cuda(
@@ -708,7 +722,11 @@ void DenseGptModel::backward() {
                 model.block_workspace,
                 model.bf16_conversion_a,
                 model.bf16_conversion_b,
-                model.bf16_conversion_c,
+                model.bf16_attention_activations == nullptr
+                    ? nullptr
+                    : model.bf16_attention_activations
+                        + static_cast<std::size_t>(layer)
+                            * model.bf16_attention_activation_elements,
                 model.block_config);
         } else {
             transformer_block_backward_cuda(
@@ -869,7 +887,9 @@ ModelMemoryReport DenseGptModel::memory_report() const {
     const std::size_t token_bytes =
         static_cast<std::size_t>(2 * model.rows) * sizeof(int);
     const std::size_t bf16_bytes = model.precision == ModelPrecision::bf16
-        ? (model.layout.elements + 3 * model.bf16_conversion_elements)
+        ? (model.layout.elements + 2 * model.bf16_conversion_elements
+           + static_cast<std::size_t>(model.config.layers)
+               * model.bf16_attention_activation_elements)
             * sizeof(__nv_bfloat16)
         : 0;
     return {

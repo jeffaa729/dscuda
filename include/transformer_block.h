@@ -94,7 +94,8 @@ void transformer_block_backward_cuda(
     cudaStream_t stream = nullptr);
 
 // Runs linear projections on BF16 Tensor Cores while retaining FP32
-// activations, normalization, attention softmax, residuals, and gradients.
+// normalization, residuals, and gradients. Fused attention stores one BF16
+// Q/K/V copy in saved_attention_qkv for reuse by backward.
 void transformer_block_forward_bf16_cuda(
     float* output,
     const float* input,
@@ -105,7 +106,7 @@ void transformer_block_forward_bf16_cuda(
     float* activations,
     __nv_bfloat16* conversion_workspace_a,
     __nv_bfloat16* conversion_workspace_b,
-    __nv_bfloat16* conversion_workspace_c,
+    __nv_bfloat16* saved_attention_qkv,
     const TransformerBlockConfig& config,
     cudaStream_t stream = nullptr);
 
@@ -122,7 +123,7 @@ void transformer_block_backward_bf16_cuda(
     float* workspace,
     __nv_bfloat16* conversion_workspace_a,
     __nv_bfloat16* conversion_workspace_b,
-    __nv_bfloat16* conversion_workspace_c,
+    const __nv_bfloat16* saved_attention_qkv,
     const TransformerBlockConfig& config,
     cudaStream_t stream = nullptr);
 
