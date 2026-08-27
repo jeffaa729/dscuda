@@ -34,6 +34,18 @@ def read_report(ncu, report):
 
 
 def kernel_name(full_name):
+    flash_attention = re.search(
+        r"flash_attention_(forward|backward_query|backward_key_value)(?:_tensor_core)?_kernel",
+        full_name,
+    )
+    if flash_attention:
+        names = {
+            "forward": "flash_fwd",
+            "backward_query": "flash_bwd_dq",
+            "backward_key_value": "flash_bwd_dkv",
+        }
+        return names[flash_attention.group(1)]
+
     matmul = re.search(
         r"matmul(?:_tensor_core(?:_mma|_edge)?)?_kernel<([^>]*)>",
         full_name,
@@ -136,7 +148,9 @@ def numeric_value(metrics, section, metric):
 def stage_name(kernel):
     name = kernel["name"]
     if name.startswith("matmul"):
-        return "matmul"
+        return "gemm"
+    if name.startswith("convert_fp32_to_bf16"):
+        return "bf16_conversion"
     if name.startswith("rmsnorm"):
         return "rmsnorm"
     if name.startswith("rope"):
@@ -145,10 +159,20 @@ def stage_name(kernel):
         return "softmax"
     if name.startswith("attention"):
         return "attention_layout"
+    if name.startswith("flash_"):
+        return "flash_attention"
     if name.startswith("swiglu"):
         return "swiglu"
     if name.startswith("residual"):
         return "residual"
+    if name.startswith("cross_entropy"):
+        return "loss"
+    if name.startswith("embedding"):
+        return "embedding"
+    if name.startswith("global_norm") or name.startswith("clip_gradients"):
+        return "gradient_norm"
+    if name.startswith("adamw"):
+        return "optimizer"
     return "other"
 
 

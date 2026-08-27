@@ -28,6 +28,7 @@ add_library(dscuda_kernels STATIC
     kernels/cross_entropy.cu
     kernels/cuda_common.cu
     kernels/embedding.cu
+    kernels/flash_attention.cu
     kernels/global_norm.cu
     kernels/matmul.cu
     kernels/model.cu
@@ -94,8 +95,17 @@ target_link_libraries(benchmark_softmax PRIVATE dscuda_kernels)
 add_executable(test_attention tests/test_attention.cu)
 target_link_libraries(test_attention PRIVATE dscuda_kernels)
 
+add_executable(test_flash_attention tests/test_flash_attention.cu)
+target_link_libraries(test_flash_attention PRIVATE dscuda_kernels)
+
 add_executable(benchmark_attention benchmarks/benchmark_attention.cu)
 target_link_libraries(benchmark_attention PRIVATE dscuda_kernels)
+
+add_executable(benchmark_flash_attention benchmarks/benchmark_flash_attention.cu)
+target_link_libraries(benchmark_flash_attention PRIVATE dscuda_kernels)
+
+add_executable(benchmark_training_step benchmarks/benchmark_training_step.cu)
+target_link_libraries(benchmark_training_step PRIVATE dscuda_kernels)
 
 add_executable(test_residual tests/test_residual.cu)
 target_link_libraries(test_residual PRIVATE dscuda_kernels)
@@ -139,6 +149,9 @@ target_link_libraries(test_dataset PRIVATE dscuda_data)
 add_executable(test_model tests/test_model.cu)
 target_link_libraries(test_model PRIVATE dscuda_kernels)
 
+add_executable(test_model_bf16 tests/test_model_bf16.cu)
+target_link_libraries(test_model_bf16 PRIVATE dscuda_kernels)
+
 add_executable(train_dscuda train_dscuda.cu)
 target_link_libraries(train_dscuda PRIVATE dscuda_kernels dscuda_data)
 
@@ -158,6 +171,7 @@ add_test(NAME matmul COMMAND test_matmul)
 add_test(NAME rope COMMAND test_rope)
 add_test(NAME softmax COMMAND test_softmax)
 add_test(NAME attention COMMAND test_attention)
+add_test(NAME flash_attention COMMAND test_flash_attention)
 add_test(NAME residual COMMAND test_residual)
 add_test(NAME transformer_block COMMAND test_transformer_block)
 add_test(NAME embedding COMMAND test_embedding)
@@ -167,6 +181,7 @@ add_test(NAME global_norm COMMAND test_global_norm)
 add_test(NAME tokenizer_cpp COMMAND test_tokenizer)
 add_test(NAME dataset COMMAND test_dataset)
 add_test(NAME model COMMAND test_model)
+add_test(NAME model_bf16 COMMAND test_model_bf16)
 add_test(NAME checkpoint COMMAND test_checkpoint)
 add_test(NAME generation COMMAND test_generation)
 if(Python3_Interpreter_FOUND)

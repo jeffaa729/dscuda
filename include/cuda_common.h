@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
 #include <cstddef>
@@ -16,5 +17,11 @@ void device_free(void* pointer);
 void synchronize(cudaStream_t stream = nullptr);
 cudaDeviceProp device_properties(int device = 0);
 void print_device_summary(int device = 0);
+
+void convert_fp32_to_bf16_cuda(
+    __nv_bfloat16* output,
+    const float* input,
+    std::size_t elements,
+    cudaStream_t stream = nullptr);
 
 }  // namespace dscuda

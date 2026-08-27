@@ -1435,6 +1435,51 @@ void matmul_fp32_right_backward_cuda(
         right_gradient, left, output_gradient, K, N, M, K, N, N, stream);
 }
 
+void matmul_bf16_strided_cuda(
+    float* output,
+    const __nv_bfloat16* left,
+    const __nv_bfloat16* right,
+    int M,
+    int N,
+    int K,
+    bool transpose_left,
+    bool transpose_right,
+    bool accumulate,
+    cudaStream_t stream) {
+    const int left_stride = transpose_left ? M : K;
+    const int right_stride = transpose_right ? K : N;
+
+#define LAUNCH_BF16(TL, TR, ACC)                                              \
+    launch_tensor_core_matmul<TL, TR, ACC>(                                   \
+        output, left, right, M, N, K, left_stride, right_stride, N, stream)
+
+    if (transpose_left) {
+        if (transpose_right) {
+            if (accumulate) {
+                LAUNCH_BF16(true, true, true);
+            } else {
+                LAUNCH_BF16(true, true, false);
+            }
+        } else if (accumulate) {
+            LAUNCH_BF16(true, false, true);
+        } else {
+            LAUNCH_BF16(true, false, false);
+        }
+    } else if (transpose_right) {
+        if (accumulate) {
+            LAUNCH_BF16(false, true, true);
+        } else {
+            LAUNCH_BF16(false, true, false);
+        }
+    } else if (accumulate) {
+        LAUNCH_BF16(false, false, true);
+    } else {
+        LAUNCH_BF16(false, false, false);
+    }
+
+#undef LAUNCH_BF16
+}
+
 void matmul_bf16_forward_cuda(
     float* output,
     const __nv_bfloat16* left,

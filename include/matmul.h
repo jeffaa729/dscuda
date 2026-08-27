@@ -63,6 +63,20 @@ void matmul_fp32_right_backward_cuda(
     int K,
     cudaStream_t stream = nullptr);
 
+// Computes one BF16 Tensor Core product with optional logical transposes and
+// FP32 output accumulation. Operands retain their original row-major storage.
+void matmul_bf16_strided_cuda(
+    float* output,
+    const __nv_bfloat16* left,
+    const __nv_bfloat16* right,
+    int M,
+    int N,
+    int K,
+    bool transpose_left,
+    bool transpose_right,
+    bool accumulate,
+    cudaStream_t stream = nullptr);
+
 // Multiplies native BF16 operands on Tensor Cores and writes FP32 output; M, N, and K are multiples of 16.
 void matmul_bf16_forward_cuda(
     float* output,

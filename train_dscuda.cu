@@ -11,15 +11,21 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <exception>
+#include <fstream>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
 
 struct Options {
     std::string mode = "overfit";
+    dscuda::ModelPrecision precision = dscuda::ModelPrecision::fp32;
+    dscuda::AttentionImplementation attention =
+        dscuda::AttentionImplementation::composed;
     std::string data_directory = "data/tinystories";
     std::string output_directory = "checkpoints/tinystories";
     std::string resume_checkpoint;
@@ -39,75 +45,153 @@ struct Options {
     unsigned int seed = 1337;
 };
 
-int parse_int(const char* value) {
+int parse_int(const std::string& value) {
     return std::stoi(value);
 }
 
-float parse_float(const char* value) {
+float parse_float(const std::string& value) {
     return std::stof(value);
 }
 
+std::string trim(const std::string& text) {
+    const std::size_t first = text.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos) {
+        return {};
+    }
+    const std::size_t last = text.find_last_not_of(" \t\r\n");
+    return text.substr(first, last - first + 1);
+}
+
+void set_option(
+    Options& options,
+    const std::string& name,
+    const std::string& value) {
+    if (name == "mode") {
+        options.mode = value;
+    } else if (name == "precision") {
+        if (value == "fp32") {
+            options.precision = dscuda::ModelPrecision::fp32;
+        } else if (value == "bf16") {
+            options.precision = dscuda::ModelPrecision::bf16;
+        } else {
+            throw std::runtime_error("precision must be fp32 or bf16");
+        }
+    } else if (name == "attention") {
+        if (value == "composed") {
+            options.attention = dscuda::AttentionImplementation::composed;
+        } else if (value == "flash2") {
+            options.attention = dscuda::AttentionImplementation::flash2;
+        } else {
+            throw std::runtime_error("attention must be composed or flash2");
+        }
+    } else if (name == "data-dir") {
+        options.data_directory = value;
+    } else if (name == "output-dir") {
+        options.output_directory = value;
+    } else if (name == "resume") {
+        options.resume_checkpoint = value;
+    } else if (name == "steps") {
+        options.steps = parse_int(value);
+    } else if (name == "batch") {
+        options.batch_size = parse_int(value);
+    } else if (name == "seq") {
+        options.sequence_length = parse_int(value);
+    } else if (name == "layers") {
+        options.layers = parse_int(value);
+    } else if (name == "hidden") {
+        options.hidden_size = parse_int(value);
+    } else if (name == "heads") {
+        options.heads = parse_int(value);
+    } else if (name == "ffn") {
+        options.ffn_size = parse_int(value);
+    } else if (name == "rotary") {
+        options.rotary_size = parse_int(value);
+    } else if (name == "lr") {
+        options.learning_rate = parse_float(value);
+    } else if (name == "max-grad-norm") {
+        options.maximum_gradient_norm = parse_float(value);
+    } else if (name == "peak-tflops") {
+        options.peak_tflops = parse_float(value);
+    } else if (name == "log-every") {
+        options.log_interval = parse_int(value);
+    } else if (name == "checkpoint-every") {
+        options.checkpoint_interval = parse_int(value);
+    } else if (name == "seed") {
+        options.seed = static_cast<unsigned int>(parse_int(value));
+    } else {
+        throw std::runtime_error("unknown training option: " + name);
+    }
+}
+
+void load_config(const std::string& path, Options& options) {
+    std::ifstream file(path);
+    if (!file) {
+        throw std::runtime_error("cannot open training config: " + path);
+    }
+    std::string line;
+    int line_number = 0;
+    while (std::getline(file, line)) {
+        ++line_number;
+        line = trim(line);
+        if (line.empty() || line[0] == '#') {
+            continue;
+        }
+        const std::size_t equals = line.find('=');
+        if (equals == std::string::npos) {
+            throw std::runtime_error(
+                path + ":" + std::to_string(line_number)
+                + ": expected name = value");
+        }
+        set_option(
+            options,
+            trim(line.substr(0, equals)),
+            trim(line.substr(equals + 1)));
+    }
+}
+
+void print_help() {
+    std::printf(
+        "Usage: train_dscuda [options]\n"
+        "  --config PATH                         load name = value settings\n"
+        "  --mode overfit|tinystories --precision fp32|bf16\n"
+        "  --attention composed|flash2\n"
+        "  --data-dir PATH --output-dir PATH --resume PATH\n"
+        "  --steps N --batch N --seq N --layers N\n"
+        "  --hidden N --heads N --ffn N --rotary N\n"
+        "  --lr VALUE --max-grad-norm VALUE --peak-tflops VALUE\n"
+        "  --log-every N --checkpoint-every N --seed N\n"
+        "Command-line settings override values loaded from --config.\n");
+}
+
 Options parse_options(int argc, char** argv) {
-    Options options;
+    std::string config_path;
+    std::vector<std::pair<std::string, std::string>> overrides;
     for (int index = 1; index < argc; ++index) {
         const std::string argument = argv[index];
-        auto value = [&]() -> const char* {
-            if (index + 1 >= argc) {
-                throw std::runtime_error("missing value after " + argument);
-            }
-            return argv[++index];
-        };
-
-        if (argument == "--mode") {
-            options.mode = value();
-        } else if (argument == "--data-dir") {
-            options.data_directory = value();
-        } else if (argument == "--output-dir") {
-            options.output_directory = value();
-        } else if (argument == "--resume") {
-            options.resume_checkpoint = value();
-        } else if (argument == "--steps") {
-            options.steps = parse_int(value());
-        } else if (argument == "--batch") {
-            options.batch_size = parse_int(value());
-        } else if (argument == "--seq") {
-            options.sequence_length = parse_int(value());
-        } else if (argument == "--layers") {
-            options.layers = parse_int(value());
-        } else if (argument == "--hidden") {
-            options.hidden_size = parse_int(value());
-        } else if (argument == "--heads") {
-            options.heads = parse_int(value());
-        } else if (argument == "--ffn") {
-            options.ffn_size = parse_int(value());
-        } else if (argument == "--rotary") {
-            options.rotary_size = parse_int(value());
-        } else if (argument == "--lr") {
-            options.learning_rate = parse_float(value());
-        } else if (argument == "--max-grad-norm") {
-            options.maximum_gradient_norm = parse_float(value());
-        } else if (argument == "--peak-tflops") {
-            options.peak_tflops = parse_float(value());
-        } else if (argument == "--log-every") {
-            options.log_interval = parse_int(value());
-        } else if (argument == "--checkpoint-every") {
-            options.checkpoint_interval = parse_int(value());
-        } else if (argument == "--seed") {
-            options.seed = static_cast<unsigned int>(parse_int(value()));
-        } else if (argument == "--help") {
-            std::printf(
-                "Usage: train_dscuda [options]\n"
-                "  --mode overfit|tinystories\n"
-                "  --data-dir PATH --output-dir PATH --resume PATH\n"
-                "  --steps N --batch N --seq N --layers N\n"
-                "  --hidden N --heads N --ffn N --rotary N\n"
-                "  --lr VALUE --max-grad-norm VALUE --peak-tflops VALUE\n"
-                "  --log-every N\n"
-                "  --checkpoint-every N --seed N\n");
+        if (argument == "--help") {
+            print_help();
             std::exit(0);
+        }
+        if (index + 1 >= argc) {
+            throw std::runtime_error("missing value after " + argument);
+        }
+        const std::string value = argv[++index];
+        if (argument == "--config") {
+            config_path = value;
+        } else if (argument.rfind("--", 0) == 0) {
+            overrides.emplace_back(argument.substr(2), value);
         } else {
             throw std::runtime_error("unknown option: " + argument);
         }
+    }
+
+    Options options;
+    if (!config_path.empty()) {
+        load_config(config_path, options);
+        std::printf("Loaded training config: %s\n", config_path.c_str());
+    }
+    for (const auto& [name, value] : overrides) {
+        set_option(options, name, value);
     }
     if (options.mode != "overfit" && options.mode != "tinystories") {
         throw std::runtime_error("--mode must be overfit or tinystories");
@@ -152,6 +236,7 @@ dscuda::ModelConfig make_config(
         use_default(options.ffn_size, overfit ? 192 : 768),
         use_default(options.rotary_size, overfit ? 16 : 64),
         1.0e-5F,
+        options.attention,
     };
 }
 
@@ -167,16 +252,21 @@ double training_flops_per_token(
 void print_model_summary(
     const dscuda::ModelConfig& config,
     const dscuda::ModelMemoryReport& memory,
-    double peak_tflops) {
+    double peak_tflops,
+    dscuda::ModelPrecision precision) {
     std::printf(
-        "Model: L=%d H=%d heads=%d FFN=%d, B=%d T=%d V=%d\n",
+        "Model: L=%d H=%d heads=%d FFN=%d, B=%d T=%d V=%d, %s, %s attention\n",
         config.layers,
         config.hidden_size,
         config.heads,
         config.ffn_size,
         config.batch_size,
         config.sequence_length,
-        config.vocabulary_size);
+        config.vocabulary_size,
+        precision == dscuda::ModelPrecision::bf16 ? "BF16 mixed" : "FP32",
+        config.attention == dscuda::AttentionImplementation::flash2
+            ? "Flash2"
+            : "composed");
     std::printf(
         "Parameters: %.3f M, allocated model memory: %.1f MiB\n",
         static_cast<double>(memory.parameter_elements) / 1.0e6,
@@ -223,12 +313,13 @@ int run_overfit(const Options& options) {
     std::vector<int> inputs(stream.begin(), stream.end() - 1);
     std::vector<int> targets(stream.begin() + 1, stream.end());
 
-    dscuda::DenseGptModel model(config);
+    dscuda::DenseGptModel model(config, options.precision);
     model.initialize(options.seed);
     const dscuda::ModelMemoryReport memory = model.memory_report();
     const double flops_per_token =
         training_flops_per_token(config, memory);
-    print_model_summary(config, memory, options.peak_tflops);
+    print_model_summary(
+        config, memory, options.peak_tflops, options.precision);
     const dscuda::AdamWConfig optimizer{
         learning_rate, 0.9F, 0.95F, 1.0e-8F, 0.0F};
 
@@ -294,6 +385,7 @@ int run_tinystories(const Options& options) {
         const dscuda::CheckpointMetadata metadata =
             dscuda::read_checkpoint_metadata(options.resume_checkpoint);
         config = metadata.config;
+        config.attention = options.attention;
         completed_steps = metadata.step;
         if (config.vocabulary_size != tokenizer.vocabulary_size()) {
             throw std::runtime_error(
@@ -308,7 +400,7 @@ int run_tinystories(const Options& options) {
         throw std::runtime_error("token dataset is smaller than one model batch");
     }
 
-    dscuda::DenseGptModel model(config);
+    dscuda::DenseGptModel model(config, options.precision);
     if (options.resume_checkpoint.empty()) {
         model.initialize(options.seed);
     } else {
@@ -321,7 +413,8 @@ int run_tinystories(const Options& options) {
     const dscuda::ModelMemoryReport memory = model.memory_report();
     const double flops_per_token =
         training_flops_per_token(config, memory);
-    print_model_summary(config, memory, options.peak_tflops);
+    print_model_summary(
+        config, memory, options.peak_tflops, options.precision);
     std::printf(
         "Dataset: %zu training tokens, %zu validation tokens\n",
         train.token_count(),
