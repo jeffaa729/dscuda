@@ -28,6 +28,7 @@ add_library(dscuda_kernels STATIC
     kernels/cross_entropy.cu
     kernels/cuda_common.cu
     kernels/embedding.cu
+    kernels/flash_attention.cu
     kernels/global_norm.cu
     kernels/matmul.cu
     kernels/model.cu
@@ -94,8 +95,14 @@ target_link_libraries(benchmark_softmax PRIVATE dscuda_kernels)
 add_executable(test_attention tests/test_attention.cu)
 target_link_libraries(test_attention PRIVATE dscuda_kernels)
 
+add_executable(test_flash_attention tests/test_flash_attention.cu)
+target_link_libraries(test_flash_attention PRIVATE dscuda_kernels)
+
 add_executable(benchmark_attention benchmarks/benchmark_attention.cu)
 target_link_libraries(benchmark_attention PRIVATE dscuda_kernels)
+
+add_executable(benchmark_flash_attention benchmarks/benchmark_flash_attention.cu)
+target_link_libraries(benchmark_flash_attention PRIVATE dscuda_kernels)
 
 add_executable(test_residual tests/test_residual.cu)
 target_link_libraries(test_residual PRIVATE dscuda_kernels)
@@ -161,6 +168,7 @@ add_test(NAME matmul COMMAND test_matmul)
 add_test(NAME rope COMMAND test_rope)
 add_test(NAME softmax COMMAND test_softmax)
 add_test(NAME attention COMMAND test_attention)
+add_test(NAME flash_attention COMMAND test_flash_attention)
 add_test(NAME residual COMMAND test_residual)
 add_test(NAME transformer_block COMMAND test_transformer_block)
 add_test(NAME embedding COMMAND test_embedding)

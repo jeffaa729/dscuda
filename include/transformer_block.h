@@ -1,5 +1,7 @@
 #pragma once
 
+#include "attention.h"
+
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
@@ -17,6 +19,7 @@ struct TransformerBlockConfig {
     int rotary_size;
     float epsilon;
     float attention_scale;
+    AttentionImplementation attention = AttentionImplementation::composed;
 };
 
 struct TransformerBlockParameters {
@@ -100,7 +103,9 @@ void transformer_block_forward_bf16_cuda(
     const float* cosine,
     const float* sine,
     float* activations,
-    __nv_bfloat16* conversion_workspace,
+    __nv_bfloat16* conversion_workspace_a,
+    __nv_bfloat16* conversion_workspace_b,
+    __nv_bfloat16* conversion_workspace_c,
     const TransformerBlockConfig& config,
     cudaStream_t stream = nullptr);
 
@@ -117,6 +122,7 @@ void transformer_block_backward_bf16_cuda(
     float* workspace,
     __nv_bfloat16* conversion_workspace_a,
     __nv_bfloat16* conversion_workspace_b,
+    __nv_bfloat16* conversion_workspace_c,
     const TransformerBlockConfig& config,
     cudaStream_t stream = nullptr);
 

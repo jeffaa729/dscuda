@@ -124,6 +124,49 @@ This first mixed-precision stage uses slightly more memory because it retains
 the complete FP32 training state and adds BF16 parameter shadows plus conversion
 workspace. Moving saved activations to BF16 is a separate optimization.
 
+## Fused causal attention
+
+Select the fused attention path independently from matrix precision:
+
+```bash
+./build/train_dscuda \
+    --config configs/tinystories_flash2.conf
+```
+
+The equivalent configuration setting is `attention = flash2`; use
+`attention = composed` to retain the QK matmul, materialized probability
+matrix, softmax, and PV matmul baseline. The fused path tiles K/V through
+shared memory, performs FP32 online softmax, saves one log-sum-exp value per
+`[B,H,T]` row, and reconstructs probabilities during backward. Its saved
+attention state is therefore `O(BHT)` rather than `O(BHT^2)`.
+
+For BF16 inputs with `D=64` and a sequence length divisible by 64, the SM89
+kernel uses native `mma.sync` instructions for `QK^T`, `PV`, `dO V^T`, `dS K`,
+`dS^T Q`, and `P^T dO`. Softmax maxima, denominators, log-sum-exp, and output
+accumulation remain FP32. Other supported shapes use the readable warp-level
+fallback. On the RTX 4060 Laptop test system, Nsight Compute measured:
+
+| sequence | composed time | fused time | composed DRAM reads | fused DRAM reads |
+|---:|---:|---:|---:|---:|
+| 128 | 0.122 ms | 0.055 ms | 18.11 MB | 6.16 MB |
+| 256 | 0.323 ms | 0.136 ms | 48.97 MB | 12.20 MB |
+| 512 | 1.293 ms | 0.312 ms | 151.44 MB | 24.30 MB |
+
+For the default four-layer TinyStories configuration at `B=4`, `T=256`, and
+`H=256`, a short identical-data comparison measured 104,917 tokens/s and
+282.7 MiB with composed attention versus 121,431 tokens/s and 223.7 MiB with
+the fused Tensor Core path.
+
+Reproduce the fused-kernel profile and overwrite its previous reports with:
+
+```bash
+bash scripts/profile.sh flash_attention
+```
+
+The next performance step is reducing the current 197-220 registers per thread,
+double-buffering K/V tile loads, and adding Tensor Core dispatches for more head
+dimensions without complicating the reference path.
+
 Each `step_XXXXXXXX` checkpoint contains a versioned architecture header,
 parameters, both AdamW moment buffers, the completed step, and a `DONE` marker.
 The marker is written last, so an interrupted `.part` file is never treated as

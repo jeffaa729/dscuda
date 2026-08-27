@@ -24,6 +24,8 @@ namespace {
 struct Options {
     std::string mode = "overfit";
     dscuda::ModelPrecision precision = dscuda::ModelPrecision::fp32;
+    dscuda::AttentionImplementation attention =
+        dscuda::AttentionImplementation::composed;
     std::string data_directory = "data/tinystories";
     std::string output_directory = "checkpoints/tinystories";
     std::string resume_checkpoint;
@@ -73,6 +75,14 @@ void set_option(
             options.precision = dscuda::ModelPrecision::bf16;
         } else {
             throw std::runtime_error("precision must be fp32 or bf16");
+        }
+    } else if (name == "attention") {
+        if (value == "composed") {
+            options.attention = dscuda::AttentionImplementation::composed;
+        } else if (value == "flash2") {
+            options.attention = dscuda::AttentionImplementation::flash2;
+        } else {
+            throw std::runtime_error("attention must be composed or flash2");
         }
     } else if (name == "data-dir") {
         options.data_directory = value;
@@ -144,6 +154,7 @@ void print_help() {
         "Usage: train_dscuda [options]\n"
         "  --config PATH                         load name = value settings\n"
         "  --mode overfit|tinystories --precision fp32|bf16\n"
+        "  --attention composed|flash2\n"
         "  --data-dir PATH --output-dir PATH --resume PATH\n"
         "  --steps N --batch N --seq N --layers N\n"
         "  --hidden N --heads N --ffn N --rotary N\n"
@@ -225,6 +236,7 @@ dscuda::ModelConfig make_config(
         use_default(options.ffn_size, overfit ? 192 : 768),
         use_default(options.rotary_size, overfit ? 16 : 64),
         1.0e-5F,
+        options.attention,
     };
 }
 
@@ -243,7 +255,7 @@ void print_model_summary(
     double peak_tflops,
     dscuda::ModelPrecision precision) {
     std::printf(
-        "Model: L=%d H=%d heads=%d FFN=%d, B=%d T=%d V=%d, %s\n",
+        "Model: L=%d H=%d heads=%d FFN=%d, B=%d T=%d V=%d, %s, %s attention\n",
         config.layers,
         config.hidden_size,
         config.heads,
@@ -251,7 +263,10 @@ void print_model_summary(
         config.batch_size,
         config.sequence_length,
         config.vocabulary_size,
-        precision == dscuda::ModelPrecision::bf16 ? "BF16 mixed" : "FP32");
+        precision == dscuda::ModelPrecision::bf16 ? "BF16 mixed" : "FP32",
+        config.attention == dscuda::AttentionImplementation::flash2
+            ? "Flash2"
+            : "composed");
     std::printf(
         "Parameters: %.3f M, allocated model memory: %.1f MiB\n",
         static_cast<double>(memory.parameter_elements) / 1.0e6,
@@ -370,6 +385,7 @@ int run_tinystories(const Options& options) {
         const dscuda::CheckpointMetadata metadata =
             dscuda::read_checkpoint_metadata(options.resume_checkpoint);
         config = metadata.config;
+        config.attention = options.attention;
         completed_steps = metadata.step;
         if (config.vocabulary_size != tokenizer.vocabulary_size()) {
             throw std::runtime_error(

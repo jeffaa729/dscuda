@@ -26,6 +26,7 @@ struct ModelConfig {
     int ffn_size;
     int rotary_size;
     float rms_epsilon;
+    AttentionImplementation attention = AttentionImplementation::composed;
 };
 
 struct ModelBlockOffsets {

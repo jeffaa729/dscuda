@@ -6,7 +6,27 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 build_dir="$repo_root/build"
 report_dir="$repo_root/profiles/reports"
 benchmark="${1:-swiglu}"
-ncu_bin="/usr/local/cuda/bin/ncu"
+nvcc_bin="${CUDACXX:-}"
+if [[ -z "$nvcc_bin" ]]; then
+    nvcc_bin="$(
+        for candidate in /usr/local/cuda-*/bin/nvcc; do
+            [[ -x "$candidate" ]] && printf '%s\n' "$candidate"
+        done | sort -V | tail -n 1
+    )"
+fi
+if [[ -z "$nvcc_bin" && -x /usr/local/cuda/bin/nvcc ]]; then
+    nvcc_bin="/usr/local/cuda/bin/nvcc"
+fi
+ncu_bin=""
+for candidate in /usr/local/cuda/bin/ncu /usr/local/cuda-*/bin/ncu; do
+    if [[ -x "$candidate" ]]; then
+        ncu_bin="$candidate"
+    fi
+done
+if [[ -z "$nvcc_bin" || -z "$ncu_bin" ]]; then
+    echo "CUDA compiler or Nsight Compute was not found under /usr/local/cuda*" >&2
+    exit 1
+fi
 
 case "$benchmark" in
     rmsnorm)
@@ -51,6 +71,13 @@ case "$benchmark" in
         workload_name="sequence"
         workloads=(128 256 512)
         ;;
+    flash_attention)
+        test_target="test_flash_attention"
+        benchmark_target="benchmark_flash_attention"
+        kernel_pattern="regex:flash_attention_.*_kernel"
+        workload_name="sequence"
+        workloads=(128 256 512 1024)
+        ;;
     transformer_block)
         test_target="test_transformer_block"
         benchmark_target="benchmark_transformer_block"
@@ -87,7 +114,7 @@ case "$benchmark" in
         workloads=(1048576 4194304 16777216)
         ;;
     *)
-        echo "usage: bash scripts/profile.sh {rmsnorm|swiglu|matmul|rope|softmax|attention|transformer_block|embedding|adamw|cross_entropy|global_norm}" >&2
+        echo "usage: bash scripts/profile.sh {rmsnorm|swiglu|matmul|rope|softmax|attention|flash_attention|transformer_block|embedding|adamw|cross_entropy|global_norm}" >&2
         exit 1
         ;;
 esac
@@ -96,7 +123,7 @@ cmake \
     -S "$repo_root" \
     -B "$build_dir" \
     -DCMAKE_BUILD_TYPE=Release \
-    -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc \
+    -DCMAKE_CUDA_COMPILER="$nvcc_bin" \
     -DCMAKE_CUDA_ARCHITECTURES=89
 cmake --build "$build_dir" --target "$test_target" "$benchmark_target" -j
 ctest --test-dir "$build_dir" --output-on-failure -R "^${benchmark}$"
@@ -126,6 +153,8 @@ for workload in "${workloads[@]}"; do
                 benchmark_arguments=(1 8 "$workload" 0.125)
             elif [[ "$benchmark" == "attention" ]]; then
                 benchmark_arguments=(2 "$workload" 8 64 0.125)
+            elif [[ "$benchmark" == "flash_attention" ]]; then
+                benchmark_arguments=(2 "$workload" 8 64 bf16)
             elif [[ "$benchmark" == "transformer_block" ]]; then
                 benchmark_arguments=(2 "$workload" 512 8 1536)
             elif [[ "$benchmark" == "embedding" ]]; then

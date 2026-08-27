@@ -5,6 +5,7 @@
 
 #include "attention.h"
 #include "cuda_common.h"
+#include "flash_attention.h"
 #include "matmul.h"
 #include "residual.h"
 #include "rmsnorm.h"
@@ -20,7 +21,7 @@ struct ActivationLayout {
     float* query;
     float* key;
     float* value;
-    float* probabilities;
+    float* attention_auxiliary;
     float* attention_output;
     float* residual1;
     float* norm2;
@@ -37,7 +38,7 @@ struct ConstActivationLayout {
     const float* query;
     const float* key;
     const float* value;
-    const float* probabilities;
+    const float* attention_auxiliary;
     const float* attention_output;
     const float* residual1;
     const float* norm2;
@@ -64,6 +65,38 @@ struct BackwardLayout {
     float* attention_workspace;
 };
 
+std::size_t attention_auxiliary_elements(
+    const TransformerBlockConfig& config) {
+    if (config.attention == AttentionImplementation::flash2) {
+        return static_cast<std::size_t>(config.batch_size) * config.heads
+            * config.sequence_length;
+    }
+    return static_cast<std::size_t>(config.batch_size) * config.heads
+        * config.sequence_length * config.sequence_length;
+}
+
+std::size_t attention_forward_workspace_elements(
+    const TransformerBlockConfig& config) {
+    return config.attention == AttentionImplementation::flash2
+        ? 0
+        : dense_attention_forward_workspace_elements(
+              config.batch_size,
+              config.sequence_length,
+              config.heads,
+              config.head_size);
+}
+
+std::size_t attention_backward_workspace_elements(
+    const TransformerBlockConfig& config) {
+    return config.attention == AttentionImplementation::flash2
+        ? 0
+        : dense_attention_backward_workspace_elements(
+              config.batch_size,
+              config.sequence_length,
+              config.heads,
+              config.head_size);
+}
+
 ActivationLayout activation_layout(
     float* buffer,
     const TransformerBlockConfig& config) {
@@ -71,9 +104,8 @@ ActivationLayout activation_layout(
         static_cast<std::size_t>(config.batch_size) * config.sequence_length;
     const std::size_t activations = rows * config.hidden_size;
     const std::size_t ffn_activations = rows * config.ffn_size;
-    const std::size_t probabilities =
-        static_cast<std::size_t>(config.batch_size) * config.heads *
-        config.sequence_length * config.sequence_length;
+    const std::size_t attention_auxiliary =
+        attention_auxiliary_elements(config);
 
     ActivationLayout layout;
     layout.norm1 = buffer;
@@ -81,8 +113,9 @@ ActivationLayout activation_layout(
     layout.query = layout.inverse_rms1 + rows;
     layout.key = layout.query + activations;
     layout.value = layout.key + activations;
-    layout.probabilities = layout.value + activations;
-    layout.attention_output = layout.probabilities + probabilities;
+    layout.attention_auxiliary = layout.value + activations;
+    layout.attention_output =
+        layout.attention_auxiliary + attention_auxiliary;
     layout.residual1 = layout.attention_output + activations;
     layout.norm2 = layout.residual1 + activations;
     layout.inverse_rms2 = layout.norm2 + activations;
@@ -100,9 +133,8 @@ ConstActivationLayout activation_layout(
         static_cast<std::size_t>(config.batch_size) * config.sequence_length;
     const std::size_t activations = rows * config.hidden_size;
     const std::size_t ffn_activations = rows * config.ffn_size;
-    const std::size_t probabilities =
-        static_cast<std::size_t>(config.batch_size) * config.heads *
-        config.sequence_length * config.sequence_length;
+    const std::size_t attention_auxiliary =
+        attention_auxiliary_elements(config);
 
     ConstActivationLayout layout;
     layout.norm1 = buffer;
@@ -110,8 +142,9 @@ ConstActivationLayout activation_layout(
     layout.query = layout.inverse_rms1 + rows;
     layout.key = layout.query + activations;
     layout.value = layout.key + activations;
-    layout.probabilities = layout.value + activations;
-    layout.attention_output = layout.probabilities + probabilities;
+    layout.attention_auxiliary = layout.value + activations;
+    layout.attention_output =
+        layout.attention_auxiliary + attention_auxiliary;
     layout.residual1 = layout.attention_output + activations;
     layout.norm2 = layout.residual1 + activations;
     layout.inverse_rms2 = layout.norm2 + activations;
@@ -310,15 +343,9 @@ std::size_t transformer_block_activation_elements(
         static_cast<std::size_t>(config.batch_size) * config.sequence_length;
     const std::size_t activations = rows * config.hidden_size;
     const std::size_t ffn_activations = rows * config.ffn_size;
-    const std::size_t probabilities =
-        static_cast<std::size_t>(config.batch_size) * config.heads *
-        config.sequence_length * config.sequence_length;
-    return 7 * activations + 3 * ffn_activations + 2 * rows + probabilities +
-        dense_attention_forward_workspace_elements(
-               config.batch_size,
-               config.sequence_length,
-               config.heads,
-               config.head_size);
+    return 7 * activations + 3 * ffn_activations + 2 * rows
+        + attention_auxiliary_elements(config)
+        + attention_forward_workspace_elements(config);
 }
 
 std::size_t transformer_block_backward_workspace_elements(
@@ -327,12 +354,8 @@ std::size_t transformer_block_backward_workspace_elements(
         static_cast<std::size_t>(config.batch_size) * config.sequence_length;
     const std::size_t activations = rows * config.hidden_size;
     const std::size_t ffn_activations = rows * config.ffn_size;
-    return 10 * activations + 3 * ffn_activations +
-        dense_attention_backward_workspace_elements(
-               config.batch_size,
-               config.sequence_length,
-               config.heads,
-               config.head_size);
+    return 10 * activations + 3 * ffn_activations
+        + attention_backward_workspace_elements(config);
 }
 
 void transformer_block_forward_impl(
@@ -343,7 +366,9 @@ void transformer_block_forward_impl(
     const float* cosine,
     const float* sine,
     float* activations,
-    __nv_bfloat16* conversion_workspace,
+    __nv_bfloat16* conversion_workspace_a,
+    __nv_bfloat16* conversion_workspace_b,
+    __nv_bfloat16* conversion_workspace_c,
     const TransformerBlockConfig& config,
     cudaStream_t stream) {
     const int rows = config.batch_size * config.sequence_length;
@@ -368,7 +393,7 @@ void transformer_block_forward_impl(
         rows,
         config.hidden_size,
         config.hidden_size,
-        conversion_workspace,
+        conversion_workspace_a,
         stream);
     linear_forward(
         saved.key,
@@ -378,7 +403,7 @@ void transformer_block_forward_impl(
         rows,
         config.hidden_size,
         config.hidden_size,
-        conversion_workspace,
+        conversion_workspace_a,
         stream);
     linear_forward(
         saved.value,
@@ -388,7 +413,7 @@ void transformer_block_forward_impl(
         rows,
         config.hidden_size,
         config.hidden_size,
-        conversion_workspace,
+        conversion_workspace_a,
         stream);
     rope_forward_cuda(
         saved.query,
@@ -412,19 +437,64 @@ void transformer_block_forward_impl(
         config.head_size,
         config.rotary_size,
         stream);
-    dense_attention_forward_cuda(
-        saved.attention_output,
-        saved.probabilities,
-        saved.query,
-        saved.key,
-        saved.value,
-        saved.attention_workspace,
-        config.batch_size,
-        config.sequence_length,
-        config.heads,
-        config.head_size,
-        config.attention_scale,
-        stream);
+    if (config.attention == AttentionImplementation::flash2) {
+        if (bf16_parameters == nullptr) {
+            flash_attention_forward_cuda(
+                saved.attention_output,
+                saved.attention_auxiliary,
+                saved.query,
+                saved.key,
+                saved.value,
+                config.batch_size,
+                config.sequence_length,
+                config.heads,
+                config.head_size,
+                config.attention_scale,
+                stream);
+        } else {
+            convert_fp32_to_bf16_cuda(
+                conversion_workspace_a,
+                saved.query,
+                activation_elements,
+                stream);
+            convert_fp32_to_bf16_cuda(
+                conversion_workspace_b,
+                saved.key,
+                activation_elements,
+                stream);
+            convert_fp32_to_bf16_cuda(
+                conversion_workspace_c,
+                saved.value,
+                activation_elements,
+                stream);
+            flash_attention_forward_bf16_cuda(
+                saved.attention_output,
+                saved.attention_auxiliary,
+                conversion_workspace_a,
+                conversion_workspace_b,
+                conversion_workspace_c,
+                config.batch_size,
+                config.sequence_length,
+                config.heads,
+                config.head_size,
+                config.attention_scale,
+                stream);
+        }
+    } else {
+        dense_attention_forward_cuda(
+            saved.attention_output,
+            saved.attention_auxiliary,
+            saved.query,
+            saved.key,
+            saved.value,
+            saved.attention_workspace,
+            config.batch_size,
+            config.sequence_length,
+            config.heads,
+            config.head_size,
+            config.attention_scale,
+            stream);
+    }
     linear_forward(
         output,
         saved.attention_output,
@@ -433,7 +503,7 @@ void transformer_block_forward_impl(
         rows,
         config.hidden_size,
         config.hidden_size,
-        conversion_workspace,
+        conversion_workspace_a,
         stream);
     residual_forward_cuda(
         saved.residual1, input, output, activation_elements, stream);
@@ -454,7 +524,7 @@ void transformer_block_forward_impl(
         rows,
         config.ffn_size,
         config.hidden_size,
-        conversion_workspace,
+        conversion_workspace_a,
         stream);
     linear_forward(
         saved.up,
@@ -464,7 +534,7 @@ void transformer_block_forward_impl(
         rows,
         config.ffn_size,
         config.hidden_size,
-        conversion_workspace,
+        conversion_workspace_a,
         stream);
     swiglu_forward_cuda(
         saved.hidden, saved.gate, saved.up, ffn_elements, stream);
@@ -476,7 +546,7 @@ void transformer_block_forward_impl(
         rows,
         config.hidden_size,
         config.ffn_size,
-        conversion_workspace,
+        conversion_workspace_a,
         stream);
     residual_forward_cuda(
         output, saved.residual1, output, activation_elements, stream);
@@ -495,6 +565,7 @@ void transformer_block_backward_impl(
     float* workspace,
     __nv_bfloat16* conversion_workspace_a,
     __nv_bfloat16* conversion_workspace_b,
+    __nv_bfloat16* conversion_workspace_c,
     const TransformerBlockConfig& config,
     cudaStream_t stream) {
     const int rows = config.batch_size * config.sequence_length;
@@ -602,22 +673,75 @@ void transformer_block_backward_impl(
         0,
         3 * activation_elements * sizeof(float),
         stream));
-    dense_attention_backward_cuda(
-        gradient.rotated_query_gradient,
-        gradient.rotated_key_gradient,
-        gradient.value_gradient,
-        gradient.attention_output_gradient,
-        saved.probabilities,
-        saved.query,
-        saved.key,
-        saved.value,
-        gradient.attention_workspace,
-        config.batch_size,
-        config.sequence_length,
-        config.heads,
-        config.head_size,
-        config.attention_scale,
-        stream);
+    if (config.attention == AttentionImplementation::flash2) {
+        if (bf16_parameters == nullptr) {
+            flash_attention_backward_cuda(
+                gradient.rotated_query_gradient,
+                gradient.rotated_key_gradient,
+                gradient.value_gradient,
+                gradient.attention_output_gradient,
+                saved.attention_output,
+                saved.attention_auxiliary,
+                saved.query,
+                saved.key,
+                saved.value,
+                config.batch_size,
+                config.sequence_length,
+                config.heads,
+                config.head_size,
+                config.attention_scale,
+                stream);
+        } else {
+            convert_fp32_to_bf16_cuda(
+                conversion_workspace_a,
+                saved.query,
+                activation_elements,
+                stream);
+            convert_fp32_to_bf16_cuda(
+                conversion_workspace_b,
+                saved.key,
+                activation_elements,
+                stream);
+            convert_fp32_to_bf16_cuda(
+                conversion_workspace_c,
+                saved.value,
+                activation_elements,
+                stream);
+            flash_attention_backward_bf16_cuda(
+                gradient.rotated_query_gradient,
+                gradient.rotated_key_gradient,
+                gradient.value_gradient,
+                gradient.attention_output_gradient,
+                saved.attention_output,
+                saved.attention_auxiliary,
+                conversion_workspace_a,
+                conversion_workspace_b,
+                conversion_workspace_c,
+                config.batch_size,
+                config.sequence_length,
+                config.heads,
+                config.head_size,
+                config.attention_scale,
+                stream);
+        }
+    } else {
+        dense_attention_backward_cuda(
+            gradient.rotated_query_gradient,
+            gradient.rotated_key_gradient,
+            gradient.value_gradient,
+            gradient.attention_output_gradient,
+            saved.attention_auxiliary,
+            saved.query,
+            saved.key,
+            saved.value,
+            gradient.attention_workspace,
+            config.batch_size,
+            config.sequence_length,
+            config.heads,
+            config.head_size,
+            config.attention_scale,
+            stream);
+    }
     CUDA_CHECK(cudaMemsetAsync(
         gradient.query_gradient,
         0,
@@ -718,6 +842,8 @@ void transformer_block_forward_cuda(
         sine,
         activations,
         nullptr,
+        nullptr,
+        nullptr,
         config,
         stream);
 }
@@ -747,6 +873,7 @@ void transformer_block_backward_cuda(
         workspace,
         nullptr,
         nullptr,
+        nullptr,
         config,
         stream);
 }
@@ -759,7 +886,9 @@ void transformer_block_forward_bf16_cuda(
     const float* cosine,
     const float* sine,
     float* activations,
-    __nv_bfloat16* conversion_workspace,
+    __nv_bfloat16* conversion_workspace_a,
+    __nv_bfloat16* conversion_workspace_b,
+    __nv_bfloat16* conversion_workspace_c,
     const TransformerBlockConfig& config,
     cudaStream_t stream) {
     transformer_block_forward_impl(
@@ -770,7 +899,9 @@ void transformer_block_forward_bf16_cuda(
         cosine,
         sine,
         activations,
-        conversion_workspace,
+        conversion_workspace_a,
+        conversion_workspace_b,
+        conversion_workspace_c,
         config,
         stream);
 }
@@ -788,6 +919,7 @@ void transformer_block_backward_bf16_cuda(
     float* workspace,
     __nv_bfloat16* conversion_workspace_a,
     __nv_bfloat16* conversion_workspace_b,
+    __nv_bfloat16* conversion_workspace_c,
     const TransformerBlockConfig& config,
     cudaStream_t stream) {
     transformer_block_backward_impl(
@@ -803,6 +935,7 @@ void transformer_block_backward_bf16_cuda(
         workspace,
         conversion_workspace_a,
         conversion_workspace_b,
+        conversion_workspace_c,
         config,
         stream);
 }

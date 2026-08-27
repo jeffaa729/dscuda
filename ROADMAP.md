@@ -5,11 +5,14 @@
 - [x] Integrate token embedding with repeated transformer blocks and a tied language-model head.
 - [x] Integrate cross-entropy, global gradient clipping, and AdamW into the training loop.
 - [x] Assemble, train, checkpoint, resume, and sample from a small dense GPT-2-style model.
+- [x] Add selectable composed and fused causal attention training paths with online softmax, saved log-sum-exp, backward recomputation, and FP32/BF16 inputs.
+- [x] Move the D=64 fused attention forward and backward tile products to BF16 Tensor Core MMA and benchmark against the composed baseline.
+- [ ] Reduce fused-attention register pressure, pipeline K/V loads, and add Tensor Core shapes beyond D=64.
 
 ## Phase 2: DeepSeek-V3 path
 
 - Implement MLA projections and a readable CPU reference.
-- Adapt the FlashAttention-2 tiling strategy into a BF16 causal MLA training kernel with asymmetric QK and V dimensions, FP32 online-softmax accumulation, saved log-sum-exp, and backward recomputation.
+- Adapt the dense fused-attention interface and Tensor Core tiling strategy into a BF16 causal MLA training kernel with asymmetric QK and V dimensions, FP32 online-softmax accumulation, saved log-sum-exp, and backward recomputation.
 - Implement compressed-KV MLA decoding separately from the training/prefill kernel.
 - Implement DeepSeekMoE routing, token dispatch, grouped expert GEMM, token combine, shared experts, and their backward passes.
 - Add auxiliary-loss-free load balancing and Multi-Token Prediction.

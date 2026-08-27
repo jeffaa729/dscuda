@@ -160,6 +160,11 @@ struct DenseGptModel::Implementation {
             throw std::runtime_error(
                 "BF16 model dimensions must be multiples of 16");
         }
+        if (config.attention == AttentionImplementation::flash2
+            && config.hidden_size / config.heads > 128) {
+            throw std::runtime_error(
+                "flash attention requires a head size no larger than 128");
+        }
         activation_elements =
             static_cast<std::size_t>(rows) * config.hidden_size;
         logits_elements =
@@ -175,6 +180,7 @@ struct DenseGptModel::Implementation {
             config.rms_epsilon,
             1.0F / std::sqrt(
                 static_cast<float>(config.hidden_size / config.heads)),
+            config.attention,
         };
         block_activation_elements =
             transformer_block_activation_elements(block_config);
@@ -222,6 +228,8 @@ struct DenseGptModel::Implementation {
                 allocate<__nv_bfloat16>(bf16_conversion_elements);
             bf16_conversion_b =
                 allocate<__nv_bfloat16>(bf16_conversion_elements);
+            bf16_conversion_c =
+                allocate<__nv_bfloat16>(bf16_conversion_elements);
         }
 
         std::vector<float> host_cosine(frequencies);
@@ -259,6 +267,7 @@ struct DenseGptModel::Implementation {
 
     ~Implementation() {
         if (bf16_parameters != nullptr) {
+            device_free(bf16_conversion_c);
             device_free(bf16_conversion_b);
             device_free(bf16_conversion_a);
             device_free(bf16_parameters);
@@ -322,6 +331,7 @@ struct DenseGptModel::Implementation {
     __nv_bfloat16* bf16_parameters = nullptr;
     __nv_bfloat16* bf16_conversion_a = nullptr;
     __nv_bfloat16* bf16_conversion_b = nullptr;
+    __nv_bfloat16* bf16_conversion_c = nullptr;
     bool forward_ready = false;
 };
 
@@ -492,6 +502,8 @@ void DenseGptModel::run_model_forward(
                 model.sine,
                 activations,
                 model.bf16_conversion_a,
+                model.bf16_conversion_b,
+                model.bf16_conversion_c,
                 model.block_config);
         } else {
             transformer_block_forward_cuda(
@@ -696,6 +708,7 @@ void DenseGptModel::backward() {
                 model.block_workspace,
                 model.bf16_conversion_a,
                 model.bf16_conversion_b,
+                model.bf16_conversion_c,
                 model.block_config);
         } else {
             transformer_block_backward_cuda(
@@ -856,7 +869,7 @@ ModelMemoryReport DenseGptModel::memory_report() const {
     const std::size_t token_bytes =
         static_cast<std::size_t>(2 * model.rows) * sizeof(int);
     const std::size_t bf16_bytes = model.precision == ModelPrecision::bf16
-        ? (model.layout.elements + 2 * model.bf16_conversion_elements)
+        ? (model.layout.elements + 3 * model.bf16_conversion_elements)
             * sizeof(__nv_bfloat16)
         : 0;
     return {

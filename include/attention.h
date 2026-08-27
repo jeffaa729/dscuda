@@ -6,6 +6,11 @@
 
 namespace dscuda {
 
+enum class AttentionImplementation {
+    composed,
+    flash2,
+};
+
 // Q, K, V, output, and their gradients use [B, T, H, D]. Saved probabilities
 // use [B, H, T, T], and D must be divisible by four for vectorized layout copies.
 std::size_t dense_attention_forward_workspace_elements(
