@@ -85,6 +85,20 @@ case "$benchmark" in
         workload_name="sequence"
         workloads=(128 256 512 1024)
         ;;
+    mla)
+        test_target="test_mla"
+        benchmark_target="benchmark_mla"
+        kernel_pattern="regex:mla_(forward_tensor_core|forward|query_backward|kv_backward)_kernel"
+        workload_name="sequence"
+        workloads=(128 256 512)
+        ;;
+    mla_decode)
+        test_target="test_mla_decode"
+        benchmark_target="benchmark_mla_decode"
+        kernel_pattern="regex:mla_decode_(split|combine)_kernel"
+        workload_name="context"
+        workloads=(128 512 2048)
+        ;;
     transformer_block)
         test_target="test_transformer_block"
         benchmark_target="benchmark_transformer_block"
@@ -129,7 +143,7 @@ case "$benchmark" in
         workloads=(1048576 4194304 16777216)
         ;;
     *)
-        echo "usage: bash scripts/profile.sh {rmsnorm|swiglu|matmul|rope|softmax|attention|flash_attention|transformer_block|training_step|embedding|adamw|cross_entropy|global_norm}" >&2
+        echo "usage: bash scripts/profile.sh {rmsnorm|swiglu|matmul|rope|softmax|attention|flash_attention|mla|mla_decode|transformer_block|training_step|embedding|adamw|cross_entropy|global_norm}" >&2
         exit 1
         ;;
 esac
@@ -138,7 +152,6 @@ cmake \
     -S "$repo_root" \
     -B "$build_dir" \
     -DCMAKE_BUILD_TYPE=Release \
-    -DCMAKE_CUDA_COMPILER="$nvcc_bin" \
     -DCMAKE_CUDA_ARCHITECTURES=89
 cmake --build "$build_dir" --target "$test_target" "$benchmark_target" -j
 ctest --test-dir "$build_dir" --output-on-failure -R "^${test_name}$"
@@ -170,6 +183,10 @@ for workload in "${workloads[@]}"; do
                 benchmark_arguments=(2 "$workload" 8 64 0.125)
             elif [[ "$benchmark" == "flash_attention" ]]; then
                 benchmark_arguments=(2 "$workload" 8 64 bf16)
+            elif [[ "$benchmark" == "mla" ]]; then
+                benchmark_arguments=(2 "$workload" 4 64 32)
+            elif [[ "$benchmark" == "mla_decode" ]]; then
+                benchmark_arguments=(1 "$workload" 4 64 32 4)
             elif [[ "$benchmark" == "transformer_block" ]]; then
                 benchmark_arguments=(2 "$workload" 512 8 1536)
             elif [[ "$benchmark" == "training_step" ]]; then

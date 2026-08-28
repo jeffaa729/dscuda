@@ -1,14 +1,16 @@
-// Loads a trained dense GPT checkpoint, encodes a prompt, and performs no-cache autoregressive generation through the shared sampler.
-// This correctness-first path recomputes the fixed context each token and can later be replaced by architecture-specific cache backends.
+// Loads a dense-GPT or DeepSeek-V3 checkpoint and performs autoregressive generation through the shared tokenizer and sampler.
+// Model construction is selected from checkpoint metadata; V3 generation uses compressed MLA caches while the dense baseline retains its correctness-first prefix recomputation path.
 
 #include "checkpoint.h"
 #include "cuda_common.h"
+#include "deepseek_v3_model.h"
 #include "generation.h"
 #include "model.h"
 #include "tokenizer.h"
 
 #include <cstdio>
 #include <exception>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -67,12 +69,27 @@ int main(int argc, char** argv) {
         dscuda::print_device_summary();
         const dscuda::CheckpointMetadata metadata =
             dscuda::read_checkpoint_metadata(options.checkpoint);
-        dscuda::ModelConfig generation_config = metadata.config;
-        generation_config.batch_size = 1;
-        dscuda::DenseGptModel model(generation_config);
-        dscuda::load_dense_gpt_checkpoint(options.checkpoint, model);
+        std::unique_ptr<dscuda::AutoregressiveModel> model;
+        if (metadata.architecture
+            == dscuda::CheckpointArchitecture::dense_gpt) {
+            dscuda::ModelConfig config = metadata.config;
+            config.batch_size = 1;
+            auto dense = std::make_unique<dscuda::DenseGptModel>(config);
+            dscuda::load_dense_gpt_checkpoint(options.checkpoint, *dense);
+            model = std::move(dense);
+        } else if (metadata.architecture
+                   == dscuda::CheckpointArchitecture::deepseek_v3) {
+            dscuda::DeepSeekV3Config config = metadata.deepseek_v3_config;
+            config.batch_size = 1;
+            auto v3 = std::make_unique<dscuda::DeepSeekV3Model>(config);
+            dscuda::load_deepseek_v3_checkpoint(options.checkpoint, *v3);
+            model = std::move(v3);
+        } else {
+            throw std::runtime_error(
+                "checkpoint architecture is not supported for generation");
+        }
         const dscuda::Tokenizer tokenizer(options.tokenizer);
-        if (tokenizer.vocabulary_size() != model.vocabulary_size()) {
+        if (tokenizer.vocabulary_size() != model->vocabulary_size()) {
             throw std::runtime_error(
                 "tokenizer vocabulary does not match checkpoint");
         }
@@ -88,7 +105,7 @@ int main(int argc, char** argv) {
             options.seed,
         };
         const std::vector<int> generated = dscuda::generate_tokens(
-            model, prompt, tokenizer.eos_id(), config);
+            *model, prompt, tokenizer.eos_id(), config);
 
         std::printf(
             "Checkpoint step %llu, prompt tokens %zu, generated tokens %zu\n",

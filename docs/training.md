@@ -231,6 +231,10 @@ engine implementation.
 ```
 
 The sampler supports greedy decoding with `--temperature 0`, or stable
-temperature plus top-k multinomial sampling. This first correctness-oriented
-generator recomputes the prefix for every token and stops at the model context
-length (`T=256` by default); a KV cache is a later performance optimization.
+temperature plus top-k multinomial sampling. Dense GPT currently recomputes
+the prefix for every token, while DeepSeek-V3 incrementally maintains its
+compressed MLA cache; both stop at the checkpoint context length.
+
+The complete V3 architecture, cache layout, Nsight results, matched training
+comparison, and generation commands are documented in
+[`docs/deepseek_v3.md`](deepseek_v3.md).

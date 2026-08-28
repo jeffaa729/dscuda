@@ -1,63 +1,241 @@
 # dscuda Roadmap
-## Phase 1: Core training runtime
 
-- [x] Complete the shared tensor, allocator, parameter, checkpoint, and CUDA utility code.
-- [x] Integrate token embedding with repeated transformer blocks and a tied language-model head.
-- [x] Integrate cross-entropy, global gradient clipping, and AdamW into the training loop.
-- [x] Assemble, train, checkpoint, resume, and sample from a small dense GPT-2-style model.
-- [x] Add selectable composed and fused causal attention training paths with online softmax, saved log-sum-exp, backward recomputation, and FP32/BF16 inputs.
-- [x] Move the D=64 fused attention forward and backward tile products to BF16 Tensor Core MMA and benchmark against the composed baseline.
-- [x] Add a full BF16 training-step Nsight profile and persist Flash2 Q/K/V operands so backward does not reconvert them.
-- [ ] Make Q/K/V projection GEMMs write BF16 directly and combine their rotary transform with the fused-attention load path.
-- [ ] Reduce fused-attention register pressure, pipeline K/V loads, and add Tensor Core shapes beyond D=64.
+## Project goal
 
-## Phase 2: DeepSeek-V3 path
+Build a CUDA-first LLM training and kernel-engineering project. The main result
+is a set of correct forward/backward kernels whose performance is measured
+against production libraries; small dense GPT, DeepSeek-V3-style, and
+V4-style models demonstrate that the kernels compose into a real training
+system.
 
-- Implement MLA projections and a readable CPU reference.
-- Adapt the dense fused-attention interface and Tensor Core tiling strategy into a BF16 causal MLA training kernel with asymmetric QK and V dimensions, FP32 online-softmax accumulation, saved log-sum-exp, and backward recomputation.
-- Implement compressed-KV MLA decoding separately from the training/prefill kernel.
-- Implement DeepSeekMoE routing, token dispatch, grouped expert GEMM, token combine, shared experts, and their backward passes.
-- Add auxiliary-loss-free load balancing and Multi-Token Prediction.
-- Train and compare a small dense GPT model and a parameter-matched DeepSeek-V3-style model.
+Serving-system work such as paged allocation, continuous batching, prefix
+sharing, request scheduling, and production KV-cache management belongs in a
+separate future inference-engine project. Generation in this repository is a
+functional integration test, not a serving benchmark.
 
-## Phase 3: DeepSeek-V4 architecture extensions
+## Benchmark contract
 
-### Hybrid compressed attention
+Every optimized-kernel comparison must:
 
-- Implement the shared token-wise KV compression primitive and its backward pass.
-- Implement Heavily Compressed Attention first: non-overlapping heavy KV compression followed by dense shared-KV MQA.
-- Implement Compressed Sparse Attention next: overlapping KV compression, a lightning indexer, top-k compressed-block selection, and sparse shared-KV MQA.
-- Add grouped attention-output projection to avoid one very large output projection.
-- Add per-head query and compressed-KV RMSNorm immediately before attention.
-- Add partial RoPE on the final 64 dimensions of queries and KV entries, plus inverse-position RoPE on attention outputs.
-- Add the uncompressed sliding-window attention branch needed for local dependencies and strict causality inside a compressed block.
-- Add learnable attention-sink logits to the online-softmax denominator.
+- use the same GPU, tensor shapes, layout, datatype, causal mask, scale, and
+  input data for the custom and reference implementations;
+- validate outputs before profiling and validate gradients for training
+  kernels;
+- exclude allocation, host-device copies, and datatype/layout conversion from
+  the measured operation unless both implementations intrinsically need them;
+- include every kernel required to finish the operation;
+- profile both implementations with the same Nsight Compute settings and
+  overwrite the previous `.ncu-rep` report on every run;
+- extract latency, TFLOP/s or effective bandwidth, registers per thread,
+  shared memory, occupancy, cache behavior, and spills into a concise table;
+- record the GPU, CUDA version, reference commit, compiler flags, and shape.
 
-### Manifold-Constrained Hyper-Connections
+Relative performance is:
 
-- Expand the residual stream into a small number of parallel streams.
-- Implement dynamic input, residual, and output mappings.
-- Constrain the residual mapping to a doubly stochastic matrix and constrain input/output mappings with sigmoid.
-- Fuse the small mappings, residual mixing, and layer input/output operations after the CPU reference and backward tests pass.
+```text
+reference latency / custom latency * 100%
+```
 
-### Muon optimizer
+The optimization target is at least 80% over a representative shape set, not
+one selected shape. An 80% result means the custom kernel takes no more than
+1.25x the reference latency.
 
-- Keep AdamW for embeddings, the prediction head, RMSNorm weights, and the specified mHC biases and gates.
-- Implement Muon momentum, Nesterov update, update rescaling, weight decay, and ten hybrid Newton-Schulz iterations for the remaining matrix parameters.
-- Use BF16 matrix multiplication with FP32 norms and reductions, and verify the optimizer against a CPU reference on small matrices.
+## Phase 1: Completed training foundation
 
-### V4 MoE changes
+- [x] Implement shared tensor, allocator, checkpoint, tokenizer, dataset, and
+  CUDA utility code.
+- [x] Implement and test embedding, RMSNorm, RoPE, residual, SwiGLU,
+  cross-entropy, gradient clipping, AdamW, and matrix multiplication.
+- [x] Assemble, train, checkpoint, resume, and sample from a dense GPT model.
+- [x] Add FP32 and BF16 paths, Tensor Core GEMM, FLOPs/token, TFLOP/s,
+  tokens/s, and MFU reporting.
+- [x] Implement composed causal attention and fused FlashAttention-style
+  forward/backward paths with online softmax and backward recomputation.
+- [x] Implement MLA forward/backward, split-KV compressed decode, DeepSeekMoE,
+  routing-bias balancing, shared experts, and sequential MTP.
+- [x] Train and generate text with parameter-matched dense GPT and
+  DeepSeek-V3-style TinyStories models.
 
-- Change routed-expert affinity scoring from sigmoid to `sqrt(softplus(x))`.
-- Add the small sequence-wise expert-balance loss.
-- Add token-ID hash routing for the initial MoE blocks as a separate routing mode.
+## Phase 2: Unified comparison harness
 
-## Final demonstration
+- [ ] Define deterministic benchmark cases shared by custom and external
+  implementations.
+- [ ] Add small CPU or PyTorch correctness cases and larger profiling cases.
+- [ ] Separate training/prefill workloads from decode workloads.
+- [ ] Produce one CSV and one concise Markdown table per kernel family.
+- [ ] Add an aggregate report containing correctness, relative performance,
+  and the primary Nsight Compute bottleneck for every kernel.
 
-Train a small GPT baseline, a DeepSeek-V3-style MLA plus MoE model, and a V4-style hybrid-compressed-attention variant on the same dataset. Report correctness, validation loss, tokens per second, peak training memory, KV-cache bytes per token, and attention FLOPs as context length grows; the V4 demonstration should emphasize exact compression and scaling properties rather than claiming frontier-model quality at small scale.
+Initial attention workloads:
+
+```text
+training/prefill:
+  B = 1, 4
+  T = 128, 256, 512, 1024, 2048
+  H = 4, 8
+  D = 64, 128
+
+decode:
+  B = 1, 8, 32
+  Q = 1
+  KV = 128, 512, 2048, 8192, 32768
+```
+
+Primary attention comparisons use BF16 inputs with FP32 softmax or MMA
+accumulation unless the reference contract requires otherwise.
+
+## Phase 3: GEMM versus cuBLAS
+
+- [x] Implement FP32 tiled GEMM and BF16 Tensor Core GEMM.
+- [x] Add CPU references, forward/backward tests, and a cuBLAS benchmark.
+- [x] Test square matrices of size 2048, 4096, and 8192.
+- [ ] Move results into the unified report format.
+- [ ] Record final latency, TFLOP/s, relative cuBLAS performance, tile
+  configuration, registers, shared memory, occupancy, and spills.
+- [ ] Freeze this family after reaching the 80% target or clearly documenting
+  the remaining hardware bottleneck.
+
+## Phase 4: CUDA FlashAttention versus official FlashAttention
+
+- [x] Implement causal BF16 FlashAttention-style forward and backward.
+- [x] Integrate fused attention into dense GPT training.
+- [x] Validate output, log-sum-exp, and Q/K/V gradients.
+- [ ] Add an adapter for the official FlashAttention-2 repository.
+- [ ] Compare identical causal BF16 forward and backward workloads for head
+  dimensions 64 and 128 over the shared prefill shape matrix.
+- [ ] Report complete forward and backward operation time separately.
+- [ ] Optimize register pressure, K/V load pipelining, Tensor Core shape
+  coverage, and avoidable conversions until reaching 80% or documenting the
+  limiting resource.
+
+The local SM89 RTX 4060 is the primary comparison GPU because official
+FlashAttention-2 supports Ada. Record the exact reference commit.
+
+## Phase 5: CUDA MLA versus FlashMLA
+
+- [x] Implement MLA CPU references, training forward/backward, and compressed
+  cached decode.
+- [x] Implement an SM89 BF16 Tensor Core path for the small model shape.
+- [x] Validate sequential compressed-cache decode against full causal MLA.
+- [ ] Generalize the benchmark to FlashMLA-compatible production dimensions
+  and layouts without creating a separate MLA algorithm version.
+- [ ] Report training forward, training backward, prefill, and cached decode
+  separately.
+- [ ] Add a FlashMLA adapter with identical BF16 cache format, dimensions,
+  split metadata, sequence lengths, and output contract.
+- [ ] Rent an H100/H800-class SM90 GPU and compile both implementations for
+  that same machine.
+- [ ] Compare custom MLA and FlashMLA on SM90; never compare RTX 4060 timings
+  with published H800 results.
+- [ ] Report correctness, latency, TFLOP/s or bandwidth, cache bytes/token,
+  registers, shared memory, occupancy, cache behavior, and spills.
+
+Local SM89 results are development profiles. The final FlashMLA speed ratio is
+an SM90 same-hardware experiment.
+
+## Phase 6: Secondary MoE kernel demonstration
+
+- [x] Implement and test sigmoid top-k routing, no-drop dispatch, grouped
+  routed experts, shared experts, combine, backward, and bias updates.
+- [ ] Benchmark routing, dispatch, grouped GEMM, SwiGLU, combine, backward, and
+  the complete MoE layer separately.
+- [ ] Replace serial dispatch-map construction with parallel histograms,
+  prefix offsets, and token permutation.
+- [ ] Implement BF16 Tensor Core grouped GEMM for variable expert loads.
+- [ ] Fuse grouped gate/up projection with the SwiGLU epilogue.
+- [ ] Test uniform, skewed, and hot-expert routing distributions.
+- [ ] Compare grouped GEMM locally with a compatible cuBLAS/CUTLASS baseline;
+  optionally compare a matching full MoE contract with FlashInfer or DeepGEMM
+  on rented datacenter hardware.
+
+MoE demonstrates irregular scheduling and grouped compute, but must not delay
+the FlashAttention and MLA comparisons.
+
+## Phase 7: HCA, DSA, and CSA CUDA kernels
+
+### Shared token compression
+
+- [ ] Implement token-wise KV compression forward/backward with a CPU or
+  PyTorch reference.
+- [ ] Benchmark compression independently before attention fusion.
+
+### Heavily Compressed Attention
+
+- [ ] Implement HCA over non-overlapping compressed KV blocks.
+- [ ] Add the uncompressed sliding-window branch for local dependencies and
+  strict causality inside a compressed block.
+- [ ] Add the selected V4-style query/KV normalization, partial RoPE,
+  inverse-position output RoPE, grouped output projection, and attention sinks.
+- [ ] Implement and validate HCA backward.
+- [ ] Compare with the same PyTorch equations locally and a matching FlashInfer
+  HCA implementation on rented supported hardware.
+
+### DeepSeek Sparse Attention
+
+- [ ] Implement lightning-indexer logits.
+- [ ] Implement GPU top-k selection and packed sparse indices.
+- [ ] Implement indexed sparse MLA forward with online softmax.
+- [ ] Implement sparse backward with indexed gradient scatter/reduction.
+- [ ] Benchmark indexer and sparse attention separately and together.
+- [ ] Compare matching kernels with DeepGEMM, FlashMLA, or FlashInfer on rented
+  supported hardware.
+
+### Compressed Sparse Attention
+
+- [ ] Implement overlapping compressed KV blocks.
+- [ ] Index compressed blocks and select top-k blocks.
+- [ ] Implement sparse shared-KV attention over selected compressed blocks plus
+  the local sliding-window branch.
+- [ ] Implement and validate CSA backward.
+- [ ] Compare the exact CSA contract against a readable reference and a
+  compatible production implementation on the same rented GPU.
+
+Implementation order:
+
+```text
+shared token compression -> HCA -> DSA indexer -> DSA sparse attention -> CSA
+```
+
+Architecture-changing kernels are checked against references implementing the
+same equations. Dense attention, MLA, HCA, DSA, and CSA are not treated as
+numerically interchangeable models.
+
+## Phase 8: Integration demonstrations
+
+- [x] Dense GPT: train, checkpoint, resume, report utilization, and generate
+  TinyStories text.
+- [x] DeepSeek-V3-style: integrate MLA, MoE, balancing, shared experts, MTP,
+  checkpointing, and compressed-cache generation.
+- [ ] V4-style hybrid attention: integrate alternating HCA/CSA layers and train
+  a small correctness-scale model on the same dataset.
+- [ ] Compare parameter count, loss, tokens/s, peak training memory, and
+  generated samples using documented small configurations.
+- [ ] Use synthetic long-context kernel benchmarks, not short TinyStories
+  training, to demonstrate compression and sparse-attention scaling.
+
+Unless mHC, Muon, and the remaining V4 changes are implemented, label the last
+model a `V4-style hybrid-compressed-attention model`, not a complete
+DeepSeek-V4 reproduction.
+
+## Final portfolio demonstration
+
+1. GEMM versus cuBLAS on FP32 and BF16 workloads.
+2. CUDA FlashAttention forward/backward versus official FlashAttention-2.
+3. CUDA MLA training/decode versus FlashMLA on the same rented SM90 GPU.
+4. HCA, DSA, and CSA correctness and performance studies.
+5. A secondary MoE routing/dispatch/grouped-GEMM study.
+6. Dense GPT, DeepSeek-V3-style, and V4-style training demonstrations.
+7. One consolidated table of numerical error, latency, relative library
+   performance, TFLOP/s or bandwidth, registers, shared memory, occupancy, and
+   spills.
 
 ## Primary references
 
-- DeepSeek-V3 Technical Report: https://arxiv.org/abs/2412.19437
-- DeepSeek-V4 Technical Report: https://arxiv.org/abs/2606.19348
+- FlashAttention: https://github.com/Dao-AILab/flash-attention
 - FlashMLA: https://github.com/deepseek-ai/FlashMLA
+- CUTLASS: https://github.com/NVIDIA/cutlass
+- FlashInfer: https://github.com/flashinfer-ai/flashinfer
+- DeepGEMM: https://github.com/deepseek-ai/DeepGEMM
+- DeepSeek-V3: https://arxiv.org/abs/2412.19437
+- DeepSeek-V3.2 / DSA: https://github.com/deepseek-ai/DeepSeek-V3.2-Exp
+- DeepSeek-V4: https://arxiv.org/abs/2606.19348

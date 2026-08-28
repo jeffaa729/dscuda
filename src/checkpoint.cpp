@@ -8,6 +8,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <initializer_list>
 #include <sstream>
 #include <stdexcept>
 
@@ -34,6 +35,21 @@ std::uint64_t get_u64(
     int index) {
     return static_cast<std::uint64_t>(header[index])
         | (static_cast<std::uint64_t>(header[index + 1]) << 32);
+}
+
+void put_float(
+    std::array<std::uint32_t, kHeaderWords>& header,
+    int index,
+    float value) {
+    std::memcpy(&header[index], &value, sizeof(float));
+}
+
+float get_float(
+    const std::array<std::uint32_t, kHeaderWords>& header,
+    int index) {
+    float value = 0.0F;
+    std::memcpy(&value, &header[index], sizeof(float));
+    return value;
 }
 
 void write_u32(std::ofstream& file, std::uint32_t value) {
@@ -72,33 +88,59 @@ CheckpointMetadata read_header(std::ifstream& file) {
         || header[5] != kAdamW) {
         throw std::runtime_error("unsupported checkpoint format");
     }
-    if (header[3]
-        != static_cast<std::uint32_t>(CheckpointArchitecture::dense_gpt)) {
-        throw std::runtime_error("checkpoint is not a dense GPT model");
-    }
 
-    float epsilon = 0.0F;
-    std::memcpy(&epsilon, &header[14], sizeof(float));
     CheckpointMetadata metadata{};
     metadata.format_version = header[2];
     metadata.architecture = static_cast<CheckpointArchitecture>(header[3]);
-    metadata.config = {
-        static_cast<int>(header[6]),
-        static_cast<int>(header[7]),
-        static_cast<int>(header[8]),
-        static_cast<int>(header[9]),
-        static_cast<int>(header[10]),
-        static_cast<int>(header[11]),
-        static_cast<int>(header[12]),
-        static_cast<int>(header[13]),
-        epsilon,
-    };
     metadata.step = get_u64(header, 16);
     metadata.parameter_elements = get_u64(header, 18);
+    if (metadata.architecture == CheckpointArchitecture::dense_gpt) {
+        metadata.config = {
+            static_cast<int>(header[6]),
+            static_cast<int>(header[7]),
+            static_cast<int>(header[8]),
+            static_cast<int>(header[9]),
+            static_cast<int>(header[10]),
+            static_cast<int>(header[11]),
+            static_cast<int>(header[12]),
+            static_cast<int>(header[13]),
+            get_float(header, 14),
+        };
+    } else if (metadata.architecture
+               == CheckpointArchitecture::deepseek_v3) {
+        metadata.deepseek_v3_config = {
+            static_cast<int>(header[6]),
+            static_cast<int>(header[7]),
+            static_cast<int>(header[8]),
+            static_cast<int>(header[9]),
+            static_cast<int>(header[10]),
+            static_cast<int>(header[11]),
+            static_cast<int>(header[12]),
+            static_cast<int>(header[13]),
+            static_cast<int>(header[14]),
+            static_cast<int>(header[15]),
+            static_cast<int>(header[20]),
+            static_cast<int>(header[21]),
+            static_cast<int>(header[22]),
+            static_cast<int>(header[23]),
+            static_cast<int>(header[24]),
+            get_float(header, 25),
+            get_float(header, 26),
+            get_float(header, 27),
+            get_float(header, 30),
+            static_cast<int>(header[31]),
+            get_float(header, 32),
+            static_cast<int>(header[33]),
+            static_cast<int>(header[34]),
+        };
+        metadata.routing_bias_elements = get_u64(header, 28);
+    } else {
+        throw std::runtime_error("unsupported checkpoint architecture");
+    }
     return metadata;
 }
 
-void check_compatible(
+void check_dense_compatible(
     const ModelConfig& checkpoint,
     const ModelConfig& runtime) {
     if (checkpoint.vocabulary_size != runtime.vocabulary_size
@@ -111,6 +153,86 @@ void check_compatible(
         || runtime.sequence_length > checkpoint.sequence_length) {
         throw std::runtime_error(
             "checkpoint architecture does not match the runtime model");
+    }
+}
+
+void check_deepseek_v3_compatible(
+    const DeepSeekV3Config& checkpoint,
+    const DeepSeekV3Config& runtime) {
+    if (checkpoint.vocabulary_size != runtime.vocabulary_size
+        || checkpoint.layers != runtime.layers
+        || checkpoint.hidden_size != runtime.hidden_size
+        || checkpoint.heads != runtime.heads
+        || checkpoint.query_rank != runtime.query_rank
+        || checkpoint.kv_rank != runtime.kv_rank
+        || checkpoint.nope_size != runtime.nope_size
+        || checkpoint.rope_size != runtime.rope_size
+        || checkpoint.value_size != runtime.value_size
+        || checkpoint.expert_hidden_size != runtime.expert_hidden_size
+        || checkpoint.routed_experts != runtime.routed_experts
+        || checkpoint.shared_experts != runtime.shared_experts
+        || checkpoint.top_k != runtime.top_k
+        || checkpoint.rms_epsilon != runtime.rms_epsilon
+        || checkpoint.route_scale != runtime.route_scale
+        || checkpoint.routing_bias_update_speed
+            != runtime.routing_bias_update_speed
+        || checkpoint.balance_loss_weight != runtime.balance_loss_weight
+        || checkpoint.mtp_depth != runtime.mtp_depth
+        || checkpoint.mtp_loss_weight != runtime.mtp_loss_weight
+        || checkpoint.dense_layers != runtime.dense_layers
+        || checkpoint.dense_ffn_size != runtime.dense_ffn_size
+        || runtime.sequence_length > checkpoint.sequence_length) {
+        throw std::runtime_error(
+            "checkpoint architecture does not match the runtime V3 model");
+    }
+}
+
+void write_checkpoint(
+    const std::string& checkpoint_directory,
+    const std::array<std::uint32_t, kHeaderWords>& header,
+    std::initializer_list<const std::vector<float>*> tensors,
+    std::uint64_t step) {
+    const std::filesystem::path directory(checkpoint_directory);
+    std::filesystem::create_directories(directory);
+    const std::filesystem::path destination = directory / "model.bin";
+    const std::filesystem::path temporary = directory / "model.bin.part";
+    const std::filesystem::path done = directory / "DONE";
+    const std::filesystem::path done_temporary = directory / "DONE.part";
+
+    {
+        std::ofstream file(temporary, std::ios::binary | std::ios::trunc);
+        if (!file) {
+            throw std::runtime_error("cannot create checkpoint file");
+        }
+        for (const std::uint32_t value : header) {
+            write_u32(file, value);
+        }
+        for (const std::vector<float>* tensor : tensors) {
+            file.write(
+                reinterpret_cast<const char*>(tensor->data()),
+                static_cast<std::streamsize>(tensor->size() * sizeof(float)));
+        }
+        if (!file) {
+            throw std::runtime_error("failed while writing checkpoint state");
+        }
+    }
+
+    std::filesystem::remove(destination);
+    std::filesystem::rename(temporary, destination);
+    {
+        std::ofstream marker(done_temporary, std::ios::trunc);
+        marker << step << '\n';
+    }
+    std::filesystem::remove(done);
+    std::filesystem::rename(done_temporary, done);
+}
+
+void read_tensor(std::ifstream& file, std::vector<float>& tensor) {
+    file.read(
+        reinterpret_cast<char*>(tensor.data()),
+        static_cast<std::streamsize>(tensor.size() * sizeof(float)));
+    if (!file) {
+        throw std::runtime_error("checkpoint tensor data is truncated");
     }
 }
 
@@ -128,13 +250,6 @@ void save_dense_gpt_checkpoint(
     const std::string& checkpoint_directory,
     const DenseGptModel& model,
     std::uint64_t step) {
-    const std::filesystem::path directory(checkpoint_directory);
-    std::filesystem::create_directories(directory);
-    const std::filesystem::path destination = directory / "model.bin";
-    const std::filesystem::path temporary = directory / "model.bin.part";
-    const std::filesystem::path done = directory / "DONE";
-    const std::filesystem::path done_temporary = directory / "DONE.part";
-
     const ModelTrainingState state = model.training_state_to_host();
     const ModelConfig& config = model.config();
     std::array<std::uint32_t, kHeaderWords> header{};
@@ -152,39 +267,14 @@ void save_dense_gpt_checkpoint(
     header[11] = config.heads;
     header[12] = config.ffn_size;
     header[13] = config.rotary_size;
-    std::memcpy(&header[14], &config.rms_epsilon, sizeof(float));
+    put_float(header, 14, config.rms_epsilon);
     put_u64(header, 16, step);
     put_u64(header, 18, state.parameters.size());
-
-    {
-        std::ofstream file(temporary, std::ios::binary | std::ios::trunc);
-        if (!file) {
-            throw std::runtime_error("cannot create checkpoint file");
-        }
-        for (const std::uint32_t value : header) {
-            write_u32(file, value);
-        }
-        auto write_values = [&](const std::vector<float>& values) {
-            file.write(
-                reinterpret_cast<const char*>(values.data()),
-                static_cast<std::streamsize>(values.size() * sizeof(float)));
-        };
-        write_values(state.parameters);
-        write_values(state.first_moment);
-        write_values(state.second_moment);
-        if (!file) {
-            throw std::runtime_error("failed while writing checkpoint state");
-        }
-    }
-
-    std::filesystem::remove(destination);
-    std::filesystem::rename(temporary, destination);
-    {
-        std::ofstream marker(done_temporary, std::ios::trunc);
-        marker << step << '\n';
-    }
-    std::filesystem::remove(done);
-    std::filesystem::rename(done_temporary, done);
+    write_checkpoint(
+        checkpoint_directory,
+        header,
+        {&state.parameters, &state.first_moment, &state.second_moment},
+        step);
 }
 
 CheckpointMetadata read_checkpoint_metadata(
@@ -212,7 +302,10 @@ CheckpointMetadata load_dense_gpt_checkpoint(
         throw std::runtime_error("cannot open checkpoint model.bin");
     }
     const CheckpointMetadata metadata = read_header(file);
-    check_compatible(metadata.config, model.config());
+    if (metadata.architecture != CheckpointArchitecture::dense_gpt) {
+        throw std::runtime_error("checkpoint is not a dense GPT model");
+    }
+    check_dense_compatible(metadata.config, model.config());
     if (metadata.parameter_elements != model.parameter_layout().elements) {
         throw std::runtime_error("checkpoint parameter count does not match model");
     }
@@ -221,17 +314,107 @@ CheckpointMetadata load_dense_gpt_checkpoint(
     state.parameters.resize(metadata.parameter_elements);
     state.first_moment.resize(metadata.parameter_elements);
     state.second_moment.resize(metadata.parameter_elements);
-    auto read_values = [&](std::vector<float>& values) {
-        file.read(
-            reinterpret_cast<char*>(values.data()),
-            static_cast<std::streamsize>(values.size() * sizeof(float)));
-        if (!file) {
-            throw std::runtime_error("checkpoint tensor data is truncated");
-        }
-    };
-    read_values(state.parameters);
-    read_values(state.first_moment);
-    read_values(state.second_moment);
+    read_tensor(file, state.parameters);
+    read_tensor(file, state.first_moment);
+    read_tensor(file, state.second_moment);
+    if (file.peek() != std::ifstream::traits_type::eof()) {
+        throw std::runtime_error("checkpoint contains unexpected trailing data");
+    }
+    model.load_training_state(state);
+    return metadata;
+}
+
+void save_deepseek_v3_checkpoint(
+    const std::string& checkpoint_directory,
+    const DeepSeekV3Model& model,
+    std::uint64_t step) {
+    const DeepSeekV3TrainingState state = model.training_state_to_host();
+    const DeepSeekV3Config& config = model.config();
+    std::array<std::uint32_t, kHeaderWords> header{};
+    header[0] = kMagic0;
+    header[1] = kMagic1;
+    header[2] = kVersion;
+    header[3] = static_cast<std::uint32_t>(
+        CheckpointArchitecture::deepseek_v3);
+    header[4] = kFp32;
+    header[5] = kAdamW;
+    header[6] = config.batch_size;
+    header[7] = config.sequence_length;
+    header[8] = config.vocabulary_size;
+    header[9] = config.layers;
+    header[10] = config.hidden_size;
+    header[11] = config.heads;
+    header[12] = config.query_rank;
+    header[13] = config.kv_rank;
+    header[14] = config.nope_size;
+    header[15] = config.rope_size;
+    put_u64(header, 16, step);
+    put_u64(header, 18, state.optimizer.parameters.size());
+    header[20] = config.value_size;
+    header[21] = config.expert_hidden_size;
+    header[22] = config.routed_experts;
+    header[23] = config.shared_experts;
+    header[24] = config.top_k;
+    put_float(header, 25, config.rms_epsilon);
+    put_float(header, 26, config.route_scale);
+    put_float(header, 27, config.routing_bias_update_speed);
+    put_u64(header, 28, state.routing_bias.size());
+    put_float(header, 30, config.balance_loss_weight);
+    header[31] = config.mtp_depth;
+    put_float(header, 32, config.mtp_loss_weight);
+    header[33] = config.dense_layers;
+    header[34] = config.dense_ffn_size;
+    write_checkpoint(
+        checkpoint_directory,
+        header,
+        {
+            &state.optimizer.parameters,
+            &state.optimizer.first_moment,
+            &state.optimizer.second_moment,
+            &state.routing_bias,
+        },
+        step);
+}
+
+CheckpointMetadata load_deepseek_v3_checkpoint(
+    const std::string& checkpoint_directory,
+    DeepSeekV3Model& model) {
+    if (!std::filesystem::exists(
+            std::filesystem::path(checkpoint_directory) / "DONE")) {
+        throw std::runtime_error("checkpoint has no DONE marker");
+    }
+    std::ifstream file(model_path(checkpoint_directory), std::ios::binary);
+    if (!file) {
+        throw std::runtime_error("cannot open checkpoint model.bin");
+    }
+    const CheckpointMetadata metadata = read_header(file);
+    if (metadata.architecture != CheckpointArchitecture::deepseek_v3) {
+        throw std::runtime_error("checkpoint is not a DeepSeek-V3 model");
+    }
+    check_deepseek_v3_compatible(
+        metadata.deepseek_v3_config, model.config());
+    if (metadata.parameter_elements != model.parameter_layout().elements) {
+        throw std::runtime_error("checkpoint parameter count does not match model");
+    }
+    const std::size_t expected_biases =
+        static_cast<std::size_t>(
+            model.config().layers - model.config().dense_layers
+            + model.config().mtp_depth)
+        * model.config().routed_experts;
+    if (metadata.routing_bias_elements != expected_biases) {
+        throw std::runtime_error(
+            "checkpoint routing-bias count does not match model");
+    }
+
+    DeepSeekV3TrainingState state;
+    state.optimizer.parameters.resize(metadata.parameter_elements);
+    state.optimizer.first_moment.resize(metadata.parameter_elements);
+    state.optimizer.second_moment.resize(metadata.parameter_elements);
+    state.routing_bias.resize(metadata.routing_bias_elements);
+    read_tensor(file, state.optimizer.parameters);
+    read_tensor(file, state.optimizer.first_moment);
+    read_tensor(file, state.optimizer.second_moment);
+    read_tensor(file, state.routing_bias);
     if (file.peek() != std::ifstream::traits_type::eof()) {
         throw std::runtime_error("checkpoint contains unexpected trailing data");
     }
