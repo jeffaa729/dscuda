@@ -1,5 +1,5 @@
-// Verifies checkpoint metadata, parameters, and AdamW moments by resuming the same model into an identical second update.
-// The DONE marker and versioned architecture header ensure only complete, compatible checkpoints are accepted.
+// Verifies architecture-aware dense and DeepSeek-V3 checkpoints by resuming each model into an identical second update.
+// The test covers parameters, AdamW moments, V3 routing biases, metadata dispatch, and the DONE publication marker.
 
 #include "checkpoint.h"
 #include "cuda_common.h"
@@ -73,6 +73,58 @@ bool run_test() {
     std::printf("  resumed update max error = %.3e\n", resumed_error);
 
     std::filesystem::remove_all(directory);
+
+    constexpr dscuda::DeepSeekV3Config v3_config{
+        1, 4, 32, 1, 16, 2, 8, 8, 4, 4, 4, 8, 4, 1, 2,
+        1.0e-5F, 1.0F, 1.0e-2F, 1.0e-3F, 1, 0.1F, 1, 24};
+    std::vector<int> v3_inputs{1, 5, 9, 13};
+    std::vector<int> v3_targets{5, 9, 13, 17};
+    dscuda::DeepSeekV3Model v3_original(v3_config);
+    v3_original.initialize(2027);
+    v3_original.train_step(
+        v3_inputs, v3_targets, 1, optimizer, 1.0F);
+
+    const std::filesystem::path v3_directory =
+        std::filesystem::temp_directory_path() / "dscuda_v3_checkpoint_test";
+    std::filesystem::remove_all(v3_directory);
+    dscuda::save_deepseek_v3_checkpoint(
+        v3_directory.string(), v3_original, 1);
+    const dscuda::CheckpointMetadata v3_metadata =
+        dscuda::read_checkpoint_metadata(v3_directory.string());
+    dscuda::DeepSeekV3Model v3_restored(v3_config);
+    const dscuda::CheckpointMetadata v3_loaded =
+        dscuda::load_deepseek_v3_checkpoint(
+            v3_directory.string(), v3_restored);
+
+    passed &= v3_metadata.architecture
+        == dscuda::CheckpointArchitecture::deepseek_v3;
+    passed &= v3_metadata.step == 1 && v3_loaded.step == 1;
+    passed &= v3_metadata.deepseek_v3_config.kv_rank == v3_config.kv_rank;
+    const dscuda::DeepSeekV3TrainingState v3_original_state =
+        v3_original.training_state_to_host();
+    const dscuda::DeepSeekV3TrainingState v3_restored_state =
+        v3_restored.training_state_to_host();
+    passed &= maximum_error(
+        v3_original_state.optimizer.parameters,
+        v3_restored_state.optimizer.parameters) == 0.0F;
+    passed &= maximum_error(
+        v3_original_state.optimizer.first_moment,
+        v3_restored_state.optimizer.first_moment) == 0.0F;
+    passed &= maximum_error(
+        v3_original_state.optimizer.second_moment,
+        v3_restored_state.optimizer.second_moment) == 0.0F;
+    passed &= maximum_error(
+        v3_original_state.routing_bias,
+        v3_restored_state.routing_bias) == 0.0F;
+
+    v3_original.train_step(v3_inputs, v3_targets, 2, optimizer, 1.0F);
+    v3_restored.train_step(v3_inputs, v3_targets, 2, optimizer, 1.0F);
+    const float v3_resumed_error = maximum_error(
+        v3_original.parameters_to_host(), v3_restored.parameters_to_host());
+    passed &= v3_resumed_error == 0.0F;
+    std::printf("  V3 resumed update max error = %.3e\n", v3_resumed_error);
+
+    std::filesystem::remove_all(v3_directory);
     return passed;
 }
 

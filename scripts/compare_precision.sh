@@ -15,7 +15,6 @@ if ! cmake \
         -S "$repo_root" \
         -B "$build_dir" \
         -DCMAKE_BUILD_TYPE=Release \
-        -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc \
         -DCMAKE_CUDA_ARCHITECTURES=89 > "$build_log" 2>&1; then
     cat "$build_log"
     exit 1

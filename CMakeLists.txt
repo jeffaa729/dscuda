@@ -27,11 +27,18 @@ add_library(dscuda_kernels STATIC
     kernels/attention.cu
     kernels/cross_entropy.cu
     kernels/cuda_common.cu
+    kernels/deepseek_moe.cu
+    kernels/deepseek_v3_block.cu
+    kernels/deepseek_v3_dense_block.cu
+    kernels/deepseek_v3_model.cu
     kernels/embedding.cu
+    kernels/expert_dispatch.cu
     kernels/flash_attention.cu
     kernels/global_norm.cu
     kernels/matmul.cu
+    kernels/mla.cu
     kernels/model.cu
+    kernels/mtp.cu
     kernels/rmsnorm.cu
     kernels/residual.cu
     kernels/rope.cu
@@ -40,10 +47,16 @@ add_library(dscuda_kernels STATIC
     kernels/transformer_block.cu
     reference/attention_cpu.cpp
     reference/cross_entropy_cpu.cpp
+    reference/deepseek_moe_cpu.cpp
+    reference/deepseek_v3_block_cpu.cpp
+    reference/deepseek_v3_dense_block_cpu.cpp
     reference/embedding_cpu.cpp
+    reference/expert_dispatch_cpu.cpp
     reference/global_norm_cpu.cpp
     reference/matmul_cpu.cpp
+    reference/mla_cpu.cpp
     reference/model_cpu.cpp
+    reference/mtp_cpu.cpp
     reference/rmsnorm_cpu.cpp
     reference/optimizer_cpu.cpp
     reference/residual_cpu.cpp
@@ -98,6 +111,24 @@ target_link_libraries(test_attention PRIVATE dscuda_kernels)
 add_executable(test_flash_attention tests/test_flash_attention.cu)
 target_link_libraries(test_flash_attention PRIVATE dscuda_kernels)
 
+add_executable(test_mla tests/test_mla.cu)
+target_link_libraries(test_mla PRIVATE dscuda_kernels)
+
+add_executable(test_mla_decode tests/test_mla_decode.cu)
+target_link_libraries(test_mla_decode PRIVATE dscuda_kernels)
+
+add_executable(test_mla_layer_decode tests/test_mla_layer_decode.cu)
+target_link_libraries(test_mla_layer_decode PRIVATE dscuda_kernels)
+
+add_executable(test_mla_layer tests/test_mla_layer.cu)
+target_link_libraries(test_mla_layer PRIVATE dscuda_kernels)
+
+add_executable(benchmark_mla benchmarks/benchmark_mla.cu)
+target_link_libraries(benchmark_mla PRIVATE dscuda_kernels)
+
+add_executable(benchmark_mla_decode benchmarks/benchmark_mla_decode.cu)
+target_link_libraries(benchmark_mla_decode PRIVATE dscuda_kernels)
+
 add_executable(benchmark_attention benchmarks/benchmark_attention.cu)
 target_link_libraries(benchmark_attention PRIVATE dscuda_kernels)
 
@@ -118,6 +149,26 @@ target_link_libraries(benchmark_transformer_block PRIVATE dscuda_kernels)
 
 add_executable(test_embedding tests/test_embedding.cu)
 target_link_libraries(test_embedding PRIVATE dscuda_kernels)
+
+add_executable(test_expert_dispatch tests/test_expert_dispatch.cu)
+target_link_libraries(test_expert_dispatch PRIVATE dscuda_kernels)
+
+add_executable(test_deepseek_moe tests/test_deepseek_moe.cu)
+target_link_libraries(test_deepseek_moe PRIVATE dscuda_kernels)
+
+add_executable(test_deepseek_v3_block tests/test_deepseek_v3_block.cu)
+target_link_libraries(test_deepseek_v3_block PRIVATE dscuda_kernels)
+
+add_executable(
+    test_deepseek_v3_dense_block
+    tests/test_deepseek_v3_dense_block.cu)
+target_link_libraries(test_deepseek_v3_dense_block PRIVATE dscuda_kernels)
+
+add_executable(test_deepseek_v3_model tests/test_deepseek_v3_model.cu)
+target_link_libraries(test_deepseek_v3_model PRIVATE dscuda_kernels)
+
+add_executable(test_mtp tests/test_mtp.cu)
+target_link_libraries(test_mtp PRIVATE dscuda_kernels)
 
 add_executable(benchmark_embedding benchmarks/benchmark_embedding.cu)
 target_link_libraries(benchmark_embedding PRIVATE dscuda_kernels)
@@ -172,9 +223,19 @@ add_test(NAME rope COMMAND test_rope)
 add_test(NAME softmax COMMAND test_softmax)
 add_test(NAME attention COMMAND test_attention)
 add_test(NAME flash_attention COMMAND test_flash_attention)
+add_test(NAME mla COMMAND test_mla)
+add_test(NAME mla_decode COMMAND test_mla_decode)
+add_test(NAME mla_layer_decode COMMAND test_mla_layer_decode)
+add_test(NAME mla_layer COMMAND test_mla_layer)
 add_test(NAME residual COMMAND test_residual)
 add_test(NAME transformer_block COMMAND test_transformer_block)
 add_test(NAME embedding COMMAND test_embedding)
+add_test(NAME expert_dispatch COMMAND test_expert_dispatch)
+add_test(NAME deepseek_moe COMMAND test_deepseek_moe)
+add_test(NAME deepseek_v3_block COMMAND test_deepseek_v3_block)
+add_test(NAME deepseek_v3_dense_block COMMAND test_deepseek_v3_dense_block)
+add_test(NAME deepseek_v3_model COMMAND test_deepseek_v3_model)
+add_test(NAME mtp COMMAND test_mtp)
 add_test(NAME adamw COMMAND test_adamw)
 add_test(NAME cross_entropy COMMAND test_cross_entropy)
 add_test(NAME global_norm COMMAND test_global_norm)
