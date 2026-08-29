@@ -119,16 +119,17 @@ The split-KV decode profile was:
 | 512 | 105.32 us | 56 | 40 | 0 |
 | 2,048 | 407.84 us | 56 | 40 | 0 |
 
-Reproduce and overwrite the reports with:
+Reproduce the frozen local MLA snapshot and overwrite the reports with:
 
 ```bash
-bash scripts/profile.sh mla
-bash scripts/profile.sh mla_decode
+bash scripts/profile.sh mla full
 ```
 
-Both commands first run the matching correctness test, save `.ncu-rep` files
-under `profiles/reports`, and print extracted timing, bandwidth, occupancy,
-cache, register, shared-memory, and spill tables.
+The command first runs all MLA correctness tests, saves `.ncu-rep` files under
+`profiles/reports`, and writes extracted timing, bandwidth, occupancy, cache,
+register, shared-memory, and spill tables under `profiles/results`. This MLA
+implementation is frozen for now; a same-H100 FlashMLA comparison is deferred
+rather than treated as a requirement for the current training-kernel demo.
 
 ## Parameter-matched TinyStories demonstration
 

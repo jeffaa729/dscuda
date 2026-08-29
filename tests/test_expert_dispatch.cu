@@ -1,4 +1,4 @@
-// Compares DeepSeek sigmoid routing, deterministic no-drop dispatch, grouped linear algebra, combination, and backward maps with CPU references.
+// Compares DeepSeek sigmoid routing, parallel no-drop dispatch, grouped linear algebra, combination, and backward maps with CPU references.
 // Uneven expert loads and non-tile-aligned tensor sizes exercise the irregular paths that distinguish MoE from dense feed-forward layers.
 
 #include "cuda_common.h"
@@ -79,6 +79,55 @@ bool check_float(
         name,
         error,
         passed ? "PASS" : "FAIL");
+    return passed;
+}
+
+bool check_dispatched_by_route(
+    const char* name,
+    const std::vector<float>& expected,
+    const std::vector<float>& actual,
+    const std::vector<int>& expected_route_to_slot,
+    const std::vector<int>& actual_route_to_slot,
+    int width,
+    float tolerance = 2.0e-5F) {
+    float error = 0.0F;
+    for (int route = 0; route < ROUTES; ++route) {
+        const int expected_slot = expected_route_to_slot[route];
+        const int actual_slot = actual_route_to_slot[route];
+        for (int column = 0; column < width; ++column) {
+            error = std::max(
+                error,
+                std::abs(
+                    expected[expected_slot * width + column]
+                    - actual[actual_slot * width + column]));
+        }
+    }
+    const bool passed = error < tolerance;
+    std::printf(
+        "  %-25s max error = %.3e  %s\n",
+        name,
+        error,
+        passed ? "PASS" : "FAIL");
+    return passed;
+}
+
+bool check_dispatch_map(
+    const std::vector<int>& indices,
+    const std::vector<int>& route_to_slot,
+    const std::vector<int>& slot_to_route,
+    const std::vector<int>& slot_expert) {
+    std::vector<int> seen(ROUTES);
+    bool passed = true;
+    for (int route = 0; route < ROUTES; ++route) {
+        const int slot = route_to_slot[route];
+        passed &= slot >= 0 && slot < ROUTES;
+        if (slot >= 0 && slot < ROUTES) {
+            passed &= seen[slot]++ == 0;
+            passed &= slot_to_route[slot] == route;
+            passed &= slot_expert[slot] == indices[route];
+        }
+    }
+    std::printf("  %-25s %s\n", "parallel dispatch map", passed ? "PASS" : "FAIL");
     return passed;
 }
 
@@ -208,6 +257,15 @@ int main() {
         g_bias.data(), g_counts.data(), E, ROUTES, 0.01F);
     dscuda::synchronize();
 
+    const auto gpu_route_to_slot = g_route_to_slot.download();
+    const auto gpu_slot_to_route = g_slot_to_route.download();
+    const auto gpu_slot_expert = g_slot_expert.download();
+    const auto gpu_dispatched = g_dispatched.download();
+    const auto gpu_grouped_output = g_grouped_output.download();
+    const auto gpu_grouped_output_gradient =
+        g_grouped_output_gradient.download();
+    const auto gpu_dispatched_gradient = g_dispatched_gradient.download();
+
     std::printf("DeepSeek expert dispatch test\n");
     bool passed = true;
     passed &= check_float("scores", scores, g_scores.download());
@@ -215,19 +273,25 @@ int main() {
     passed &= check_float("route weights", route_weights, g_route_weights.download());
     passed &= check_exact("expert counts", counts, g_counts.download());
     passed &= check_exact("expert offsets", offsets, g_offsets.download());
-    passed &= check_exact("route to slot", route_to_slot, g_route_to_slot.download());
-    passed &= check_exact("slot to route", slot_to_route, g_slot_to_route.download());
-    passed &= check_exact("slot expert", slot_expert, g_slot_expert.download());
-    passed &= check_float("dispatched input", dispatched, g_dispatched.download());
-    passed &= check_float("grouped output", grouped_output, g_grouped_output.download());
+    passed &= check_dispatch_map(
+        indices, gpu_route_to_slot, gpu_slot_to_route, gpu_slot_expert);
+    passed &= check_dispatched_by_route(
+        "dispatched input", dispatched, gpu_dispatched,
+        route_to_slot, gpu_route_to_slot, D);
+    passed &= check_dispatched_by_route(
+        "grouped output", grouped_output, gpu_grouped_output,
+        route_to_slot, gpu_route_to_slot, O);
     passed &= check_float("combined output", combined, g_combined.download());
     passed &= check_float(
         "route weight gradient", route_weight_gradient,
         g_route_weight_gradient.download());
     passed &= check_float("shared gradient", shared_gradient, g_shared_gradient.download());
-    passed &= check_float(
+    passed &= check_dispatched_by_route(
+        "grouped output gradient", grouped_output_gradient,
+        gpu_grouped_output_gradient, route_to_slot, gpu_route_to_slot, O);
+    passed &= check_dispatched_by_route(
         "dispatched gradient", dispatched_gradient,
-        g_dispatched_gradient.download());
+        gpu_dispatched_gradient, route_to_slot, gpu_route_to_slot, D);
     passed &= check_float("weight gradient", weight_gradient, g_weight_gradient.download());
     passed &= check_float("unrouted gradient", input_gradient, g_input_gradient.download());
     passed &= check_float("router logit gradient", logit_gradient, g_logit_gradient.download());
