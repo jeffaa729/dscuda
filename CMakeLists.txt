@@ -156,6 +156,12 @@ target_link_libraries(test_expert_dispatch PRIVATE dscuda_kernels)
 add_executable(test_deepseek_moe tests/test_deepseek_moe.cu)
 target_link_libraries(test_deepseek_moe PRIVATE dscuda_kernels)
 
+add_executable(test_grouped_gemm tests/test_grouped_gemm.cu)
+target_link_libraries(test_grouped_gemm PRIVATE dscuda_kernels)
+
+add_executable(benchmark_moe benchmarks/benchmark_moe.cu)
+target_link_libraries(benchmark_moe PRIVATE dscuda_kernels CUDA::cublas)
+
 add_executable(test_deepseek_v3_block tests/test_deepseek_v3_block.cu)
 target_link_libraries(test_deepseek_v3_block PRIVATE dscuda_kernels)
 
@@ -232,6 +238,7 @@ add_test(NAME transformer_block COMMAND test_transformer_block)
 add_test(NAME embedding COMMAND test_embedding)
 add_test(NAME expert_dispatch COMMAND test_expert_dispatch)
 add_test(NAME deepseek_moe COMMAND test_deepseek_moe)
+add_test(NAME grouped_gemm COMMAND test_grouped_gemm)
 add_test(NAME deepseek_v3_block COMMAND test_deepseek_v3_block)
 add_test(NAME deepseek_v3_dense_block COMMAND test_deepseek_v3_dense_block)
 add_test(NAME deepseek_v3_model COMMAND test_deepseek_v3_model)

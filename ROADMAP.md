@@ -58,12 +58,12 @@ one selected shape. An 80% result means the custom kernel takes no more than
 
 ## Phase 2: Unified comparison harness
 
-- [ ] Define deterministic benchmark cases shared by custom and external
+- [x] Define deterministic benchmark cases shared by custom and external
   implementations.
-- [ ] Add small CPU or PyTorch correctness cases and larger profiling cases.
-- [ ] Separate training/prefill workloads from decode workloads.
-- [ ] Produce one CSV and one concise Markdown table per kernel family.
-- [ ] Add an aggregate report containing correctness, relative performance,
+- [x] Add small CPU or PyTorch correctness cases and larger profiling cases.
+- [x] Separate training/prefill workloads from decode workloads.
+- [x] Produce one CSV and one concise Markdown table per kernel family.
+- [x] Add an aggregate report containing correctness, relative performance,
   and the primary Nsight Compute bottleneck for every kernel.
 
 Initial attention workloads:
@@ -89,67 +89,80 @@ accumulation unless the reference contract requires otherwise.
 - [x] Implement FP32 tiled GEMM and BF16 Tensor Core GEMM.
 - [x] Add CPU references, forward/backward tests, and a cuBLAS benchmark.
 - [x] Test square matrices of size 2048, 4096, and 8192.
-- [ ] Move results into the unified report format.
-- [ ] Record final latency, TFLOP/s, relative cuBLAS performance, tile
+- [x] Move results into the unified report format.
+- [x] Record final latency, TFLOP/s, relative cuBLAS performance, tile
   configuration, registers, shared memory, occupancy, and spills.
-- [ ] Freeze this family after reaching the 80% target or clearly documenting
+- [x] Freeze this family after reaching the 80% target or clearly documenting
   the remaining hardware bottleneck.
+
+The full SM89 sweep covers forward and both backward GEMMs at 2048, 4096, and
+8192. Median relative performance is 100.4% for FP32 and 91.0% for BF16, while
+the weakest transposed/backward cases fall to 38.0% and 61.7% respectively.
+Nsight Compute reports register pressure across the family; the large
+transpose cases also expose the current tile/layout sensitivity. GEMM is
+therefore frozen with that limitation documented rather than adding more
+specialized kernels now.
 
 ## Phase 4: CUDA FlashAttention versus official FlashAttention
 
 - [x] Implement causal BF16 FlashAttention-style forward and backward.
 - [x] Integrate fused attention into dense GPT training.
 - [x] Validate output, log-sum-exp, and Q/K/V gradients.
-- [ ] Add an adapter for the official FlashAttention-2 repository.
-- [ ] Compare identical causal BF16 forward and backward workloads for head
+- [x] Add an adapter for the official FlashAttention-2 Python package.
+- [x] Add identical causal BF16 forward and backward benchmark cases for head
   dimensions 64 and 128 over the shared prefill shape matrix.
-- [ ] Report complete forward and backward operation time separately.
+- [x] Capture and report complete forward and backward operations separately.
+- [ ] Run the official comparison matrix on the same local or rented GPU and
+  record the exact FlashAttention commit and environment.
 - [ ] Optimize register pressure, K/V load pipelining, Tensor Core shape
   coverage, and avoidable conversions until reaching 80% or documenting the
   limiting resource.
 
-The local SM89 RTX 4060 is the primary comparison GPU because official
-FlashAttention-2 supports Ada. Record the exact reference commit.
+The local SM89 RTX 4060 is the development GPU. A local quick correctness and
+kernel-time snapshot against flash-attn 2.8.3.post1 passes for D64 and D128. At
+`B=1,T=512,H=8`, the custom D64 forward/backward take 31.8/162.5 us versus
+417.3/713.8 us for the official kernels; the generic custom D128 path takes
+1447.7/3464.5 us versus 508.9/1127.2 us. These Nsight Systems timings identify
+D128 Tensor Core coverage as the immediate gap; the full Nsight Compute matrix
+and exact upstream commit remain open.
 
-## Phase 5: CUDA MLA versus FlashMLA
+The final official comparison may run locally or on a rented H100 using the
+`h100` suite, but custom and official timings must come from that same machine.
+Record the exact reference commit.
+
+## Phase 5: Frozen CUDA MLA implementation
 
 - [x] Implement MLA CPU references, training forward/backward, and compressed
   cached decode.
 - [x] Implement an SM89 BF16 Tensor Core path for the small model shape.
 - [x] Validate sequential compressed-cache decode against full causal MLA.
-- [ ] Generalize the benchmark to FlashMLA-compatible production dimensions
-  and layouts without creating a separate MLA algorithm version.
-- [ ] Report training forward, training backward, prefill, and cached decode
-  separately.
-- [ ] Add a FlashMLA adapter with identical BF16 cache format, dimensions,
-  split metadata, sequence lengths, and output contract.
-- [ ] Rent an H100/H800-class SM90 GPU and compile both implementations for
-  that same machine.
-- [ ] Compare custom MLA and FlashMLA on SM90; never compare RTX 4060 timings
-  with published H800 results.
-- [ ] Report correctness, latency, TFLOP/s or bandwidth, cache bytes/token,
-  registers, shared memory, occupancy, cache behavior, and spills.
+- [x] Profile training forward/backward and compressed cached decode with the
+  unified Nsight Compute table.
+- [x] Document compressed-cache bytes per token and validate token-by-token
+  decode against full causal MLA.
 
-Local SM89 results are development profiles. The final FlashMLA speed ratio is
-an SM90 same-hardware experiment.
+MLA is frozen at this point. Generalizing to FlashMLA production layouts and a
+same-H100 comparison is a deferred extension, not a gate for phases 6 or 7.
+If resumed, both implementations must run on the same SM90 machine; local RTX
+4060 timings must never be compared with published H800 results.
 
 ## Phase 6: Secondary MoE kernel demonstration
 
 - [x] Implement and test sigmoid top-k routing, no-drop dispatch, grouped
   routed experts, shared experts, combine, backward, and bias updates.
-- [ ] Benchmark routing, dispatch, grouped GEMM, SwiGLU, combine, backward, and
-  the complete MoE layer separately.
-- [ ] Replace serial dispatch-map construction with parallel histograms,
+- [x] Replace serial dispatch-map construction with parallel histograms,
   prefix offsets, and token permutation.
-- [ ] Implement BF16 Tensor Core grouped GEMM for variable expert loads.
-- [ ] Fuse grouped gate/up projection with the SwiGLU epilogue.
-- [ ] Test uniform, skewed, and hot-expert routing distributions.
-- [ ] Compare grouped GEMM locally with a compatible cuBLAS/CUTLASS baseline;
-  optionally compare a matching full MoE contract with FlashInfer or DeepGEMM
-  on rented datacenter hardware.
+- [x] Implement and CPU-check BF16 Tensor Core grouped GEMM for variable expert
+  loads, including an empty expert.
+- [x] Add uniform, skewed, and hot-expert grouped-GEMM benchmark cases.
+- [x] Compare the same grouped rows and BF16 operands against per-expert
+  cuBLAS Tensor Core GEMMs.
+- [x] Retain complete FP32 MoE forward/backward CPU-CUDA integration tests.
 
-MoE demonstrates irregular scheduling and grouped compute, but must not delay
-the FlashAttention and MLA comparisons.
+This secondary demonstration is deliberately scoped to parallel dispatch and
+grouped GEMM. Fusing gate/up projection with the SwiGLU epilogue and comparing
+a complete production MoE contract with CUTLASS, FlashInfer, or DeepGEMM are
+optional H100 follow-ups and must not delay the attention work.
 
 ## Phase 7: HCA, DSA, and CSA CUDA kernels
 
@@ -221,7 +234,7 @@ DeepSeek-V4 reproduction.
 
 1. GEMM versus cuBLAS on FP32 and BF16 workloads.
 2. CUDA FlashAttention forward/backward versus official FlashAttention-2.
-3. CUDA MLA training/decode versus FlashMLA on the same rented SM90 GPU.
+3. Frozen CUDA MLA training/decode correctness and compressed-cache study.
 4. HCA, DSA, and CSA correctness and performance studies.
 5. A secondary MoE routing/dispatch/grouped-GEMM study.
 6. Dense GPT, DeepSeek-V3-style, and V4-style training demonstrations.

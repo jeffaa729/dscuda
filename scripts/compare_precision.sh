@@ -5,7 +5,7 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 build_dir="$repo_root/build"
 steps="${1:-200}"
-base_config="${2:-configs/tinystories.conf}"
+base_config="${2:-configs/tinystories_dense_matched.conf}"
 cd "$repo_root"
 
 build_log="$(mktemp)"

@@ -5,3 +5,5 @@ data/
 checkpoints/
 __pycache__/
 *.pyc
+/profiles
+.venv/
