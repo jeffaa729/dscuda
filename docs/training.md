@@ -80,6 +80,39 @@ Training logs report loss, tokens/s, achieved TFLOP/s, and estimated model
 FLOPs utilization. Set `peak-tflops` to the appropriate peak for the selected
 GPU and datatype; it is only the denominator used for MFU.
 
+## Portable kernel runtime
+
+The portable FlashAttention comparison uses CUDA events and therefore works on
+rented hosts that do not expose NVIDIA hardware performance counters. It builds
+and tests the custom kernel, checks output and gradients against official
+`flash-attn`, then overwrites concise runtime reports under `profiles/runtime`:
+
+```bash
+uv sync
+
+# Fast two-shape comparison
+bash scripts/benchmark.sh flash_attention quick
+
+# A100 or H100 with an explicit architecture
+DSCUDA_CUDA_ARCH=80 bash scripts/benchmark.sh flash_attention quick
+DSCUDA_CUDA_ARCH=90 bash scripts/benchmark.sh flash_attention h100
+```
+
+Warm-up, iterations per trial, and trial count default to 10, 50, and 5. They
+can be changed without adding positional arguments:
+
+```bash
+DSCUDA_BENCHMARK_WARMUP=20 \
+DSCUDA_BENCHMARK_ITERATIONS=100 \
+DSCUDA_BENCHMARK_TRIALS=7 \
+bash scripts/benchmark.sh flash_attention quick
+```
+
+The Markdown and CSV tables report median, minimum, and maximum CUDA-event
+latency, causal-attention TFLOP/s, minimum API-traffic GB/s, and performance
+relative to official FlashAttention. API GB/s is a calculated lower bound, not
+measured DRAM traffic.
+
 ## Kernel profiling
 
 The comparison profiler builds the matching tests, runs them, captures timing

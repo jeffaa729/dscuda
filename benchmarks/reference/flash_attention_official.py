@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 
-"""Profiles official FlashAttention on deterministic tensors shared with the CUDA benchmark.
+"""Profiles or times official FlashAttention on deterministic tensors shared with the CUDA benchmark.
 The optional raw dump contains output, dQ, dK, and dV as consecutive FP32 arrays."""
 
 import argparse
+import json
 import math
 from pathlib import Path
+import statistics
 
 
 def arguments():
@@ -17,6 +19,10 @@ def arguments():
     parser.add_argument(
         "operation", choices=("forward", "backward", "all"))
     parser.add_argument("dump", nargs="?", type=Path)
+    parser.add_argument("--timing", action="store_true")
+    parser.add_argument("--warmup", type=int, default=10)
+    parser.add_argument("--iterations", type=int, default=50)
+    parser.add_argument("--trials", type=int, default=5)
     return parser.parse_args()
 
 
@@ -66,13 +72,31 @@ def main():
             causal=True,
         )
 
-    def backward(output):
+    def backward(output, retain_graph=False):
         return torch.autograd.grad(
             output,
             (query, key, value),
             output_gradient,
-            retain_graph=False,
+            retain_graph=retain_graph,
         )
+
+    def measure(operation):
+        for _ in range(args.warmup):
+            operation()
+        torch.cuda.synchronize()
+
+        measurements = []
+        for _ in range(args.trials):
+            start = torch.cuda.Event(enable_timing=True)
+            stop = torch.cuda.Event(enable_timing=True)
+            start.record()
+            for _ in range(args.iterations):
+                operation()
+            stop.record()
+            stop.synchronize()
+            measurements.append(
+                start.elapsed_time(stop) / args.iterations)
+        return measurements
 
     # Warm the same operation that will be captured. Backward setup remains
     # outside capture so only the reference backward kernels are measured.
@@ -85,22 +109,53 @@ def main():
         backward(forward())
     torch.cuda.synchronize()
 
-    backward_output = None
-    if args.operation == "backward":
-        backward_output = forward()
-        torch.cuda.synchronize()
+    timing_result = None
+    if args.timing:
+        if args.operation == "all":
+            raise SystemExit("timing requires forward or backward operation")
+        if args.operation == "forward":
+            def measured_operation():
+                with torch.no_grad():
+                    forward()
+        else:
+            backward_output = forward()
+            torch.cuda.synchronize()
 
-    cudart = torch.cuda.cudart()
-    checked_profiler_call(cudart.cudaProfilerStart, "cudaProfilerStart")
-    if args.operation == "forward":
-        with torch.no_grad():
-            forward()
-    elif args.operation == "backward":
-        backward(backward_output)
+            def measured_operation():
+                backward(backward_output, retain_graph=True)
+
+        measurements = measure(measured_operation)
+        timing_result = {
+            "backend": "official",
+            "operation": args.operation,
+            "batch": args.batch,
+            "sequence": args.sequence,
+            "heads": args.heads,
+            "head_size": args.head_size,
+            "warmup": args.warmup,
+            "iterations": args.iterations,
+            "trials": args.trials,
+            "median_ms": statistics.median(measurements),
+            "minimum_ms": min(measurements),
+            "maximum_ms": max(measurements),
+        }
     else:
-        backward(forward())
-    torch.cuda.synchronize()
-    checked_profiler_call(cudart.cudaProfilerStop, "cudaProfilerStop")
+        backward_output = None
+        if args.operation == "backward":
+            backward_output = forward()
+            torch.cuda.synchronize()
+
+        cudart = torch.cuda.cudart()
+        checked_profiler_call(cudart.cudaProfilerStart, "cudaProfilerStart")
+        if args.operation == "forward":
+            with torch.no_grad():
+                forward()
+        elif args.operation == "backward":
+            backward(backward_output)
+        else:
+            backward(forward())
+        torch.cuda.synchronize()
+        checked_profiler_call(cudart.cudaProfilerStop, "cudaProfilerStop")
 
     if args.dump is not None:
         output = forward()
@@ -119,6 +174,8 @@ def main():
         f"D={args.head_size} operation={args.operation} "
         f"torch={torch.__version__}"
     )
+    if timing_result is not None:
+        print("DSCUDA_TIMING " + json.dumps(timing_result, sort_keys=True))
 
 
 if __name__ == "__main__":
