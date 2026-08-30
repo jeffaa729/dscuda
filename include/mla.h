@@ -7,78 +7,14 @@
 
 namespace dscuda {
 
-struct MlaLayerConfig {
-    int batch_size;
-    int sequence_length;
-    int hidden_size;
-    int heads;
-    int query_rank;
-    int kv_rank;
-    int nope_size;
-    int rope_size;
-    int value_size;
-    float epsilon;
-    float attention_scale;
-};
-
-// Matrix weights use row-major input-feature/output-feature storage except
-// key_up [H,NoPE,C] and value_up [H,C,V], which are packed per attention head.
-struct MlaLayerParameters {
-    const float* query_down_weight;
-    const float* query_norm_weight;
-    const float* query_up_weight;
-    const float* kv_down_weight;
-    const float* kv_norm_weight;
-    const float* key_up_weight;
-    const float* value_up_weight;
-    const float* output_weight;
-};
-
-struct MlaLayerGradients {
-    float* query_down_weight;
-    float* query_norm_weight;
-    float* query_up_weight;
-    float* kv_down_weight;
-    float* kv_norm_weight;
-    float* key_up_weight;
-    float* value_up_weight;
-    float* output_weight;
-};
-
-std::size_t mla_layer_activation_elements(const MlaLayerConfig& config);
-std::size_t mla_layer_backward_workspace_elements(const MlaLayerConfig& config);
-std::size_t mla_layer_bf16_workspace_elements(const MlaLayerConfig& config);
-
-// Computes the full DeepSeek-V3 MLA projection graph and saves the FP32 values
-// needed by backward. The attention core itself always consumes BF16 operands.
-void mla_layer_forward_cuda(
-    float* output,
-    const float* input,
-    const MlaLayerParameters& parameters,
-    const float* cosine,
-    const float* sine,
-    float* activations,
-    __nv_bfloat16* bf16_workspace,
-    const MlaLayerConfig& config,
-    cudaStream_t stream = nullptr);
-
-void mla_layer_backward_cuda(
-    float* input_gradient,
-    const MlaLayerGradients& parameter_gradients,
-    const float* output_gradient,
-    const float* input,
-    const MlaLayerParameters& parameters,
-    const float* cosine,
-    const float* sine,
-    const float* activations,
-    float* workspace,
-    __nv_bfloat16* bf16_workspace,
-    const MlaLayerConfig& config,
-    cudaStream_t stream = nullptr);
+constexpr int MLA_KV_RANK = 512;
+constexpr int MLA_ROPE_SIZE = 64;
 
 // Implements the absorbed-query form of MLA. Query latents use [B,T,H,C],
 // query RoPE uses [B,T,H,R], shared KV latents use [B,T,C], shared key RoPE
-// uses [B,T,R], output uses [B,T,H,C], and logsumexp uses [B,H,T].
+// uses [B,T,R], output uses [B,T,H,C], and logsumexp uses [B,H,T] (natural log).
+// One supported CUDA shape: C=512, R=64; B, T and H may vary. Forward uses
+// BF16 Tensor Cores with FP32 accumulation, including incomplete sequence tiles.
 void mla_compressed_attention_forward_cuda(
     float* output,
     float* logsumexp,
@@ -95,7 +31,8 @@ void mla_compressed_attention_forward_cuda(
     cudaStream_t stream = nullptr);
 
 // Recomputes causal probabilities from the saved logsumexp. Every gradient
-// element has one writer, and all four FP32 gradient buffers are accumulated.
+// element has one writer. Set accumulate=false to overwrite all four FP32
+// gradient buffers without clearing them before every benchmark replay.
 void mla_compressed_attention_backward_cuda(
     float* query_latent_gradient,
     float* query_rope_gradient,
@@ -114,6 +51,7 @@ void mla_compressed_attention_backward_cuda(
     int kv_rank,
     int rope_size,
     float scale,
+    bool accumulate = true,
     cudaStream_t stream = nullptr);
 
 // Returns the FP32 workspace for split maxima, normalizers, and unnormalized
@@ -126,6 +64,7 @@ std::size_t mla_decode_workspace_elements(
 
 // Decodes one query per batch from a BF16 compressed KV cache. Independent
 // split CTAs produce online-softmax states, then one combine CTA merges them.
+// Cache lengths must be in [1, maximum_sequence_length]; splits must be positive.
 void mla_decode_forward_cuda(
     float* output,
     float* logsumexp,
@@ -142,31 +81,6 @@ void mla_decode_forward_cuda(
     int rope_size,
     int splits,
     float scale,
-    cudaStream_t stream = nullptr);
-
-// Projects one new hidden state into absorbed queries and compressed KV,
-// appends the KV pair to cache, runs split-KV decode, and applies value/output
-// projections. The cache stores only [C] latent and [R] RoPE entries.
-std::size_t mla_layer_decode_workspace_elements(
-    const MlaLayerConfig& config,
-    int splits);
-std::size_t mla_layer_decode_bf16_workspace_elements(
-    const MlaLayerConfig& config);
-
-void mla_layer_decode_forward_cuda(
-    float* output,
-    const float* input,
-    const MlaLayerParameters& parameters,
-    const float* cosine,
-    const float* sine,
-    int position,
-    __nv_bfloat16* kv_cache,
-    __nv_bfloat16* key_rope_cache,
-    int* cache_lengths,
-    float* workspace,
-    __nv_bfloat16* bf16_workspace,
-    const MlaLayerConfig& config,
-    int splits,
     cudaStream_t stream = nullptr);
 
 }  // namespace dscuda

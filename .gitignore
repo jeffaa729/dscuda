@@ -7,3 +7,5 @@ __pycache__/
 *.pyc
 /profiles
 .venv/
+/docker
+.dockerignore

@@ -8,12 +8,19 @@ report_dir="$repo_root/profiles/reports"
 result_dir="$repo_root/profiles/results"
 python_bin="${DSCUDA_PYTHON:-$repo_root/.venv/bin/python}"
 family="${1:-}"
+[[ "$family" != "moe" ]] || family=grouped_gemm
+[[ "$family" != "gemm" ]] || family=matmul
 suite="${2:-quick}"
 run_mode="${3:-profile}"
 
 usage() {
-    echo "usage: bash scripts/profile.sh {matmul|flash_attention|mla|moe} [quick|full|h100] [profile|extract]" >&2
+    echo "usage: bash scripts/profile.sh {matmul|grouped_gemm|flash_attention|mla|adamw|rmsnorm|softmax|rope|swiglu|embedding|cross_entropy|global_norm} [quick|full|h100] [profile|extract]" >&2
 }
+
+if [[ "$family" == "--help" || "$family" == "-h" ]]; then
+    usage
+    exit 0
+fi
 
 if [[ -z "$family"
     || "$suite" != "quick" && "$suite" != "full" && "$suite" != "h100"
@@ -73,18 +80,22 @@ case "$family" in
         build_targets=(test_flash_attention benchmark_flash_attention)
         ;;
     mla)
-        test_regex='^(mla|mla_decode|mla_layer|mla_layer_decode)$'
+        test_regex='^(mla|mla_decode)$'
         build_targets=(
-            test_mla test_mla_decode test_mla_layer test_mla_layer_decode
+            test_mla test_mla_decode
             benchmark_mla benchmark_mla_decode
         )
         ;;
-    moe)
-        test_regex='^(expert_dispatch|grouped_gemm|deepseek_moe)$'
+    grouped_gemm)
+        test_regex='^(expert_dispatch|grouped_gemm)$'
         build_targets=(
-            test_expert_dispatch test_grouped_gemm test_deepseek_moe
-            benchmark_moe
+            test_expert_dispatch test_grouped_gemm
+            benchmark_grouped_gemm
         )
+        ;;
+    adamw|rmsnorm|softmax|rope|swiglu|embedding|cross_entropy|global_norm)
+        test_regex="^${family}$"
+        build_targets=("test_${family}" "benchmark_${family}")
         ;;
     *)
         usage
@@ -92,14 +103,18 @@ case "$family" in
         ;;
 esac
 
-cmake \
-    -S "$repo_root" \
-    -B "$build_dir" \
-    -DCMAKE_BUILD_TYPE=Release \
-    -DCMAKE_CUDA_ARCHITECTURES="$cuda_arch" \
-    -DCMAKE_CUDA_COMPILER="$nvcc_bin"
-cmake --build "$build_dir" --target "${build_targets[@]}" -j
-ctest --test-dir "$build_dir" --output-on-failure -R "$test_regex"
+mkdir -p "$build_dir"
+if ! CUDACXX="$nvcc_bin" DSCUDA_CUDA_ARCH="$cuda_arch" \
+        bash "$repo_root/scripts/build.sh" "${build_targets[@]}" \
+        >"$build_dir/${family}_build.log" 2>&1; then
+    cat "$build_dir/${family}_build.log" >&2
+    exit 1
+fi
+if ! ctest --test-dir "$build_dir" --output-on-failure -R "$test_regex" \
+        >"$build_dir/${family}_tests.log" 2>&1; then
+    cat "$build_dir/${family}_tests.log" >&2
+    exit 1
+fi
 
 mkdir -p "$report_dir" "$result_dir"
 report_arguments=()
@@ -138,16 +153,19 @@ profile_case() {
     local metrics_report="$report_dir/${family}_${stem}_metrics.ncu-rep"
 
     if [[ "$run_mode" == "profile" ]]; then
-        printf 'Profiling %s\n' "$label"
-        "$ncu_bin" \
+        if ! "$ncu_bin" \
             --profile-from-start off \
             --cache-control none \
             --section SpeedOfLight \
             --kernel-name "$kernel_pattern" \
             --export "$speed_report" \
             --force-overwrite \
-            "$@" >/dev/null
-        "$ncu_bin" \
+            "$@" >"$speed_report.log" 2>&1; then
+            cat "$speed_report.log" >&2
+            echo "Nsight profiling failed; counter-free comparisons are available in scripts/benchmark.sh." >&2
+            return 1
+        fi
+        if ! "$ncu_bin" \
             --profile-from-start off \
             --cache-control all \
             --section LaunchStats \
@@ -157,9 +175,11 @@ profile_case() {
             --kernel-name "$kernel_pattern" \
             --export "$metrics_report" \
             --force-overwrite \
-            "$@" >/dev/null
+            "$@" >"$metrics_report.log" 2>&1; then
+            cat "$metrics_report.log" >&2
+            return 1
+        fi
     else
-        printf 'Extracting %s\n' "$label"
         [[ -f "$speed_report" && -f "$metrics_report" ]] || {
             echo "missing report pair for $label" >&2
             exit 1
@@ -198,16 +218,14 @@ official_flash_available() {
 }
 
 profile_flash_attention() {
-    local cases=("1 512 8 64" "1 512 8 128")
+    local cases=("1 512 8 128")
     if [[ "$suite" != "quick" ]]; then
         cases=()
-        local batch sequence heads dimension
+        local batch sequence heads
         for batch in 1 4; do
             for sequence in 128 256 512 1024 2048; do
                 for heads in 4 8; do
-                    for dimension in 64 128; do
-                        cases+=("$batch $sequence $heads $dimension")
-                    done
+                    cases+=("$batch $sequence $heads 128")
                 done
             done
         done
@@ -220,7 +238,7 @@ profile_flash_attention() {
         echo "PyTorch and the official flash-attn package are required" >&2
         exit 1
     else
-        echo "Official flash-attn is not installed; profiling the custom kernel only."
+        echo "Official flash-attn is not installed; profiling the custom kernel only." >&2
     fi
 
     local case_spec batch sequence heads dimension operation shape stem
@@ -236,12 +254,16 @@ profile_flash_attention() {
             "$build_dir/benchmark_flash_attention" \
                 "$batch" "$sequence" "$heads" "$dimension" all \
                 "$custom_dump" >/dev/null
-            "$python_bin" "$repo_root/benchmarks/reference/flash_attention_official.py" \
+            "$python_bin" "$repo_root/reference/python/flash_attention_official.py" \
                 "$batch" "$sequence" "$heads" "$dimension" all \
                 "$official_dump" >/dev/null
-            "$python_bin" "$repo_root/scripts/compare_attention_dumps.py" \
+            if ! "$python_bin" "$repo_root/scripts/compare_attention_dumps.py" \
                 "$custom_dump" "$official_dump" \
-                "$batch" "$sequence" "$heads" "$dimension"
+                "$batch" "$sequence" "$heads" "$dimension" \
+                >"$build_dir/flash_attention_comparison.log" 2>&1; then
+                cat "$build_dir/flash_attention_comparison.log" >&2
+                exit 1
+            fi
             rm -f -- "$custom_dump" "$official_dump"
         fi
 
@@ -256,7 +278,7 @@ profile_flash_attention() {
                     "$shape/official/$operation" \
                     "${stem}_official_${operation}" 'regex:.*flash.*' \
                     "$python_bin" \
-                    "$repo_root/benchmarks/reference/flash_attention_official.py" \
+                    "$repo_root/reference/python/flash_attention_official.py" \
                     "$batch" "$sequence" "$heads" "$dimension" "$operation"
             fi
         done
@@ -264,23 +286,23 @@ profile_flash_attention() {
 }
 
 profile_mla() {
-    local sequences=(256)
+    local sequences=(128)
     [[ "$suite" != "quick" ]] && sequences=(128 256 512)
     local sequence
     for sequence in "${sequences[@]}"; do
         profile_case \
-            "B=2,T=${sequence},H=4,D=64,R=32/custom/training" \
-            "T${sequence}_training" \
-            'regex:mla_(forward_tensor_core|forward|query_backward|kv_backward)_kernel' \
-            "$build_dir/benchmark_mla" 2 "$sequence" 4 64 32
+            "B=1,T=${sequence},H=8,D=512,R=64/custom/forward_backward" \
+            "T${sequence}_forward_backward" \
+            'regex:mla_(forward|query_backward|kv_backward)_kernel' \
+            "$build_dir/benchmark_mla" 1 "$sequence" 8 512 64
         profile_case \
-            "B=1,KV=${sequence},H=4,D=64,R=32/custom/decode" \
+            "B=2,KV=${sequence},H=16,D=512,R=64/custom/decode" \
             "KV${sequence}_decode" 'regex:mla_decode_(split|combine)_kernel' \
-            "$build_dir/benchmark_mla_decode" 1 "$sequence" 4 64 32 4
+            "$build_dir/benchmark_mla_decode" 2 "$sequence" 16 512 64 8
     done
 }
 
-profile_moe() {
+profile_grouped_gemm() {
     local rows=4096
     local experts=8
     local input_size=512
@@ -304,7 +326,7 @@ profile_moe() {
             stem="M${rows}_E${experts}_K${input_size}_N${output_size}_${distribution}_${backend}"
             profile_case \
                 "$label" "$stem" "$pattern" \
-                "$build_dir/benchmark_moe" \
+                "$build_dir/benchmark_grouped_gemm" \
                 "$rows" "$experts" "$input_size" "$output_size" \
                 "$distribution" "$backend"
         done
@@ -315,7 +337,8 @@ case "$family" in
     matmul) profile_matmul ;;
     flash_attention) profile_flash_attention ;;
     mla) profile_mla ;;
-    moe) profile_moe ;;
+    grouped_gemm) profile_grouped_gemm ;;
+    *) profile_case "${family}/custom/all" "custom" 'regex:.*' "$build_dir/benchmark_${family}" ;;
 esac
 
 "$python_bin" "$repo_root/scripts/extract_ncu.py" \
@@ -323,6 +346,3 @@ esac
     --markdown-out "$result_dir/${family}.md" \
     "$ncu_bin" "${report_arguments[@]}"
 "$python_bin" "$repo_root/scripts/update_benchmark_summary.py" "$result_dir"
-printf '\nRaw reports: %s/%s_*\n' "$report_dir" "$family"
-printf 'Tables: %s/%s.csv and %s/%s.md\n' \
-    "$result_dir" "$family" "$result_dir" "$family"

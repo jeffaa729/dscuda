@@ -11,12 +11,18 @@ import re
 import subprocess
 from pathlib import Path
 
+from benchmark_flash_attention_runtime import add_reference_percentages, format_percentage, table
+
 
 SPEED_SECTION = "GPU Speed Of Light Throughput"
 MEMORY_SECTION = "Memory Workload Analysis"
 LAUNCH_SECTION = "Launch Statistics"
 OCCUPANCY_SECTION = "Occupancy"
 COMMAND_SECTION = "Command line profiler metrics"
+REFERENCE_BACKENDS = {"fp32": "cublas_fp32", "bf16": "cublas_bf16",
+                      "custom_bf16": "cublas_bf16", "custom": "official",
+                      "cublas_fp32": "cublas_fp32", "cublas_bf16": "cublas_bf16",
+                      "official": "official"}
 
 
 def arguments():
@@ -104,11 +110,11 @@ def read_report(ncu, report):
 
 
 def numeric(metrics, section, metric):
-    raw, unit = metrics.get((section, metric), ("0", ""))
+    raw, unit = metrics.get((section, metric), ("nan", ""))
     try:
         value = float(raw.replace(",", ""))
     except ValueError:
-        return 0.0
+        return math.nan, unit
     return value, unit
 
 
@@ -175,11 +181,6 @@ def merge_reports(ncu, label, speed_path, metrics_path):
                 "time_us": elapsed,
                 "dram_read_mb": read_bytes / 1e6,
                 "dram_write_mb": write_bytes / 1e6,
-                "effective_gbps": (
-                    (read_bytes + write_bytes) / (elapsed * 1e3)
-                    if elapsed
-                    else 0.0
-                ),
                 "dram_pct": metric_value(
                     metrics, SPEED_SECTION, "DRAM Throughput"
                 ),
@@ -239,9 +240,6 @@ def totals(rows):
                 "time_us": elapsed,
                 "dram_read_mb": read_mb,
                 "dram_write_mb": write_mb,
-                "effective_gbps": (
-                    (read_mb + write_mb) * 1000.0 / elapsed if elapsed else 0.0
-                ),
                 "dram_pct": weighted(kernels, "dram_pct"),
                 "sm_pct": weighted(kernels, "sm_pct"),
                 "occupancy_pct": weighted(kernels, "occupancy_pct"),
@@ -253,87 +251,29 @@ def totals(rows):
                     for row in kernels
                 ),
                 "spills": sum(row["spills"] for row in kernels),
-                "tflops": operation_tflops(workload, elapsed),
             }
         )
     return result
 
 
-def operation_tflops(workload, elapsed_us):
-    dimensions = {
-        name: int(value)
-        for name, value in re.findall(r"(?:^|,)(M|N|K)=([0-9]+)", workload)
-    }
-    if not all(name in dimensions for name in ("M", "N", "K")):
-        return math.nan
-    flops = 2.0 * dimensions["M"] * dimensions["N"] * dimensions["K"]
-    return flops / (elapsed_us * 1.0e6) if elapsed_us else math.nan
+def result_table(summary):
+    # Percentages compare measured times; hardware metrics come only from Nsight.
+    add_reference_percentages(summary, REFERENCE_BACKENDS, ("workload", "operation"), "time_us")
+    def number(value, digits=2):
+        return f"{value:.{digits}f}" if math.isfinite(value) else "-"
 
-
-def reference_backend(backend):
-    return {
-        "fp32": "cublas_fp32",
-        "bf16": "cublas_bf16",
-        "custom": "official",
-        "custom_bf16": "cublas_bf16",
-    }.get(backend)
-
-
-def add_relative_performance(summary):
-    lookup = {
-        (row["workload"], row["backend"], row["operation"]): row
-        for row in summary
-    }
-    for row in summary:
-        reference = reference_backend(row["backend"])
-        reference_row = lookup.get(
-            (row["workload"], reference, row["operation"])
-        )
-        row["relative_pct"] = (
-            100.0 * reference_row["time_us"] / row["time_us"]
-            if reference_row and row["time_us"]
-            else math.nan
-        )
-        row["bottleneck"] = bottleneck(row)
-
-
-def bottleneck(row):
-    if row["spills"] > 0:
-        return "local-memory spills"
-    if row["max_registers"] >= 120 and row["occupancy_pct"] < 40:
-        return "register pressure"
-    if row["dram_pct"] >= 70:
-        return "DRAM bandwidth"
-    if row["sm_pct"] >= 70:
-        return "compute throughput"
-    if row["sm_pct"] < 35 and row["dram_pct"] < 35:
-        return "low parallelism/latency"
-    return "mixed compute/memory"
+    headers = ("workload", "backend", "operation", "launches", "time us", "DRAM MB",
+               "DRAM %", "SM %", "occ %", "L2 hit %", "regs", "shared KiB", "spills", "reference %")
+    values = [(r["workload"], r["backend"], r["operation"], r["launches"], number(r["time_us"]),
+               number(r["dram_read_mb"] + r["dram_write_mb"]), number(r["dram_pct"]),
+               number(r["sm_pct"]), number(r["occupancy_pct"]), number(r["l2_hit_pct"]),
+               number(r["max_registers"], 0), number(r["max_smem_bytes"] / 1024),
+               number(r["spills"], 0), format_percentage(r["reference_pct"])) for r in summary]
+    return table(headers, values, set(range(3, len(headers))))
 
 
 def print_totals(summary):
-    print("Operation totals")
-    print(
-        f"{'workload':<30} {'backend':<14} {'operation':<10} {'launches':>8} "
-        f"{'time us':>11} {'TFLOP/s':>9} {'DRAM MB':>10} {'GB/s':>10} {'SM %':>8} "
-        f"{'occ %':>8} {'regs':>7} {'spills':>8} {'ref %':>8} bottleneck"
-    )
-    for row in summary:
-        relative = (
-            "-"
-            if math.isnan(row["relative_pct"])
-            else f"{row['relative_pct']:.1f}"
-        )
-        tflops = "-" if math.isnan(row["tflops"]) else f"{row['tflops']:.2f}"
-        print(
-            f"{row['workload']:<30} {row['backend']:<14} "
-            f"{row['operation']:<10} {row['launches']:>8} "
-            f"{row['time_us']:>11.2f} {tflops:>9} "
-            f"{row['dram_read_mb'] + row['dram_write_mb']:>10.2f} "
-            f"{row['effective_gbps']:>10.2f} {row['sm_pct']:>8.2f} "
-            f"{row['occupancy_pct']:>8.2f} {row['max_registers']:>7.0f} "
-            f"{row['spills']:>8.0f} {relative:>8} {row['bottleneck']}"
-        )
+    print(result_table(summary), end="")
 
 
 def write_csv(path, rows):
@@ -347,37 +287,7 @@ def write_csv(path, rows):
 
 def write_markdown(path, summary):
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as output:
-        output.write(
-            "| workload | backend | operation | launches | time us | TFLOP/s | DRAM MB | "
-            "effective GB/s | DRAM % | SM % | occupancy % | L2 hit % | "
-            "registers | shared KiB | spills | ref % | bottleneck |\n"
-        )
-        output.write(
-            "|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|\n"
-        )
-        for row in summary:
-            relative = (
-                "-"
-                if math.isnan(row["relative_pct"])
-                else f"{row['relative_pct']:.1f}"
-            )
-            tflops = (
-                "-" if math.isnan(row["tflops"])
-                else f"{row['tflops']:.2f}"
-            )
-            output.write(
-                f"| {row['workload']} | {row['backend']} | "
-                f"{row['operation']} | {row['launches']} | "
-                f"{row['time_us']:.2f} | {tflops} | "
-                f"{row['dram_read_mb'] + row['dram_write_mb']:.2f} | "
-                f"{row['effective_gbps']:.2f} | {row['dram_pct']:.2f} | "
-                f"{row['sm_pct']:.2f} | {row['occupancy_pct']:.2f} | "
-                f"{row['l2_hit_pct']:.2f} | {row['max_registers']:.0f} | "
-                f"{row['max_smem_bytes'] / 1024.0:.2f} | "
-                f"{row['spills']:.0f} | {relative} | "
-                f"{row['bottleneck']} |\n"
-            )
+    path.write_text(result_table(summary), encoding="utf-8")
 
 
 def main():
@@ -393,7 +303,6 @@ def main():
             )
         )
     summary = totals(rows)
-    add_relative_performance(summary)
     print_totals(summary)
     if args.csv_out:
         write_csv(args.csv_out, summary)
