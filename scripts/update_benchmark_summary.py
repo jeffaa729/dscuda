@@ -15,7 +15,7 @@ def main():
     result_dir = Path(sys.argv[1])
     rows = []
     for path in sorted(result_dir.glob("*.csv")):
-        if path.name == "summary.csv":
+        if path.stem not in {"matmul", "grouped_gemm", "flash_attention", "mla"}:
             continue
         with path.open(newline="", encoding="utf-8") as source:
             measurements = list(csv.DictReader(source))

@@ -14,7 +14,7 @@ suite="${2:-quick}"
 run_mode="${3:-profile}"
 
 usage() {
-    echo "usage: bash scripts/profile.sh {matmul|grouped_gemm|flash_attention|mla|adamw|rmsnorm|softmax|rope|swiglu|embedding|cross_entropy|global_norm} [quick|full|h100] [profile|extract]" >&2
+    echo "usage: bash scripts/profile.sh {matmul|grouped_gemm|flash_attention|mla} [quick|full|h100] [profile|extract]" >&2
 }
 
 if [[ "$family" == "--help" || "$family" == "-h" ]]; then
@@ -92,10 +92,6 @@ case "$family" in
             test_expert_dispatch test_grouped_gemm
             benchmark_grouped_gemm
         )
-        ;;
-    adamw|rmsnorm|softmax|rope|swiglu|embedding|cross_entropy|global_norm)
-        test_regex="^${family}$"
-        build_targets=("test_${family}" "benchmark_${family}")
         ;;
     *)
         usage
@@ -338,7 +334,6 @@ case "$family" in
     flash_attention) profile_flash_attention ;;
     mla) profile_mla ;;
     grouped_gemm) profile_grouped_gemm ;;
-    *) profile_case "${family}/custom/all" "custom" 'regex:.*' "$build_dir/benchmark_${family}" ;;
 esac
 
 "$python_bin" "$repo_root/scripts/extract_ncu.py" \
