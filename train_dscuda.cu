@@ -291,13 +291,16 @@ dscuda::ModelConfig make_config(
     const Options& options,
     int vocabulary_size) {
     const bool overfit = options.mode == "overfit";
+    const bool flash = options.attention == dscuda::AttentionImplementation::flash2;
+    const int hidden = use_default(
+        options.hidden_size, overfit ? (flash ? 128 : 64) : 256);
     return {
         use_default(options.batch_size, overfit ? 2 : 4),
         use_default(options.sequence_length, overfit ? 32 : 256),
         vocabulary_size,
         use_default(options.layers, overfit ? 1 : 4),
-        use_default(options.hidden_size, overfit ? 64 : 256),
-        use_default(options.heads, 4),
+        hidden,
+        use_default(options.heads, flash ? hidden / 128 : 4),
         use_default(options.ffn_size, overfit ? 192 : 768),
         use_default(options.rotary_size, overfit ? 16 : 64),
         1.0e-5F,

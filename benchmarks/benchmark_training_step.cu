@@ -31,7 +31,7 @@ int main(int argc, char** argv) {
         const int sequence_length = argc > 3 ? std::atoi(argv[3]) : 256;
         const int layers = argc > 4 ? std::atoi(argv[4]) : 4;
         const int hidden_size = argc > 5 ? std::atoi(argv[5]) : 256;
-        const int heads = argc > 6 ? std::atoi(argv[6]) : 4;
+        const int heads = argc > 6 ? std::atoi(argv[6]) : hidden_size / 128;
         const int ffn_size = argc > 7 ? std::atoi(argv[7]) : 768;
         const int vocabulary_size = argc > 8 ? std::atoi(argv[8]) : 4096;
         const int rotary_size = hidden_size / heads;

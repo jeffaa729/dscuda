@@ -1,4 +1,4 @@
-// Implements an educational FlashAttention-2-style causal forward pass with tiled K/V reuse and FP32 online-softmax accumulation.
+// Implements D128 causal attention with BF16 Tensor Core tiles and FP32 online softmax; FP32 inputs and partial sequence tiles use a CUDA-core path.
 // Backward reconstructs probabilities from saved log-sum-exp values and partitions dQ and dK/dV by rows to avoid atomics and quadratic storage.
 
 #include "flash_attention.h"
@@ -16,8 +16,8 @@ constexpr int WARP_SIZE = 32;
 constexpr int WARPS = 4;
 constexpr int NUM_THREADS = WARPS * WARP_SIZE;
 constexpr int BN = 32;
-constexpr int MAX_HEAD_SIZE = 128;
-constexpr int VALUES_PER_LANE = MAX_HEAD_SIZE / WARP_SIZE;
+constexpr int HEAD_SIZE = 128;
+constexpr int VALUES_PER_LANE = HEAD_SIZE / WARP_SIZE;
 
 __device__ __forceinline__ float as_float(float value) {
     return value;
@@ -408,17 +408,22 @@ namespace tensor_core {
 
 constexpr int BM = 64;
 constexpr int BN = 64;
-constexpr int D = 64;
+constexpr int D = HEAD_SIZE;
 constexpr int THREADS = 128;
 constexpr int MMA_M = 16;
 constexpr int MMA_N = 8;
 constexpr int MMA_K = 16;
-constexpr int N_TILES = D / MMA_N;
-constexpr int K_TILES = D / MMA_K;
+// QK^T produces 64 score columns, while PV produces 128 output columns.
+constexpr int SCORE_N_TILES = BN / MMA_N;
+constexpr int OUTPUT_N_TILES = D / MMA_N;
+constexpr int HEAD_K_TILES = D / MMA_K;
+constexpr int TOKEN_K_TILES = BN / MMA_K;
 constexpr int VECTOR_ELEMENTS = 8;
+constexpr int BACKWARD_SHARED_BYTES = 4 * BM * D * sizeof(__nv_bfloat16);
 
+template <int STRIDE = D>
 __device__ __forceinline__ int swizzle(int offset) {
-    return offset ^ ((offset & (7 << 6)) >> 3);
+    return offset ^ (((offset / STRIDE) & 7) << 3);
 }
 
 __device__ __forceinline__ unsigned int shared_address(
@@ -545,39 +550,45 @@ __device__ __forceinline__ void copy_bf16_tile(
     cp_async_commit();
 }
 
-__device__ __forceinline__ void copy_float_tile_to_bf16(
+template <typename IO>
+__device__ __forceinline__ void copy_gradient_tile(
     __nv_bfloat16* shared,
-    const float* global,
+    const IO* global,
     int batch,
     int first_token,
     int head,
     int sequence_length,
     int heads) {
-    for (int index = threadIdx.x; index < BM * D; index += THREADS) {
-        const int row = index / D;
-        const int column = index % D;
-        shared[swizzle(index)] = __float2bfloat16(global[tensor_index(
-            batch,
-            first_token + row,
-            head,
-            column,
-            sequence_length,
-            heads)]);
+    if constexpr (std::is_same_v<IO, __nv_bfloat16>) {
+        copy_bf16_tile(shared, global, batch, first_token, head, sequence_length, heads);
+    } else {
+        for (int index = threadIdx.x; index < BM * D; index += THREADS) {
+            const int row = index / D;
+            const int column = index % D;
+            shared[swizzle(index)] = __float2bfloat16(global[tensor_index(
+                batch,
+                first_token + row,
+                head,
+                column,
+                sequence_length,
+                heads)]);
+        }
     }
 }
 
+template <int COLUMNS = D>
 __device__ __forceinline__ void load_left_fragments(
-    unsigned int (&fragments)[K_TILES][4],
+    unsigned int (&fragments)[COLUMNS / MMA_K][4],
     const __nv_bfloat16* shared,
     int warp_row,
     int lane) {
 #pragma unroll
-    for (int tile = 0; tile < K_TILES; ++tile) {
+    for (int tile = 0; tile < COLUMNS / MMA_K; ++tile) {
         const int row = warp_row + lane % MMA_M;
         const int column = tile * MMA_K + lane / MMA_M * 8;
         load_matrix_x4(
             fragments[tile],
-            shared_address(shared + swizzle(row * D + column)));
+            shared_address(shared + swizzle<COLUMNS>(row * COLUMNS + column)));
     }
 }
 
@@ -607,6 +618,7 @@ __device__ __forceinline__ void load_right_fragment(
         shared_address(shared + swizzle(row * D + column)));
 }
 
+template <int N_TILES, int K_TILES>
 __device__ __forceinline__ void matrix_product_transposed_right(
     float (&accumulators)[N_TILES][4],
     const unsigned int (&left)[K_TILES][4],
@@ -624,6 +636,7 @@ __device__ __forceinline__ void matrix_product_transposed_right(
     }
 }
 
+template <int N_TILES, int K_TILES>
 __device__ __forceinline__ void matrix_product_right(
     float (&accumulators)[N_TILES][4],
     const unsigned int (&left)[K_TILES][4],
@@ -642,11 +655,11 @@ __device__ __forceinline__ void matrix_product_right(
 }
 
 __device__ __forceinline__ void pack_row_matrix(
-    unsigned int (&fragments)[K_TILES][4],
-    const float2 (&top)[N_TILES],
-    const float2 (&bottom)[N_TILES]) {
+    unsigned int (&fragments)[TOKEN_K_TILES][4],
+    const float2 (&top)[SCORE_N_TILES],
+    const float2 (&bottom)[SCORE_N_TILES]) {
 #pragma unroll
-    for (int tile = 0; tile < K_TILES; ++tile) {
+    for (int tile = 0; tile < TOKEN_K_TILES; ++tile) {
         fragments[tile][0] = pack_bf16x2(top[tile * 2]);
         fragments[tile][1] = pack_bf16x2(bottom[tile * 2]);
         fragments[tile][2] = pack_bf16x2(top[tile * 2 + 1]);
@@ -654,11 +667,12 @@ __device__ __forceinline__ void pack_row_matrix(
     }
 }
 
+template <typename IO>
 __device__ __forceinline__ void row_delta(
     float& top,
     float& bottom,
-    const float* output_gradient,
-    const float* output,
+    const IO* output_gradient,
+    const IO* output,
     int batch,
     int first_query,
     int head,
@@ -686,8 +700,8 @@ __device__ __forceinline__ void row_delta(
             column,
             sequence_length,
             heads);
-        top += output_gradient[top_index] * output[top_index];
-        bottom += output_gradient[bottom_index] * output[bottom_index];
+        top += as_float(output_gradient[top_index]) * as_float(output[top_index]);
+        bottom += as_float(output_gradient[bottom_index]) * as_float(output[bottom_index]);
     }
     top += __shfl_xor_sync(0xffffffff, top, 1);
     top += __shfl_xor_sync(0xffffffff, top, 2);
@@ -695,9 +709,30 @@ __device__ __forceinline__ void row_delta(
     bottom += __shfl_xor_sync(0xffffffff, bottom, 2);
 }
 
+__device__ __forceinline__ void store_pair(float* destination, float2 value) {
+    *reinterpret_cast<float2*>(destination) = value;
+}
+
+__device__ __forceinline__ void store_pair(__nv_bfloat16* destination, float2 value) {
+    *reinterpret_cast<__nv_bfloat162*>(destination) = __float22bfloat162_rn(value);
+}
+
+template <typename IO>
+__device__ __forceinline__ void store_gradient_pair(IO* destination, float2 value) {
+    if constexpr (std::is_same_v<IO, float>) {
+        // Training accumulates into FP32 buffers; the native BF16 operator
+        // overwrites its gradients, matching FlashAttention's public contract.
+        const float2 previous = *reinterpret_cast<float2*>(destination);
+        value.x += previous.x;
+        value.y += previous.y;
+    }
+    store_pair(destination, value);
+}
+
+template <typename IO>
 __global__ __launch_bounds__(THREADS, 2)
 void flash_attention_forward_tensor_core_kernel(
-    float* __restrict__ output,
+    IO* __restrict__ output,
     float* __restrict__ logsumexp,
     const __nv_bfloat16* __restrict__ query,
     const __nv_bfloat16* __restrict__ key,
@@ -728,10 +763,10 @@ void flash_attention_forward_tensor_core_kernel(
     cp_async_wait();
     __syncthreads();
 
-    unsigned int query_fragments[K_TILES][4];
+    unsigned int query_fragments[HEAD_K_TILES][4];
     load_left_fragments(
         query_fragments, shared_query, warp_row, lane);
-    float output_accumulators[N_TILES][4] = {};
+    float output_accumulators[OUTPUT_N_TILES][4] = {};
     float row_max[2] = {-FLT_MAX, -FLT_MAX};
     float row_sum[2] = {0.0F, 0.0F};
 
@@ -755,7 +790,7 @@ void flash_attention_forward_tensor_core_kernel(
         cp_async_wait();
         __syncthreads();
 
-        float scores[N_TILES][4] = {};
+        float scores[SCORE_N_TILES][4] = {};
         matrix_product_transposed_right(
             scores, query_fragments, shared_key, lane);
 
@@ -763,7 +798,7 @@ void flash_attention_forward_tensor_core_kernel(
         const int local_bottom_row = local_top_row + 8;
         float current_max[2] = {-FLT_MAX, -FLT_MAX};
 #pragma unroll
-        for (int tile = 0; tile < N_TILES; ++tile) {
+        for (int tile = 0; tile < SCORE_N_TILES; ++tile) {
             const int key_column = tile * MMA_N + (lane % 4) * 2;
             if (first_key == first_query) {
                 scores[tile][0] = local_top_row >= key_column
@@ -805,7 +840,7 @@ void flash_attention_forward_tensor_core_kernel(
             expf(row_max[0] - next_max[0]),
             expf(row_max[1] - next_max[1])};
 #pragma unroll
-        for (int tile = 0; tile < N_TILES; ++tile) {
+        for (int tile = 0; tile < OUTPUT_N_TILES; ++tile) {
             output_accumulators[tile][0] *= previous_scale[0];
             output_accumulators[tile][1] *= previous_scale[0];
             output_accumulators[tile][2] *= previous_scale[1];
@@ -814,11 +849,11 @@ void flash_attention_forward_tensor_core_kernel(
         row_sum[0] *= previous_scale[0];
         row_sum[1] *= previous_scale[1];
 
-        float2 probability_top[N_TILES];
-        float2 probability_bottom[N_TILES];
+        float2 probability_top[SCORE_N_TILES];
+        float2 probability_bottom[SCORE_N_TILES];
         float local_sum[2] = {};
 #pragma unroll
-        for (int tile = 0; tile < N_TILES; ++tile) {
+        for (int tile = 0; tile < SCORE_N_TILES; ++tile) {
             probability_top[tile] = make_float2(
                 expf(scores[tile][0] - next_max[0]),
                 expf(scores[tile][1] - next_max[0]));
@@ -839,7 +874,7 @@ void flash_attention_forward_tensor_core_kernel(
         row_max[0] = next_max[0];
         row_max[1] = next_max[1];
 
-        unsigned int probability_fragments[K_TILES][4];
+        unsigned int probability_fragments[TOKEN_K_TILES][4];
         pack_row_matrix(
             probability_fragments, probability_top, probability_bottom);
         matrix_product_right(
@@ -853,7 +888,7 @@ void flash_attention_forward_tensor_core_kernel(
     const int top_query = first_query + warp_row + lane / 4;
     const int bottom_query = top_query + 8;
 #pragma unroll
-    for (int tile = 0; tile < N_TILES; ++tile) {
+    for (int tile = 0; tile < OUTPUT_N_TILES; ++tile) {
         const int column = tile * MMA_N + (lane % 4) * 2;
         const float2 top = make_float2(
             output_accumulators[tile][0] / row_sum[0],
@@ -861,20 +896,20 @@ void flash_attention_forward_tensor_core_kernel(
         const float2 bottom = make_float2(
             output_accumulators[tile][2] / row_sum[1],
             output_accumulators[tile][3] / row_sum[1]);
-        *reinterpret_cast<float2*>(output + tensor_index(
+        store_pair(output + tensor_index(
             batch,
             top_query,
             head,
             column,
             sequence_length,
-            heads)) = top;
-        *reinterpret_cast<float2*>(output + tensor_index(
+            heads), top);
+        store_pair(output + tensor_index(
             batch,
             bottom_query,
             head,
             column,
             sequence_length,
-            heads)) = bottom;
+            heads), bottom);
     }
     if (lane % 4 == 0) {
         logsumexp[batch_head * sequence_length + top_query] =
@@ -884,11 +919,12 @@ void flash_attention_forward_tensor_core_kernel(
     }
 }
 
-__global__ __launch_bounds__(THREADS, 2)
+template <typename IO>
+__global__ __launch_bounds__(THREADS, 1)
 void flash_attention_backward_query_tensor_core_kernel(
-    float* __restrict__ query_gradient,
-    const float* __restrict__ output_gradient,
-    const float* __restrict__ output,
+    IO* __restrict__ query_gradient,
+    const IO* __restrict__ output_gradient,
+    const IO* __restrict__ output,
     const float* __restrict__ logsumexp,
     const __nv_bfloat16* __restrict__ query,
     const __nv_bfloat16* __restrict__ key,
@@ -896,10 +932,12 @@ void flash_attention_backward_query_tensor_core_kernel(
     int sequence_length,
     int heads,
     float scale) {
-    __shared__ __align__(16) __nv_bfloat16 shared_query[BM * D];
-    __shared__ __align__(16) __nv_bfloat16 shared_output_gradient[BM * D];
-    __shared__ __align__(16) __nv_bfloat16 shared_key[BN * D];
-    __shared__ __align__(16) __nv_bfloat16 shared_value[BN * D];
+    // D128 needs 64 KiB here, exceeding the default 48 KiB static limit.
+    extern __shared__ __align__(16) __nv_bfloat16 shared[];
+    __nv_bfloat16* shared_query = shared;
+    __nv_bfloat16* shared_output_gradient = shared_query + BM * D;
+    __nv_bfloat16* shared_key = shared_output_gradient + BM * D;
+    __nv_bfloat16* shared_value = shared_key + BN * D;
 
     const int lane = threadIdx.x % WARP_SIZE;
     const int warp = threadIdx.x / WARP_SIZE;
@@ -917,7 +955,7 @@ void flash_attention_backward_query_tensor_core_kernel(
         head,
         sequence_length,
         heads);
-    copy_float_tile_to_bf16(
+    copy_gradient_tile(
         shared_output_gradient,
         output_gradient,
         batch,
@@ -928,8 +966,8 @@ void flash_attention_backward_query_tensor_core_kernel(
     cp_async_wait();
     __syncthreads();
 
-    unsigned int query_fragments[K_TILES][4];
-    unsigned int output_gradient_fragments[K_TILES][4];
+    unsigned int query_fragments[HEAD_K_TILES][4];
+    unsigned int output_gradient_fragments[HEAD_K_TILES][4];
     load_left_fragments(
         query_fragments, shared_query, warp_row, lane);
     load_left_fragments(
@@ -937,7 +975,7 @@ void flash_attention_backward_query_tensor_core_kernel(
         shared_output_gradient,
         warp_row,
         lane);
-    float query_gradient_accumulators[N_TILES][4] = {};
+    float query_gradient_accumulators[OUTPUT_N_TILES][4] = {};
     float delta[2];
     row_delta(
         delta[0],
@@ -977,8 +1015,8 @@ void flash_attention_backward_query_tensor_core_kernel(
         cp_async_wait();
         __syncthreads();
 
-        float scores[N_TILES][4] = {};
-        float probability_gradients[N_TILES][4] = {};
+        float scores[SCORE_N_TILES][4] = {};
+        float probability_gradients[SCORE_N_TILES][4] = {};
         matrix_product_transposed_right(
             scores, query_fragments, shared_key, lane);
         matrix_product_transposed_right(
@@ -989,10 +1027,10 @@ void flash_attention_backward_query_tensor_core_kernel(
 
         const int local_top_row = warp_row + lane / 4;
         const int local_bottom_row = local_top_row + 8;
-        float2 score_gradient_top[N_TILES];
-        float2 score_gradient_bottom[N_TILES];
+        float2 score_gradient_top[SCORE_N_TILES];
+        float2 score_gradient_bottom[SCORE_N_TILES];
 #pragma unroll
-        for (int tile = 0; tile < N_TILES; ++tile) {
+        for (int tile = 0; tile < SCORE_N_TILES; ++tile) {
             const int key_column = tile * MMA_N + (lane % 4) * 2;
             const bool top_visible =
                 first_key != first_query || local_top_row >= key_column;
@@ -1002,14 +1040,14 @@ void flash_attention_backward_query_tensor_core_kernel(
                 ? expf(scale * scores[tile][0] - row_logsumexp[0])
                 : 0.0F;
             const float top_probability1 =
-                top_visible && local_top_row >= key_column + 1
+                first_key != first_query || local_top_row >= key_column + 1
                 ? expf(scale * scores[tile][1] - row_logsumexp[0])
                 : 0.0F;
             const float bottom_probability0 = bottom_visible
                 ? expf(scale * scores[tile][2] - row_logsumexp[1])
                 : 0.0F;
             const float bottom_probability1 =
-                bottom_visible && local_bottom_row >= key_column + 1
+                first_key != first_query || local_bottom_row >= key_column + 1
                 ? expf(scale * scores[tile][3] - row_logsumexp[1])
                 : 0.0F;
             score_gradient_top[tile] = make_float2(
@@ -1024,7 +1062,7 @@ void flash_attention_backward_query_tensor_core_kernel(
                     * (probability_gradients[tile][3] - delta[1]));
         }
 
-        unsigned int score_gradient_fragments[K_TILES][4];
+        unsigned int score_gradient_fragments[TOKEN_K_TILES][4];
         pack_row_matrix(
             score_gradient_fragments,
             score_gradient_top,
@@ -1038,35 +1076,34 @@ void flash_attention_backward_query_tensor_core_kernel(
     }
 
 #pragma unroll
-    for (int tile = 0; tile < N_TILES; ++tile) {
+    for (int tile = 0; tile < OUTPUT_N_TILES; ++tile) {
         const int column = tile * MMA_N + (lane % 4) * 2;
-        float2* top = reinterpret_cast<float2*>(query_gradient + tensor_index(
+        IO* top = query_gradient + tensor_index(
             batch,
             top_query,
             head,
             column,
             sequence_length,
-            heads));
-        float2* bottom = reinterpret_cast<float2*>(
-            query_gradient + tensor_index(
+            heads);
+        IO* bottom = query_gradient + tensor_index(
                 batch,
                 bottom_query,
                 head,
                 column,
                 sequence_length,
-                heads));
-        top->x += query_gradient_accumulators[tile][0];
-        top->y += query_gradient_accumulators[tile][1];
-        bottom->x += query_gradient_accumulators[tile][2];
-        bottom->y += query_gradient_accumulators[tile][3];
+                heads);
+        store_gradient_pair(top, make_float2(
+            query_gradient_accumulators[tile][0], query_gradient_accumulators[tile][1]));
+        store_gradient_pair(bottom, make_float2(
+            query_gradient_accumulators[tile][2], query_gradient_accumulators[tile][3]));
     }
 }
 
 __device__ __forceinline__ void store_transposed_rows(
     __nv_bfloat16* shared_score_gradient,
     __nv_bfloat16* shared_probability,
-    const float (&scores)[N_TILES][4],
-    const float (&probability_gradients)[N_TILES][4],
+    const float (&scores)[SCORE_N_TILES][4],
+    const float (&probability_gradients)[SCORE_N_TILES][4],
     const float (&delta)[2],
     const float (&row_logsumexp)[2],
     int first_query,
@@ -1077,7 +1114,7 @@ __device__ __forceinline__ void store_transposed_rows(
     const int top_row = warp_row + lane / 4;
     const int bottom_row = top_row + 8;
 #pragma unroll
-    for (int tile = 0; tile < N_TILES; ++tile) {
+    for (int tile = 0; tile < SCORE_N_TILES; ++tile) {
         const int key_column = tile * MMA_N + (lane % 4) * 2;
         const bool triangular = first_query == first_key;
         const float probabilities[4] = {
@@ -1108,21 +1145,23 @@ __device__ __forceinline__ void store_transposed_rows(
             key_column, key_column + 1, key_column, key_column + 1};
 #pragma unroll
         for (int element = 0; element < 4; ++element) {
-            const int transposed = key_rows[element] * D + query_rows[element];
-            shared_score_gradient[swizzle(transposed)] =
+            // P^T and dS^T have BM columns, not D columns.
+            const int transposed = key_rows[element] * BM + query_rows[element];
+            shared_score_gradient[swizzle<BM>(transposed)] =
                 __float2bfloat16(score_gradients[element]);
-            shared_probability[swizzle(transposed)] =
+            shared_probability[swizzle<BM>(transposed)] =
                 __float2bfloat16(probabilities[element]);
         }
     }
 }
 
-__global__ __launch_bounds__(THREADS, 2)
+template <typename IO>
+__global__ __launch_bounds__(THREADS, 1)
 void flash_attention_backward_key_value_tensor_core_kernel(
-    float* __restrict__ key_gradient,
-    float* __restrict__ value_gradient,
-    const float* __restrict__ output_gradient,
-    const float* __restrict__ output,
+    IO* __restrict__ key_gradient,
+    IO* __restrict__ value_gradient,
+    const IO* __restrict__ output_gradient,
+    const IO* __restrict__ output,
     const float* __restrict__ logsumexp,
     const __nv_bfloat16* __restrict__ query,
     const __nv_bfloat16* __restrict__ key,
@@ -1130,10 +1169,11 @@ void flash_attention_backward_key_value_tensor_core_kernel(
     int sequence_length,
     int heads,
     float scale) {
-    __shared__ __align__(16) __nv_bfloat16 shared_left[BM * D];
-    __shared__ __align__(16) __nv_bfloat16 shared_right[BM * D];
-    __shared__ __align__(16) __nv_bfloat16 shared_query[BM * D];
-    __shared__ __align__(16) __nv_bfloat16 shared_output_gradient[BM * D];
+    extern __shared__ __align__(16) __nv_bfloat16 shared[];
+    __nv_bfloat16* shared_left = shared;
+    __nv_bfloat16* shared_right = shared_left + BN * D;
+    __nv_bfloat16* shared_query = shared_right + BN * D;
+    __nv_bfloat16* shared_output_gradient = shared_query + BM * D;
 
     const int lane = threadIdx.x % WARP_SIZE;
     const int warp = threadIdx.x / WARP_SIZE;
@@ -1142,8 +1182,8 @@ void flash_attention_backward_key_value_tensor_core_kernel(
     const int head = batch_head % heads;
     const int first_key = blockIdx.x * BN;
     const int warp_row = warp * MMA_M;
-    float key_gradient_accumulators[N_TILES][4] = {};
-    float value_gradient_accumulators[N_TILES][4] = {};
+    float key_gradient_accumulators[OUTPUT_N_TILES][4] = {};
+    float value_gradient_accumulators[OUTPUT_N_TILES][4] = {};
 
     for (int first_query = first_key; first_query < sequence_length;
          first_query += BM) {
@@ -1171,7 +1211,7 @@ void flash_attention_backward_key_value_tensor_core_kernel(
             head,
             sequence_length,
             heads);
-        copy_float_tile_to_bf16(
+        copy_gradient_tile(
             shared_output_gradient,
             output_gradient,
             batch,
@@ -1182,8 +1222,8 @@ void flash_attention_backward_key_value_tensor_core_kernel(
         cp_async_wait();
         __syncthreads();
 
-        unsigned int query_fragments[K_TILES][4];
-        unsigned int output_gradient_fragments[K_TILES][4];
+        unsigned int query_fragments[HEAD_K_TILES][4];
+        unsigned int output_gradient_fragments[HEAD_K_TILES][4];
         load_left_fragments(
             query_fragments, shared_query, warp_row, lane);
         load_left_fragments(
@@ -1191,8 +1231,8 @@ void flash_attention_backward_key_value_tensor_core_kernel(
             shared_output_gradient,
             warp_row,
             lane);
-        float scores[N_TILES][4] = {};
-        float probability_gradients[N_TILES][4] = {};
+        float scores[SCORE_N_TILES][4] = {};
+        float probability_gradients[SCORE_N_TILES][4] = {};
         matrix_product_transposed_right(
             scores, query_fragments, shared_left, lane);
         matrix_product_transposed_right(
@@ -1234,11 +1274,11 @@ void flash_attention_backward_key_value_tensor_core_kernel(
             scale);
         __syncthreads();
 
-        unsigned int score_gradient_fragments[K_TILES][4];
-        unsigned int probability_fragments[K_TILES][4];
-        load_left_fragments(
+        unsigned int score_gradient_fragments[TOKEN_K_TILES][4];
+        unsigned int probability_fragments[TOKEN_K_TILES][4];
+        load_left_fragments<BM>(
             score_gradient_fragments, shared_left, warp_row, lane);
-        load_left_fragments(
+        load_left_fragments<BM>(
             probability_fragments, shared_right, warp_row, lane);
         matrix_product_right(
             key_gradient_accumulators,
@@ -1256,57 +1296,96 @@ void flash_attention_backward_key_value_tensor_core_kernel(
     const int top_key = first_key + warp_row + lane / 4;
     const int bottom_key = top_key + 8;
 #pragma unroll
-    for (int tile = 0; tile < N_TILES; ++tile) {
+    for (int tile = 0; tile < OUTPUT_N_TILES; ++tile) {
         const int column = tile * MMA_N + (lane % 4) * 2;
-        float2* key_top = reinterpret_cast<float2*>(
-            key_gradient + tensor_index(
+        IO* key_top = key_gradient + tensor_index(
                 batch,
                 top_key,
                 head,
                 column,
                 sequence_length,
-                heads));
-        float2* key_bottom = reinterpret_cast<float2*>(
-            key_gradient + tensor_index(
+                heads);
+        IO* key_bottom = key_gradient + tensor_index(
                 batch,
                 bottom_key,
                 head,
                 column,
                 sequence_length,
-                heads));
-        float2* value_top = reinterpret_cast<float2*>(
-            value_gradient + tensor_index(
+                heads);
+        IO* value_top = value_gradient + tensor_index(
                 batch,
                 top_key,
                 head,
                 column,
                 sequence_length,
-                heads));
-        float2* value_bottom = reinterpret_cast<float2*>(
-            value_gradient + tensor_index(
+                heads);
+        IO* value_bottom = value_gradient + tensor_index(
                 batch,
                 bottom_key,
                 head,
                 column,
                 sequence_length,
-                heads));
-        key_top->x += key_gradient_accumulators[tile][0];
-        key_top->y += key_gradient_accumulators[tile][1];
-        key_bottom->x += key_gradient_accumulators[tile][2];
-        key_bottom->y += key_gradient_accumulators[tile][3];
-        value_top->x += value_gradient_accumulators[tile][0];
-        value_top->y += value_gradient_accumulators[tile][1];
-        value_bottom->x += value_gradient_accumulators[tile][2];
-        value_bottom->y += value_gradient_accumulators[tile][3];
+                heads);
+        store_gradient_pair(key_top, make_float2(
+            key_gradient_accumulators[tile][0], key_gradient_accumulators[tile][1]));
+        store_gradient_pair(key_bottom, make_float2(
+            key_gradient_accumulators[tile][2], key_gradient_accumulators[tile][3]));
+        store_gradient_pair(value_top, make_float2(
+            value_gradient_accumulators[tile][0], value_gradient_accumulators[tile][1]));
+        store_gradient_pair(value_bottom, make_float2(
+            value_gradient_accumulators[tile][2], value_gradient_accumulators[tile][3]));
     }
+}
+
+template <typename IO>
+void launch_forward(
+    IO* output, float* logsumexp,
+    const __nv_bfloat16* query, const __nv_bfloat16* key, const __nv_bfloat16* value,
+    int batch_size, int sequence_length, int heads, float scale, cudaStream_t stream) {
+    const dim3 grid(sequence_length / BM, batch_size * heads);
+    flash_attention_forward_tensor_core_kernel<IO><<<grid, THREADS, 0, stream>>>(
+        output, logsumexp, query, key, value, sequence_length, heads, scale);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+template <typename IO>
+void launch_backward(
+    IO* query_gradient, IO* key_gradient, IO* value_gradient,
+    const IO* output_gradient, const IO* output, const float* logsumexp,
+    const __nv_bfloat16* query, const __nv_bfloat16* key, const __nv_bfloat16* value,
+    int batch_size, int sequence_length, int heads, float scale, cudaStream_t stream) {
+    // Configure before capture during warm-up, then avoid repeated host setup.
+    // Like the rest of this runtime, this uses the device's primary CUDA context.
+    static thread_local int configured_device = -1;
+    int device;
+    CUDA_CHECK(cudaGetDevice(&device));
+    if (device != configured_device) {
+        CUDA_CHECK(cudaFuncSetAttribute(
+            flash_attention_backward_query_tensor_core_kernel<IO>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, BACKWARD_SHARED_BYTES));
+        CUDA_CHECK(cudaFuncSetAttribute(
+            flash_attention_backward_key_value_tensor_core_kernel<IO>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, BACKWARD_SHARED_BYTES));
+        configured_device = device;
+    }
+    const dim3 grid(sequence_length / BM, batch_size * heads);
+    flash_attention_backward_query_tensor_core_kernel<IO><<<
+        grid, THREADS, BACKWARD_SHARED_BYTES, stream>>>(
+        query_gradient, output_gradient, output, logsumexp, query, key, value,
+        sequence_length, heads, scale);
+    flash_attention_backward_key_value_tensor_core_kernel<IO><<<
+        grid, THREADS, BACKWARD_SHARED_BYTES, stream>>>(
+        key_gradient, value_gradient, output_gradient, output, logsumexp,
+        query, key, value, sequence_length, heads, scale);
+    CUDA_CHECK(cudaGetLastError());
 }
 
 }  // namespace tensor_core
 
 void validate_head_size(int head_size) {
-    if (head_size <= 0 || head_size > MAX_HEAD_SIZE) {
+    if (head_size != HEAD_SIZE) {
         throw std::runtime_error(
-            "flash attention supports head sizes from 1 through 128");
+            "flash attention requires head_size = 128");
     }
 }
 
@@ -1325,22 +1404,10 @@ void launch_forward(
     cudaStream_t stream) {
     validate_head_size(head_size);
     if constexpr (std::is_same_v<T, __nv_bfloat16>) {
-        if (head_size == tensor_core::D
-            && sequence_length % tensor_core::BM == 0) {
-            const dim3 tensor_grid(
-                sequence_length / tensor_core::BM,
-                batch_size * heads);
-            tensor_core::flash_attention_forward_tensor_core_kernel<<<
-                tensor_grid, tensor_core::THREADS, 0, stream>>>(
-                output,
-                logsumexp,
-                query,
-                key,
-                value,
-                sequence_length,
-                heads,
-                scale);
-            CUDA_CHECK(cudaGetLastError());
+        if (sequence_length % tensor_core::BM == 0) {
+            tensor_core::launch_forward(
+                output, logsumexp, query, key, value,
+                batch_size, sequence_length, heads, scale, stream);
             return;
         }
     }
@@ -1382,37 +1449,11 @@ void launch_backward(
     cudaStream_t stream) {
     validate_head_size(head_size);
     if constexpr (std::is_same_v<T, __nv_bfloat16>) {
-        if (head_size == tensor_core::D
-            && sequence_length % tensor_core::BM == 0) {
-            const dim3 tensor_grid(
-                sequence_length / tensor_core::BM,
-                batch_size * heads);
-            tensor_core::flash_attention_backward_query_tensor_core_kernel<<<
-                tensor_grid, tensor_core::THREADS, 0, stream>>>(
-                query_gradient,
-                output_gradient,
-                output,
-                logsumexp,
-                query,
-                key,
-                value,
-                sequence_length,
-                heads,
-                scale);
-            tensor_core::flash_attention_backward_key_value_tensor_core_kernel<<<
-                tensor_grid, tensor_core::THREADS, 0, stream>>>(
-                key_gradient,
-                value_gradient,
-                output_gradient,
-                output,
-                logsumexp,
-                query,
-                key,
-                value,
-                sequence_length,
-                heads,
-                scale);
-            CUDA_CHECK(cudaGetLastError());
+        if (sequence_length % tensor_core::BM == 0) {
+            tensor_core::launch_backward(
+                query_gradient, key_gradient, value_gradient, output_gradient,
+                output, logsumexp, query, key, value,
+                batch_size, sequence_length, heads, scale, stream);
             return;
         }
     }
@@ -1452,6 +1493,34 @@ void launch_backward(
 }
 
 }  // namespace
+
+void flash_attention_forward_bf16_io_cuda(
+    __nv_bfloat16* output, float* logsumexp,
+    const __nv_bfloat16* query, const __nv_bfloat16* key, const __nv_bfloat16* value,
+    int batch_size, int sequence_length, int heads, int head_size,
+    float scale, cudaStream_t stream) {
+    validate_head_size(head_size);
+    if (sequence_length <= 0 || sequence_length % tensor_core::BM != 0) {
+        throw std::runtime_error("BF16 IO attention requires T to be a positive multiple of 64");
+    }
+    tensor_core::launch_forward(output, logsumexp, query, key, value,
+        batch_size, sequence_length, heads, scale, stream);
+}
+
+void flash_attention_backward_bf16_io_cuda(
+    __nv_bfloat16* query_gradient, __nv_bfloat16* key_gradient, __nv_bfloat16* value_gradient,
+    const __nv_bfloat16* output_gradient, const __nv_bfloat16* output, const float* logsumexp,
+    const __nv_bfloat16* query, const __nv_bfloat16* key, const __nv_bfloat16* value,
+    int batch_size, int sequence_length, int heads, int head_size,
+    float scale, cudaStream_t stream) {
+    validate_head_size(head_size);
+    if (sequence_length <= 0 || sequence_length % tensor_core::BM != 0) {
+        throw std::runtime_error("BF16 IO attention requires T to be a positive multiple of 64");
+    }
+    tensor_core::launch_backward(query_gradient, key_gradient, value_gradient,
+        output_gradient, output, logsumexp, query, key, value,
+        batch_size, sequence_length, heads, scale, stream);
+}
 
 void flash_attention_forward_cuda(
     float* output,

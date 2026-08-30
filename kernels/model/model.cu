@@ -161,9 +161,9 @@ struct DenseGptModel::Implementation {
                 "BF16 model dimensions must be multiples of 16");
         }
         if (config.attention == AttentionImplementation::flash2
-            && config.hidden_size / config.heads > 128) {
+            && config.hidden_size / config.heads != 128) {
             throw std::runtime_error(
-                "flash attention requires a head size no larger than 128");
+                "flash2 requires hidden_size / heads = 128; use composed for other head sizes");
         }
         activation_elements =
             static_cast<std::size_t>(rows) * config.hidden_size;

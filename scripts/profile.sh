@@ -198,16 +198,14 @@ official_flash_available() {
 }
 
 profile_flash_attention() {
-    local cases=("1 512 8 64" "1 512 8 128")
+    local cases=("1 512 8 128")
     if [[ "$suite" != "quick" ]]; then
         cases=()
-        local batch sequence heads dimension
+        local batch sequence heads
         for batch in 1 4; do
             for sequence in 128 256 512 1024 2048; do
                 for heads in 4 8; do
-                    for dimension in 64 128; do
-                        cases+=("$batch $sequence $heads $dimension")
-                    done
+                    cases+=("$batch $sequence $heads 128")
                 done
             done
         done

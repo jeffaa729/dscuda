@@ -1,4 +1,4 @@
-// Runs one BF16 causal FlashAttention workload for a same-shape comparison with the official implementation.
+// Runs one D128 BF16 causal FlashAttention workload for a same-shape comparison with the official implementation.
 // Forward and backward can be profiled or timed independently, while an optional raw dump supports cross-process correctness checks.
 
 #include "cuda_common.h"
@@ -37,17 +37,20 @@ bool selected(const char* requested, const char* operation) {
         || std::strcmp(requested, operation) == 0;
 }
 
-template <typename T>
-void dump_values(std::ofstream& output, const T* device, std::size_t elements) {
-    std::vector<T> host(elements);
+void dump_values(std::ofstream& output, const __nv_bfloat16* device, std::size_t elements) {
+    std::vector<__nv_bfloat16> host(elements);
     CUDA_CHECK(cudaMemcpy(
         host.data(),
         device,
-        elements * sizeof(T),
+        elements * sizeof(__nv_bfloat16),
         cudaMemcpyDeviceToHost));
+    std::vector<float> decoded(elements);
+    for (std::size_t index = 0; index < elements; ++index) {
+        decoded[index] = __bfloat162float(host[index]);
+    }
     output.write(
-        reinterpret_cast<const char*>(host.data()),
-        static_cast<std::streamsize>(elements * sizeof(T)));
+        reinterpret_cast<const char*>(decoded.data()),
+        static_cast<std::streamsize>(elements * sizeof(float)));
 }
 
 template <typename Operation>
@@ -94,7 +97,7 @@ int main(int argc, char** argv) {
         const int batch_size = argc > 1 ? std::atoi(argv[1]) : 2;
         const int sequence_length = argc > 2 ? std::atoi(argv[2]) : 256;
         const int heads = argc > 3 ? std::atoi(argv[3]) : 8;
-        const int head_size = argc > 4 ? std::atoi(argv[4]) : 64;
+        const int head_size = argc > 4 ? std::atoi(argv[4]) : 128;
         const char* operation = argc > 5 ? argv[5] : "all";
         const char* dump_path = nullptr;
         TimingOptions timing;
@@ -131,7 +134,7 @@ int main(int argc, char** argv) {
         std::vector<__nv_bfloat16> host_query(activations);
         std::vector<__nv_bfloat16> host_key(activations);
         std::vector<__nv_bfloat16> host_value(activations);
-        std::vector<float> host_output_gradient(activations);
+        std::vector<__nv_bfloat16> host_output_gradient(activations);
         for (std::size_t index = 0; index < activations; ++index) {
             host_query[index] = __float2bfloat16(
                 static_cast<float>(
@@ -142,11 +145,8 @@ int main(int argc, char** argv) {
             host_value[index] = __float2bfloat16(
                 static_cast<float>(
                     static_cast<int>((index * 31) % 89) - 44) / 59.0F);
-            host_output_gradient[index] = __bfloat162float(
-                __float2bfloat16(
-                    static_cast<float>(
-                        static_cast<int>((index * 37) % 83) - 41)
-                    / 67.0F));
+            host_output_gradient[index] = __float2bfloat16(
+                static_cast<float>(static_cast<int>((index * 37) % 83) - 41) / 67.0F);
         }
 
         auto* query = static_cast<__nv_bfloat16*>(
@@ -155,18 +155,18 @@ int main(int argc, char** argv) {
             dscuda::device_malloc(activations * sizeof(__nv_bfloat16)));
         auto* value = static_cast<__nv_bfloat16*>(
             dscuda::device_malloc(activations * sizeof(__nv_bfloat16)));
-        auto* output_gradient = static_cast<float*>(
-            dscuda::device_malloc(activations * sizeof(float)));
-        auto* output = static_cast<float*>(
-            dscuda::device_malloc(activations * sizeof(float)));
+        auto* output_gradient = static_cast<__nv_bfloat16*>(
+            dscuda::device_malloc(activations * sizeof(__nv_bfloat16)));
+        auto* output = static_cast<__nv_bfloat16*>(
+            dscuda::device_malloc(activations * sizeof(__nv_bfloat16)));
         auto* logsumexp = static_cast<float*>(
             dscuda::device_malloc(rows * sizeof(float)));
-        auto* query_gradient = static_cast<float*>(
-            dscuda::device_malloc(activations * sizeof(float)));
-        auto* key_gradient = static_cast<float*>(
-            dscuda::device_malloc(activations * sizeof(float)));
-        auto* value_gradient = static_cast<float*>(
-            dscuda::device_malloc(activations * sizeof(float)));
+        auto* query_gradient = static_cast<__nv_bfloat16*>(
+            dscuda::device_malloc(activations * sizeof(__nv_bfloat16)));
+        auto* key_gradient = static_cast<__nv_bfloat16*>(
+            dscuda::device_malloc(activations * sizeof(__nv_bfloat16)));
+        auto* value_gradient = static_cast<__nv_bfloat16*>(
+            dscuda::device_malloc(activations * sizeof(__nv_bfloat16)));
 
         CUDA_CHECK(cudaMemcpy(
             query,
@@ -186,19 +186,11 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaMemcpy(
             output_gradient,
             host_output_gradient.data(),
-            activations * sizeof(float),
+            activations * sizeof(__nv_bfloat16),
             cudaMemcpyHostToDevice));
 
-        auto zero_gradients = [&]() {
-            CUDA_CHECK(cudaMemset(
-                query_gradient, 0, activations * sizeof(float)));
-            CUDA_CHECK(cudaMemset(
-                key_gradient, 0, activations * sizeof(float)));
-            CUDA_CHECK(cudaMemset(
-                value_gradient, 0, activations * sizeof(float)));
-        };
         auto forward = [&]() {
-            dscuda::flash_attention_forward_bf16_cuda(
+            dscuda::flash_attention_forward_bf16_io_cuda(
                 output,
                 logsumexp,
                 query,
@@ -211,7 +203,7 @@ int main(int argc, char** argv) {
                 scale);
         };
         auto backward = [&]() {
-            dscuda::flash_attention_backward_bf16_cuda(
+            dscuda::flash_attention_backward_bf16_io_cuda(
                 query_gradient,
                 key_gradient,
                 value_gradient,
@@ -240,10 +232,7 @@ int main(int argc, char** argv) {
         // that setup launch stays outside backward-only profiler capture.
         forward();
         dscuda::synchronize();
-        zero_gradients();
         run_selected();
-        dscuda::synchronize();
-        zero_gradients();
         dscuda::synchronize();
 
         std::printf(
@@ -254,6 +243,7 @@ int main(int argc, char** argv) {
             head_size,
             operation);
         if (timing.enabled) {
+            std::printf("Native C++ eager timing only; use scripts/benchmark.sh for matched graph comparisons.\n");
             const TimingResult result = measure_gpu(
                 run_selected,
                 timing.warmup,
@@ -286,7 +276,6 @@ int main(int argc, char** argv) {
 
         if (dump_path != nullptr) {
             forward();
-            zero_gradients();
             backward();
             dscuda::synchronize();
             std::ofstream dump(dump_path, std::ios::binary | std::ios::trunc);

@@ -135,6 +135,17 @@ target_link_libraries(benchmark_attention PRIVATE dscuda_kernels)
 add_executable(benchmark_flash_attention benchmarks/benchmark_flash_attention.cu)
 target_link_libraries(benchmark_flash_attention PRIVATE dscuda_kernels)
 
+# Compile just the attention operator into a small shared bridge. The ordinary
+# training library stays unchanged; no PyTorch extension toolchain is needed.
+add_library(dscuda_flash_attention_bench SHARED
+    benchmarks/reference/flash_attention_bridge.cu
+    kernels/attention/flash_attention.cu
+    kernels/common/cuda_common.cu
+)
+target_include_directories(dscuda_flash_attention_bench PRIVATE include)
+target_link_libraries(dscuda_flash_attention_bench PRIVATE CUDA::cudart)
+set_target_properties(dscuda_flash_attention_bench PROPERTIES CUDA_RUNTIME_LIBRARY Shared)
+
 add_executable(benchmark_training_step benchmarks/benchmark_training_step.cu)
 target_link_libraries(benchmark_training_step PRIVATE dscuda_kernels)
 
@@ -253,6 +264,10 @@ add_test(NAME model_bf16 COMMAND test_model_bf16)
 add_test(NAME checkpoint COMMAND test_checkpoint)
 add_test(NAME generation COMMAND test_generation)
 if(Python3_Interpreter_FOUND)
+    add_test(
+        NAME attention_benchmark_python
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_attention_benchmark.py
+    )
     add_test(
         NAME tokenizer_python
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_tokenizer.py

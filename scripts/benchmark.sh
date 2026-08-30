@@ -18,11 +18,6 @@ if [[ ! -x "$python_bin" ]]; then
     echo "uv environment not found; run: uv sync" >&2
     exit 1
 fi
-if ! "$python_bin" -c 'import torch; from flash_attn import flash_attn_func' \
-    >/dev/null 2>&1; then
-    echo "PyTorch and the official flash-attn package are required" >&2
-    exit 1
-fi
 
 nvcc_bin="${CUDACXX:-}"
 if [[ -z "$nvcc_bin" && -x /usr/local/cuda/bin/nvcc ]]; then
@@ -52,23 +47,25 @@ cmake \
     -DCMAKE_CUDA_ARCHITECTURES="$cuda_arch" \
     -DCMAKE_CUDA_COMPILER="$nvcc_bin"
 cmake --build "$build_dir" \
-    --target test_flash_attention benchmark_flash_attention -j
-ctest --test-dir "$build_dir" --output-on-failure -R '^flash_attention$'
+    --target test_flash_attention dscuda_flash_attention_bench -j
+ctest --test-dir "$build_dir" --output-on-failure -R '^(flash_attention|attention_benchmark_python)$'
 
-warmup="${DSCUDA_BENCHMARK_WARMUP:-10}"
+warmup_ms="${DSCUDA_BENCHMARK_WARMUP_MS:-1000}"
+graph_operations="${DSCUDA_GRAPH_OPERATIONS:-100}"
+graph_replays="${DSCUDA_GRAPH_REPLAYS:-10}"
 iterations="${DSCUDA_BENCHMARK_ITERATIONS:-50}"
-trials="${DSCUDA_BENCHMARK_TRIALS:-5}"
+trials="${DSCUDA_BENCHMARK_TRIALS:-9}"
 output_dir="$repo_root/profiles/runtime"
 
 "$python_bin" "$repo_root/scripts/benchmark_flash_attention_runtime.py" \
-    --custom "$build_dir/benchmark_flash_attention" \
-    --official "$repo_root/benchmarks/reference/flash_attention_official.py" \
-    --compare "$repo_root/scripts/compare_attention_dumps.py" \
+    --library "$build_dir/libdscuda_flash_attention_bench.so" \
     --suite "$suite" \
     --output-dir "$output_dir" \
-    --warmup "$warmup" \
+    --warmup-ms "$warmup_ms" \
+    --graph-operations "$graph_operations" \
+    --graph-replays "$graph_replays" \
     --iterations "$iterations" \
     --trials "$trials"
 
-printf '\nPortable CUDA-event results: %s/flash_attention.{csv,md}\n' \
+printf '\nMatched BF16 graph/API results: %s/flash_attention.{csv,md}\n' \
     "$output_dir"
