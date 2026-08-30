@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Same-process CUDA Graph comparisons: GEMM/cuBLAS and AdamW/PyTorch equations."""
+"""Same-process CUDA Graph comparisons: GEMM/cuBLAS."""
 
 import argparse
 import csv
@@ -15,24 +15,21 @@ from benchmark_flash_attention_runtime import (
     Captured, add_reference_percentages, format_percentage, positive, summarize, table)
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "reference" / "python"))
-from adamw import adamw_step
 
 BACKENDS = ("custom", "reference")
 
 
 def cases(family, suite):
-    if family == "matmul":
-        sizes = (2048,) if suite == "quick" else (2048, 4096, 8192)
-        return [(size, dtype, operation) for size in sizes for dtype in ("fp32", "bf16")
-                for operation in ("forward", "left_backward", "right_backward")]
-    return [(size, "fp32", "update") for size in
-            ((1 << 22,) if suite == "quick" else (1 << 18, 1 << 22, 1 << 24))]
+    if family != "matmul":
+        raise ValueError("only the matmul comparison belongs in dscuda")
+    sizes = (2048,) if suite == "quick" else (2048, 4096, 8192)
+    return [(size, dtype, operation) for size in sizes for dtype in ("fp32", "bf16")
+            for operation in ("forward", "left_backward", "right_backward")]
 
 
 def load_library(path):
     lib = ctypes.CDLL(str(path.resolve()))
-    pointer, integer, scalar = ctypes.c_void_p, ctypes.c_int, ctypes.c_float
+    pointer, integer = ctypes.c_void_p, ctypes.c_int
     lib.dscuda_operator_last_error.restype = ctypes.c_char_p
     lib.dscuda_cublas_init.argtypes = []
     lib.dscuda_cublas_init.restype = integer
@@ -42,8 +39,6 @@ def load_library(path):
     lib.dscuda_cublas_version.restype = integer
     lib.dscuda_gemm.argtypes = [pointer] * 3 + [integer] * 8 + [pointer]
     lib.dscuda_gemm.restype = integer
-    lib.dscuda_adamw.argtypes = [pointer] * 4 + [integer] * 2 + [scalar] * 5 + [pointer]
-    lib.dscuda_adamw.restype = integer
     return lib
 
 
@@ -57,24 +52,15 @@ class Workload:
         self.torch, self.lib = torch, lib
         self.family, self.size, self.dtype, self.operation = family, size, dtype, operation
         self.stream = torch.cuda.current_stream().cuda_stream
-        self.reference = "cuBLAS" if family == "matmul" else "pytorch_unfused"
+        self.reference = "cuBLAS"
         torch.manual_seed(2026)
-        if family == "matmul":
-            precision = torch.bfloat16 if dtype == "bf16" else torch.float32
-            self.left = torch.randn((size, size), device="cuda", dtype=precision) * 0.1
-            self.right = torch.randn_like(self.left) * 0.1
-            # Backward is a GEMM with the indicated transpose and += contract.
-            self.transpose_left = operation == "right_backward"
-            self.transpose_right = operation == "left_backward"
-            self.initial = (torch.zeros((size, size), device="cuda", dtype=torch.float32),)
-        else:
-            self.gradient = torch.randn(size, device="cuda") * 0.01
-            self.initial = (torch.randn_like(self.gradient),
-                            torch.randn_like(self.gradient) * 0.001,
-                            torch.rand_like(self.gradient) * 0.01 + 0.001)
-            # Quantize scalar constants to FP32 on both sides, including beta.
-            self.config = tuple(ctypes.c_float(v).value for v in (3e-4, .9, .95, 1e-8, .1))
-            self.step = 100
+        precision = torch.bfloat16 if dtype == "bf16" else torch.float32
+        self.left = torch.randn((size, size), device="cuda", dtype=precision) * 0.1
+        self.right = torch.randn_like(self.left) * 0.1
+        # Backward is a GEMM with the indicated transpose and += contract.
+        self.transpose_left = operation == "right_backward"
+        self.transpose_right = operation == "left_backward"
+        self.initial = (torch.zeros((size, size), device="cuda", dtype=torch.float32),)
         self.buffers = {name: tuple(t.clone() for t in self.initial) for name in BACKENDS}
 
     def reset(self, name):
@@ -83,18 +69,11 @@ class Workload:
 
     def run(self, name):
         outputs = self.buffers[name]
-        if self.family == "matmul":
-            checked(self.lib, self.lib.dscuda_gemm(
-                outputs[0].data_ptr(), self.left.data_ptr(), self.right.data_ptr(),
-                self.size, self.size, self.size, int(self.dtype == "bf16"),
-                int(self.transpose_left), int(self.transpose_right), int(self.operation != "forward"),
-                int(name == "reference"), self.stream))
-        elif name == "custom":
-            checked(self.lib, self.lib.dscuda_adamw(
-                *(t.data_ptr() for t in outputs), self.gradient.data_ptr(),
-                self.size, self.step, *self.config, self.stream))
-        else:
-            adamw_step(*outputs, self.gradient, self.step, *self.config)
+        checked(self.lib, self.lib.dscuda_gemm(
+            outputs[0].data_ptr(), self.left.data_ptr(), self.right.data_ptr(),
+            self.size, self.size, self.size, int(self.dtype == "bf16"),
+            int(self.transpose_left), int(self.transpose_right), int(self.operation != "forward"),
+            int(name == "reference"), self.stream))
         return outputs
 
     def check(self, graphs=None):
@@ -161,7 +140,7 @@ def result_table(rows):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("family", choices=("matmul", "adamw"))
+    parser.add_argument("family", choices=("matmul",))
     parser.add_argument("--suite", choices=("quick", "full", "h100"), default="quick")
     parser.add_argument("--library", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, default=ROOT / "profiles" / "runtime")
@@ -201,10 +180,7 @@ def main():
     report = result_table(rows)
     print(report, end="", flush=True)
     note = ("FP32 disables TF32; BF16 inputs accumulate and output FP32. "
-            "Backward GEMMs accumulate FP32 gradients." if args.family == "matmul" else
-            "FP32 fixed-step AdamW update (step=100), versus unfused PyTorch equations, "
-            "not torch.optim.AdamW(fused=True). Both replay the same fixed bias correction; "
-            "state is reset outside timing. This is not an optimizer training trajectory.")
+            "Backward GEMMs accumulate FP32 gradients.")
     note += ("\nWarm-cache CUDA Graph measurements; allocations, state resets, and graph construction "
              "are excluded.\n")
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -220,9 +196,6 @@ def main():
                     git_commit=subprocess.check_output(
                         ["git", "-C", str(ROOT), "rev-parse", "HEAD"], text=True).strip(),
                     library_sha256=hashlib.sha256(args.library.read_bytes()).hexdigest(),
-                    reference_sha256=hashlib.sha256(
-                        (ROOT / "reference/python/adamw.py").read_bytes()).hexdigest()
-                        if args.family == "adamw" else None,
                     controls={k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()})
     (args.output_dir / f"{args.family}_samples.json").write_text(
         json.dumps(dict(environment=metadata, checks=checks, results=rows), indent=2) + "\n")

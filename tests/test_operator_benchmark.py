@@ -25,9 +25,9 @@ class OperatorBenchmarkTests(unittest.TestCase):
         self.assertEqual(len(cases), 18)
         self.assertEqual(len(benchmark.cases("matmul", "quick")), 6)
 
-    def test_adamw_suite(self):
-        self.assertEqual(benchmark.cases("adamw", "quick"), [(1 << 22, "fp32", "update")])
-        self.assertTrue(all(c[0] % 4 == 0 for c in benchmark.cases("adamw", "full")))
+    def test_removed_family_is_rejected(self):
+        with self.assertRaises(ValueError):
+            benchmark.cases("unsupported", "quick")
 
     def test_table(self):
         row = dict(size=2048, dtype="fp32", operation="forward", backend="reference",

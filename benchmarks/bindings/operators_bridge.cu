@@ -1,7 +1,6 @@
-// Exposes GEMM and AdamW to Python-owned CUDA buffers without a PyTorch extension build.
+// Exposes GEMM to Python-owned CUDA buffers without a PyTorch extension build.
 // cuBLAS uses the same stream and operand/output precision as the custom GEMM.
 #include "matmul.h"
-#include "optimizer.h"
 
 #include <cublas_v2.h>
 #include <stdexcept>
@@ -77,20 +76,6 @@ extern "C" int dscuda_gemm(
                 bf16 ? CUBLAS_COMPUTE_32F : CUBLAS_COMPUTE_32F_PEDANTIC,
                 bf16 ? CUBLAS_GEMM_DEFAULT_TENSOR_OP : CUBLAS_GEMM_DEFAULT));
         }
-        return 0;
-    } catch (const std::exception& error) {
-        last_error = error.what();
-        return 1;
-    }
-}
-
-extern "C" int dscuda_adamw(
-    float* parameter, float* first, float* second, const float* gradient,
-    int elements, int step, float lr, float beta1, float beta2,
-    float epsilon, float decay, cudaStream_t stream) {
-    try {
-        dscuda::adamw_step_cuda(parameter, first, second, gradient, elements, step,
-            {lr, beta1, beta2, epsilon, decay}, stream);
         return 0;
     } catch (const std::exception& error) {
         last_error = error.what();

@@ -10,7 +10,7 @@ suite="${2:-quick}"
 extra_targets=()
 
 usage() {
-    echo "usage: bash scripts/benchmark.sh {flash_attention|mla|matmul|adamw} [quick|full|h100]"
+    echo "usage: bash scripts/benchmark.sh {flash_attention|mla|matmul} [quick|full|h100]"
     echo "Runs correctness checks, then same-process CUDA Graph comparisons."
     echo "For Nsight metrics and other operators, use scripts/profile.sh."
 }
@@ -40,7 +40,7 @@ case "$family" in
         extra_args=()
         extra_targets=(test_mla_decode)
         ;;
-    matmul|adamw)
+    matmul)
         bridge=dscuda_operator_bench
         runner=benchmark_operators_runtime.py
         test_regex="^($family|operator_benchmark_python)$"
