@@ -247,6 +247,26 @@ def measure_operation(workload, operation, args):
     return rows
 
 
+def add_reference_percentages(rows, reference, keys, time_field="median_ms"):
+    """Reference time / backend time * 100; match shape, operation and timing mode."""
+    def key(row):
+        return tuple(tuple(row[k]) if isinstance(row[k], (list, tuple)) else row[k] for k in keys)
+
+    times = {(row["backend"], key(row)): float(row[time_field]) for row in rows}
+    for row in rows:
+        backend = reference.get(row["backend"]) if isinstance(reference, dict) else reference
+        reference_time = times.get((backend, key(row)))
+        elapsed = float(row[time_field])
+        row["reference_pct"] = (
+            100 * reference_time / elapsed
+            if reference_time is not None and math.isfinite(reference_time) and reference_time > 0
+            and math.isfinite(elapsed) and elapsed > 0 else None)
+
+
+def format_percentage(value):
+    return "-" if value is None else f"{value:.1f}"
+
+
 def table(headers, rows, numeric):
     widths = [max(3, len(h), *(len(str(row[i])) for row in rows)) for i, h in enumerate(headers)]
     def line(values):
@@ -260,16 +280,21 @@ def table(headers, rows, numeric):
 
 
 def result_table(rows, mode):
-    headers = ("B", "T", "H", "D", "dtype", "causal", "backend", "operation", "median us")
+    add_reference_percentages(rows, "official",
+                              ("batch", "sequence", "heads", "head_size", "operation", "mode"))
+    headers = ("B", "T", "H", "D", "dtype", "causal", "backend", "operation", "median us", "reference %")
     values = [(r["batch"], r["sequence"], r["heads"], r["head_size"], "bf16", "yes",
-               r["backend"], r["operation"], f'{1000*r["median_ms"]:.2f}')
+               r["backend"], r["operation"], f'{1000*r["median_ms"]:.2f}',
+               format_percentage(r["reference_pct"]))
               for r in rows if r["mode"] == mode]
-    return table(headers, values, {0, 1, 2, 3, 8})
+    return table(headers, values, {0, 1, 2, 3, 8, 9})
 
 
 def write_results(directory, rows, checks, args):
     directory.mkdir(parents=True, exist_ok=True)
-    fields = ("batch", "sequence", "heads", "head_size", "mode", "backend", "operation", "median_ms")
+    report = ("CUDA Graph GPU time\n\n" + result_table(rows, "graph")
+              + "\nPython API wall time\n\n" + result_table(rows, "api"))
+    fields = ("batch", "sequence", "heads", "head_size", "mode", "backend", "operation", "median_ms", "reference_pct")
     with (directory / "flash_attention.csv").open("w", newline="") as destination:
         writer = csv.DictWriter(destination, fieldnames=fields, extrasaction="ignore")
         writer.writeheader()
@@ -283,8 +308,6 @@ def write_results(directory, rows, checks, args):
                                  "graph": "CUDA events, warm repeated-input graph replay",
                                  "api": "synchronized wall time, includes Python dispatch and allocations"},
                     "correctness": checks, "measurements": rows}, indent=2) + "\n")
-    report = ("CUDA Graph GPU time\n\n" + result_table(rows, "graph")
-              + "\nPython API wall time\n\n" + result_table(rows, "api"))
     (directory / "flash_attention.md").write_text(report)
     print(report, end="", flush=True)
 

@@ -5,15 +5,23 @@
 #include "mla.h"
 
 #include <cuda_bf16.h>
+#include <math_constants.h>
 #include <cfloat>
 #include <cmath>
+#include <stdexcept>
 
 namespace dscuda {
 namespace {
 
 constexpr int BLOCK_SIZE = 256;
 constexpr int WARP_SIZE = 32;
-constexpr int MAX_KV_RANK = 512;
+constexpr int MAX_KV_RANK = MLA_KV_RANK;
+
+void check_shape(int kv_rank, int rope_size) {
+    if (kv_rank != MLA_KV_RANK || rope_size != MLA_ROPE_SIZE) {
+        throw std::invalid_argument("MLA requires C=512 and RoPE=64");
+    }
+}
 
 template <int WIDTH = WARP_SIZE>
 __device__ __forceinline__ float warp_reduce_sum(float value) {
@@ -96,478 +104,249 @@ __device__ float dot_query_key(
     return block_reduce_sum(partial);
 }
 
-__global__ void mla_forward_kernel(
-    float* output,
-    float* logsumexp,
-    const __nv_bfloat16* query_latent,
-    const __nv_bfloat16* query_rope,
-    const __nv_bfloat16* kv_latent,
-    const __nv_bfloat16* key_rope,
-    int sequence_length,
-    int heads,
-    int kv_rank,
-    int rope_size,
-    float scale) {
-    __shared__ float output_accumulator[MAX_KV_RANK];
-    __shared__ float row_maximum;
-    __shared__ float row_normalizer;
-    __shared__ float previous_scale;
-    __shared__ float probability_scale;
+namespace mla_forward {
 
-    const int query_token = blockIdx.x;
-    const int head = blockIdx.y;
-    const int batch = blockIdx.z;
-    const int query_base = query_offset(
-        batch, query_token, head, sequence_length, heads, kv_rank);
-    const int query_rope_base = query_offset(
-        batch, query_token, head, sequence_length, heads, rope_size);
-
-    for (int column = threadIdx.x; column < kv_rank; column += BLOCK_SIZE) {
-        output_accumulator[column] = 0.0F;
-    }
-    if (threadIdx.x == 0) {
-        row_maximum = -__int_as_float(0x7f800000);
-        row_normalizer = 0.0F;
-    }
-    __syncthreads();
-
-    for (int key_token = 0; key_token <= query_token; ++key_token) {
-        const int kv_base = shared_offset(
-            batch, key_token, sequence_length, kv_rank);
-        const int key_rope_base = shared_offset(
-            batch, key_token, sequence_length, rope_size);
-        const float score = dot_query_key(
-            query_latent,
-            query_rope,
-            kv_latent,
-            key_rope,
-            query_base,
-            query_rope_base,
-            kv_base,
-            key_rope_base,
-            kv_rank,
-            rope_size) *
-            scale;
-
-        if (threadIdx.x == 0) {
-            const float next_maximum = fmaxf(row_maximum, score);
-            previous_scale = expf(row_maximum - next_maximum);
-            probability_scale = expf(score - next_maximum);
-            row_normalizer =
-                row_normalizer * previous_scale + probability_scale;
-            row_maximum = next_maximum;
-        }
-        __syncthreads();
-
-        for (int column = threadIdx.x; column < kv_rank; column += BLOCK_SIZE) {
-            output_accumulator[column] =
-                output_accumulator[column] * previous_scale +
-                probability_scale * __bfloat162float(kv_latent[kv_base + column]);
-        }
-        __syncthreads();
-    }
-
-    for (int column = threadIdx.x; column < kv_rank; column += BLOCK_SIZE) {
-        output[query_base + column] =
-            output_accumulator[column] / row_normalizer;
-    }
-    if (threadIdx.x == 0) {
-        logsumexp[lse_offset(
-            batch, head, query_token, heads, sequence_length)] =
-            row_maximum + logf(row_normalizer);
-    }
-}
-
-namespace mla_tensor_core {
-
-constexpr int BM = 64;
-constexpr int BN = 64;
-constexpr int C = 64;
-constexpr int R = 32;
+constexpr int BM = 16;
+constexpr int BN = 16;
+constexpr int C = MLA_KV_RANK;
+constexpr int R = MLA_ROPE_SIZE;
 constexpr int K = C + R;
-constexpr int THREADS = 128;
-constexpr int MMA_M = 16;
-constexpr int MMA_N = 8;
-constexpr int MMA_K = 16;
-constexpr int SCORE_K_TILES = K / MMA_K;
-constexpr int VALUE_K_TILES = BN / MMA_K;
-constexpr int N_TILES = C / MMA_N;
+constexpr int WARPS = 4;
+constexpr int THREADS = WARPS * WARP_SIZE;
+constexpr int SCORE_TILES = BN / 8;
+constexpr int OUTPUT_TILES = C / (WARPS * 8);
+constexpr int QUERY_TILES = K / (WARPS * 16);
 
+// Rows are 576 BF16 elements wide; XOR within each 64-element segment keeps
+// 16-byte copies aligned and distributes ldmatrix rows across shared banks.
 __device__ __forceinline__ int swizzle(int offset) {
-    return offset ^ ((offset & (7 << 6)) >> 3);
+    return offset ^ (((offset / K) & 7) << 3);
 }
 
-__device__ __forceinline__ unsigned int shared_address(
-    const void* pointer) {
+__device__ __forceinline__ unsigned int shared_address(const void* pointer) {
     return static_cast<unsigned int>(__cvta_generic_to_shared(pointer));
 }
 
-__device__ __forceinline__ void load_matrix_x4(
-    unsigned int (&fragment)[4],
-    unsigned int address) {
+__device__ __forceinline__ void load_x4(unsigned int (&fragment)[4], unsigned int address) {
     asm volatile(
-        "ldmatrix.sync.aligned.m8n8.x4.shared.b16 "
-        "{%0, %1, %2, %3}, [%4];\n"
-        : "=r"(fragment[0]),
-          "=r"(fragment[1]),
-          "=r"(fragment[2]),
-          "=r"(fragment[3])
+        "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
+        : "=r"(fragment[0]), "=r"(fragment[1]), "=r"(fragment[2]), "=r"(fragment[3])
         : "r"(address));
 }
 
-__device__ __forceinline__ void load_matrix_x2(
-    unsigned int (&fragment)[2],
-    unsigned int address) {
+__device__ __forceinline__ void load_x2(unsigned int (&fragment)[2], unsigned int address) {
     asm volatile(
-        "ldmatrix.sync.aligned.m8n8.x2.shared.b16 "
-        "{%0, %1}, [%2];\n"
-        : "=r"(fragment[0]), "=r"(fragment[1])
-        : "r"(address));
+        "ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];"
+        : "=r"(fragment[0]), "=r"(fragment[1]) : "r"(address));
 }
 
-__device__ __forceinline__ void load_matrix_x2_transpose(
-    unsigned int (&fragment)[2],
-    unsigned int address) {
+__device__ __forceinline__ void load_x2_transpose(
+    unsigned int (&fragment)[2], unsigned int address) {
     asm volatile(
-        "ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 "
-        "{%0, %1}, [%2];\n"
-        : "=r"(fragment[0]), "=r"(fragment[1])
-        : "r"(address));
+        "ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0,%1}, [%2];"
+        : "=r"(fragment[0]), "=r"(fragment[1]) : "r"(address));
 }
 
 __device__ __forceinline__ void mma(
-    float (&accumulator)[4],
-    const unsigned int (&left)[4],
-    const unsigned int (&right)[2]) {
+    float (&accumulator)[4], const unsigned int (&left)[4], const unsigned int (&right)[2]) {
     asm volatile(
         "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
-        "{%0, %1, %2, %3}, "
-        "{%4, %5, %6, %7}, "
-        "{%8, %9}, "
-        "{%0, %1, %2, %3};\n"
-        : "+f"(accumulator[0]),
-          "+f"(accumulator[1]),
-          "+f"(accumulator[2]),
-          "+f"(accumulator[3])
-        : "r"(left[0]),
-          "r"(left[1]),
-          "r"(left[2]),
-          "r"(left[3]),
-          "r"(right[0]),
-          "r"(right[1]));
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+        : "+f"(accumulator[0]), "+f"(accumulator[1]),
+          "+f"(accumulator[2]), "+f"(accumulator[3])
+        : "r"(left[0]), "r"(left[1]), "r"(left[2]), "r"(left[3]),
+          "r"(right[0]), "r"(right[1]));
 }
 
-__device__ __forceinline__ unsigned int pack_bf16x2(float2 values) {
+// The same tile loader handles strided queries and head-shared KV. Each thread
+// copies eight BF16 elements, with zero padding for incomplete sequence tiles.
+__device__ __forceinline__ void copy_tile(
+    __nv_bfloat16* shared, const __nv_bfloat16* latent, const __nv_bfloat16* rope,
+    int first, int sequence_length, int latent_stride, int rope_stride) {
+    for (int vector = threadIdx.x; vector < BM * K / 8; vector += THREADS) {
+        const int row = vector / (K / 8);
+        const int column = vector % (K / 8) * 8;
+        uint4 values = make_uint4(0, 0, 0, 0);
+        if (first + row < sequence_length) {
+            const __nv_bfloat16* source = column < C
+                ? latent + (first + row) * latent_stride + column
+                : rope + (first + row) * rope_stride + column - C;
+            values = *reinterpret_cast<const uint4*>(source);
+        }
+        *reinterpret_cast<uint4*>(shared + swizzle(row * K + column)) = values;
+    }
+}
+
+// P stays FP32 for softmax statistics. Two BF16 parts approximate each weight
+// for PV, retaining the FP32-output accuracy contract without a SIMT fallback.
+__device__ __forceinline__ void split_probability(
+    float x, float y, unsigned int& high, unsigned int& low) {
     union Packed {
-        __nv_bfloat162 bf16;
+        __nv_bfloat162 value;
         unsigned int bits;
     } packed;
-    packed.bf16 = __float22bfloat162_rn(values);
-    return packed.bits;
+    packed.value = __floats2bfloat162_rn(x, y);
+    high = packed.bits;
+    const float2 rounded = __bfloat1622float2(packed.value);
+    packed.value = __floats2bfloat162_rn(x - rounded.x, y - rounded.y);
+    low = packed.bits;
 }
 
-__device__ __forceinline__ void copy_query_tile(
-    __nv_bfloat16* shared,
-    const __nv_bfloat16* query_latent,
-    const __nv_bfloat16* query_rope,
-    int batch,
-    int first_query,
-    int head,
-    int sequence_length,
-    int heads) {
-    for (int index = threadIdx.x; index < BM * K; index += THREADS) {
-        const int row = index / K;
-        const int column = index % K;
-        shared[swizzle(index)] = column < C
-            ? query_latent[query_offset(
-                  batch,
-                  first_query + row,
-                  head,
-                  sequence_length,
-                  heads,
-                  C) + column]
-            : query_rope[query_offset(
-                  batch,
-                  first_query + row,
-                  head,
-                  sequence_length,
-                  heads,
-                  R) + column - C];
-    }
-}
-
-__device__ __forceinline__ void copy_key_value_tile(
-    __nv_bfloat16* shared_key,
-    __nv_bfloat16* shared_value,
-    const __nv_bfloat16* kv_latent,
-    const __nv_bfloat16* key_rope,
-    int batch,
-    int first_key,
-    int sequence_length) {
-    for (int index = threadIdx.x; index < BN * K; index += THREADS) {
-        const int row = index / K;
-        const int column = index % K;
-        shared_key[swizzle(index)] = column < C
-            ? kv_latent[shared_offset(
-                  batch, first_key + row, sequence_length, C) + column]
-            : key_rope[shared_offset(
-                  batch, first_key + row, sequence_length, R) + column - C];
-    }
-    for (int index = threadIdx.x; index < BN * C; index += THREADS) {
-        const int row = index / C;
-        const int column = index % C;
-        shared_value[swizzle(index)] = kv_latent[shared_offset(
-            batch, first_key + row, sequence_length, C) + column];
-    }
-}
-
-__device__ __forceinline__ void load_query_fragments(
-    unsigned int (&fragments)[SCORE_K_TILES][4],
-    const __nv_bfloat16* shared,
-    int warp_row,
-    int lane) {
-#pragma unroll
-    for (int tile = 0; tile < SCORE_K_TILES; ++tile) {
-        const int row = warp_row + lane % MMA_M;
-        const int column = tile * MMA_K + lane / MMA_M * 8;
-        load_matrix_x4(
-            fragments[tile],
-            shared_address(shared + swizzle(row * K + column)));
-    }
-}
-
-__device__ __forceinline__ void score_matrix_product(
-    float (&accumulators)[N_TILES][4],
-    const unsigned int (&query)[SCORE_K_TILES][4],
-    const __nv_bfloat16* key,
-    int lane) {
-#pragma unroll
-    for (int tile_inner = 0; tile_inner < SCORE_K_TILES; ++tile_inner) {
-#pragma unroll
-        for (int tile_column = 0; tile_column < N_TILES; ++tile_column) {
-            const int row = tile_column * MMA_N + lane % MMA_N;
-            const int column =
-                tile_inner * MMA_K + (lane % MMA_M) / 8 * 8;
-            unsigned int key_fragment[2];
-            load_matrix_x2(
-                key_fragment,
-                shared_address(key + swizzle(row * K + column)));
-            mma(accumulators[tile_column], query[tile_inner], key_fragment);
-        }
-    }
-}
-
-__device__ __forceinline__ void pack_probability_fragments(
-    unsigned int (&fragments)[VALUE_K_TILES][4],
-    const float2 (&top)[N_TILES],
-    const float2 (&bottom)[N_TILES]) {
-#pragma unroll
-    for (int tile = 0; tile < VALUE_K_TILES; ++tile) {
-        fragments[tile][0] = pack_bf16x2(top[tile * 2]);
-        fragments[tile][1] = pack_bf16x2(bottom[tile * 2]);
-        fragments[tile][2] = pack_bf16x2(top[tile * 2 + 1]);
-        fragments[tile][3] = pack_bf16x2(bottom[tile * 2 + 1]);
-    }
-}
-
-__device__ __forceinline__ void value_matrix_product(
-    float (&accumulators)[N_TILES][4],
-    const unsigned int (&probability)[VALUE_K_TILES][4],
-    const __nv_bfloat16* value,
-    int lane) {
-#pragma unroll
-    for (int tile_inner = 0; tile_inner < VALUE_K_TILES; ++tile_inner) {
-#pragma unroll
-        for (int tile_column = 0; tile_column < N_TILES; ++tile_column) {
-            const int row = tile_inner * MMA_K + lane % MMA_M;
-            const int column = tile_column * MMA_N;
-            unsigned int value_fragment[2];
-            load_matrix_x2_transpose(
-                value_fragment,
-                shared_address(value + swizzle(row * C + column)));
-            mma(
-                accumulators[tile_column],
-                probability[tile_inner],
-                value_fragment);
-        }
-    }
-}
-
+// One CTA owns 16 query rows. Its four warps split the 576-wide QK reduction,
+// then each warp owns 128 output columns; KV is shared across all query heads.
 __global__ __launch_bounds__(THREADS, 2)
-void mla_forward_tensor_core_kernel(
+void mla_forward_kernel(
     float* __restrict__ output,
     float* __restrict__ logsumexp,
     const __nv_bfloat16* __restrict__ query_latent,
     const __nv_bfloat16* __restrict__ query_rope,
     const __nv_bfloat16* __restrict__ kv_latent,
     const __nv_bfloat16* __restrict__ key_rope,
-    int sequence_length,
-    int heads,
-    float scale) {
+    int sequence_length, int heads, float scale) {
     __shared__ __align__(16) __nv_bfloat16 shared_query[BM * K];
-    __shared__ __align__(16) __nv_bfloat16 shared_key[BN * K];
-    __shared__ __align__(16) __nv_bfloat16 shared_value[BN * C];
+    __shared__ __align__(16) __nv_bfloat16 shared_kv[BN * K];
+    __shared__ float partial[WARPS][SCORE_TILES][WARP_SIZE][4];
 
     const int lane = threadIdx.x % WARP_SIZE;
     const int warp = threadIdx.x / WARP_SIZE;
-    const int batch_head = blockIdx.y;
-    const int batch = batch_head / heads;
-    const int head = batch_head % heads;
+    const int batch = blockIdx.y / heads;
+    const int head = blockIdx.y % heads;
     const int first_query = blockIdx.x * BM;
-    const int warp_row = warp * MMA_M;
+    const int top_query = first_query + lane / 4;
+    const int bottom_query = top_query + 8;
 
-    copy_query_tile(
-        shared_query,
-        query_latent,
-        query_rope,
-        batch,
-        first_query,
-        head,
-        sequence_length,
-        heads);
+    copy_tile(shared_query,
+              query_latent + (batch * sequence_length * heads + head) * C,
+              query_rope + (batch * sequence_length * heads + head) * R,
+              first_query, sequence_length, heads * C, heads * R);
     __syncthreads();
+    unsigned int query[QUERY_TILES][4];
+#pragma unroll
+    for (int tile = 0; tile < QUERY_TILES; ++tile) {
+        const int column = (warp * QUERY_TILES + tile) * 16 + lane / 16 * 8;
+        load_x4(query[tile], shared_address(shared_query + swizzle(lane % 16 * K + column)));
+    }
 
-    unsigned int query_fragments[SCORE_K_TILES][4];
-    load_query_fragments(query_fragments, shared_query, warp_row, lane);
-    float output_accumulators[N_TILES][4] = {};
+    float numerator[OUTPUT_TILES][4] = {};
     float row_max[2] = {-FLT_MAX, -FLT_MAX};
-    float row_sum[2] = {0.0F, 0.0F};
-
+    float row_sum[2] = {};
     for (int first_key = 0; first_key <= first_query; first_key += BN) {
-        copy_key_value_tile(
-            shared_key,
-            shared_value,
-            kv_latent,
-            key_rope,
-            batch,
-            first_key,
-            sequence_length);
+        copy_tile(shared_kv, kv_latent + batch * sequence_length * C,
+                  key_rope + batch * sequence_length * R,
+                  first_key, sequence_length, C, R);
         __syncthreads();
 
-        float scores[N_TILES][4] = {};
-        score_matrix_product(scores, query_fragments, shared_key, lane);
-        const int local_top_row = warp_row + lane / 4;
-        const int local_bottom_row = local_top_row + 8;
-        float current_max[2] = {-FLT_MAX, -FLT_MAX};
+        float scores[SCORE_TILES][4] = {};
 #pragma unroll
-        for (int tile = 0; tile < N_TILES; ++tile) {
-            const int key_column = tile * MMA_N + (lane % 4) * 2;
-            if (first_key == first_query) {
-                scores[tile][0] = local_top_row >= key_column
-                    ? scores[tile][0] * scale
-                    : -FLT_MAX;
-                scores[tile][1] = local_top_row >= key_column + 1
-                    ? scores[tile][1] * scale
-                    : -FLT_MAX;
-                scores[tile][2] = local_bottom_row >= key_column
-                    ? scores[tile][2] * scale
-                    : -FLT_MAX;
-                scores[tile][3] = local_bottom_row >= key_column + 1
-                    ? scores[tile][3] * scale
-                    : -FLT_MAX;
-            } else {
-                scores[tile][0] *= scale;
-                scores[tile][1] *= scale;
-                scores[tile][2] *= scale;
-                scores[tile][3] *= scale;
+        for (int inner = 0; inner < QUERY_TILES; ++inner) {
+#pragma unroll
+            for (int tile = 0; tile < SCORE_TILES; ++tile) {
+                const int row = tile * 8 + lane % 8;
+                const int column = (warp * QUERY_TILES + inner) * 16 + lane % 16 / 8 * 8;
+                unsigned int key[2];
+                load_x2(key, shared_address(shared_kv + swizzle(row * K + column)));
+                mma(scores[tile], query[inner], key);
             }
-            current_max[0] = fmaxf(
-                current_max[0], fmaxf(scores[tile][0], scores[tile][1]));
-            current_max[1] = fmaxf(
-                current_max[1], fmaxf(scores[tile][2], scores[tile][3]));
         }
-        current_max[0] = fmaxf(
-            current_max[0],
-            __shfl_xor_sync(0xffffffffU, current_max[0], 1));
-        current_max[0] = fmaxf(
-            current_max[0],
-            __shfl_xor_sync(0xffffffffU, current_max[0], 2));
-        current_max[1] = fmaxf(
-            current_max[1],
-            __shfl_xor_sync(0xffffffffU, current_max[1], 1));
-        current_max[1] = fmaxf(
-            current_max[1],
-            __shfl_xor_sync(0xffffffffU, current_max[1], 2));
-
-        const float next_max[2] = {
-            fmaxf(row_max[0], current_max[0]),
-            fmaxf(row_max[1], current_max[1])};
-        const float previous_scale[2] = {
-            expf(row_max[0] - next_max[0]),
-            expf(row_max[1] - next_max[1])};
 #pragma unroll
-        for (int tile = 0; tile < N_TILES; ++tile) {
-            output_accumulators[tile][0] *= previous_scale[0];
-            output_accumulators[tile][1] *= previous_scale[0];
-            output_accumulators[tile][2] *= previous_scale[1];
-            output_accumulators[tile][3] *= previous_scale[1];
+        for (int tile = 0; tile < SCORE_TILES; ++tile) {
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                partial[warp][tile][lane][i] = scores[tile][i];
+            }
         }
-        row_sum[0] *= previous_scale[0];
-        row_sum[1] *= previous_scale[1];
+        __syncthreads();
 
-        float2 probability_top[N_TILES];
-        float2 probability_bottom[N_TILES];
+        float next_max[2] = {row_max[0], row_max[1]};
+#pragma unroll
+        for (int tile = 0; tile < SCORE_TILES; ++tile) {
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                float value = 0.0F;
+#pragma unroll
+                for (int w = 0; w < WARPS; ++w) {
+                    value += partial[w][tile][lane][i];
+                }
+                const int q = i < 2 ? top_query : bottom_query;
+                const int k = first_key + tile * 8 + lane % 4 * 2 + i % 2;
+                scores[tile][i] = q < sequence_length && k < sequence_length && k <= q
+                    ? value * scale : -CUDART_INF_F;
+                next_max[i / 2] = fmaxf(next_max[i / 2], scores[tile][i]);
+            }
+        }
+#pragma unroll
+        for (int row = 0; row < 2; ++row) {
+            next_max[row] = fmaxf(next_max[row], __shfl_xor_sync(0xffffffffU, next_max[row], 1));
+            next_max[row] = fmaxf(next_max[row], __shfl_xor_sync(0xffffffffU, next_max[row], 2));
+        }
+        const float alpha[2] = {expf(row_max[0] - next_max[0]), expf(row_max[1] - next_max[1])};
+#pragma unroll
+        for (int tile = 0; tile < OUTPUT_TILES; ++tile) {
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                numerator[tile][i] *= alpha[i / 2];
+            }
+        }
+
+        unsigned int probability_high[4], probability_low[4];
         float local_sum[2] = {};
 #pragma unroll
-        for (int tile = 0; tile < N_TILES; ++tile) {
-            probability_top[tile] = make_float2(
-                expf(scores[tile][0] - next_max[0]),
-                expf(scores[tile][1] - next_max[0]));
-            probability_bottom[tile] = make_float2(
-                expf(scores[tile][2] - next_max[1]),
-                expf(scores[tile][3] - next_max[1]));
-            local_sum[0] +=
-                probability_top[tile].x + probability_top[tile].y;
-            local_sum[1] +=
-                probability_bottom[tile].x + probability_bottom[tile].y;
+        for (int tile = 0; tile < SCORE_TILES; ++tile) {
+#pragma unroll
+            for (int row = 0; row < 2; ++row) {
+                const float p0 = expf(scores[tile][2 * row] - next_max[row]);
+                const float p1 = expf(scores[tile][2 * row + 1] - next_max[row]);
+                local_sum[row] += p0 + p1;
+                split_probability(p0, p1, probability_high[2 * tile + row],
+                                  probability_low[2 * tile + row]);
+            }
         }
-        local_sum[0] += __shfl_xor_sync(0xffffffffU, local_sum[0], 1);
-        local_sum[0] += __shfl_xor_sync(0xffffffffU, local_sum[0], 2);
-        local_sum[1] += __shfl_xor_sync(0xffffffffU, local_sum[1], 1);
-        local_sum[1] += __shfl_xor_sync(0xffffffffU, local_sum[1], 2);
-        row_sum[0] += local_sum[0];
-        row_sum[1] += local_sum[1];
-        row_max[0] = next_max[0];
-        row_max[1] = next_max[1];
+#pragma unroll
+        for (int row = 0; row < 2; ++row) {
+            local_sum[row] += __shfl_xor_sync(0xffffffffU, local_sum[row], 1);
+            local_sum[row] += __shfl_xor_sync(0xffffffffU, local_sum[row], 2);
+            row_sum[row] = row_sum[row] * alpha[row] + local_sum[row];
+            row_max[row] = next_max[row];
+        }
 
-        unsigned int probability_fragments[VALUE_K_TILES][4];
-        pack_probability_fragments(
-            probability_fragments, probability_top, probability_bottom);
-        value_matrix_product(
-            output_accumulators,
-            probability_fragments,
-            shared_value,
-            lane);
+#pragma unroll
+        for (int tile = 0; tile < OUTPUT_TILES; ++tile) {
+            const int column = (warp * OUTPUT_TILES + tile) * 8;
+            unsigned int value[2];
+            load_x2_transpose(value, shared_address(shared_kv + swizzle(lane % 16 * K + column)));
+            mma(numerator[tile], probability_high, value);
+            mma(numerator[tile], probability_low, value);
+        }
         __syncthreads();
     }
 
-    const int top_query = first_query + warp_row + lane / 4;
-    const int bottom_query = top_query + 8;
 #pragma unroll
-    for (int tile = 0; tile < N_TILES; ++tile) {
-        const int column = tile * MMA_N + (lane % 4) * 2;
-        *reinterpret_cast<float2*>(output + query_offset(
-            batch, top_query, head, sequence_length, heads, C) + column) =
-            make_float2(
-                output_accumulators[tile][0] / row_sum[0],
-                output_accumulators[tile][1] / row_sum[0]);
-        *reinterpret_cast<float2*>(output + query_offset(
-            batch, bottom_query, head, sequence_length, heads, C) + column) =
-            make_float2(
-                output_accumulators[tile][2] / row_sum[1],
-                output_accumulators[tile][3] / row_sum[1]);
+    for (int tile = 0; tile < OUTPUT_TILES; ++tile) {
+        const int column = (warp * OUTPUT_TILES + tile) * 8 + lane % 4 * 2;
+        if (top_query < sequence_length) {
+            *reinterpret_cast<float2*>(output + query_offset(
+                batch, top_query, head, sequence_length, heads, C) + column) =
+                make_float2(numerator[tile][0] / row_sum[0], numerator[tile][1] / row_sum[0]);
+        }
+        if (bottom_query < sequence_length) {
+            *reinterpret_cast<float2*>(output + query_offset(
+                batch, bottom_query, head, sequence_length, heads, C) + column) =
+                make_float2(numerator[tile][2] / row_sum[1], numerator[tile][3] / row_sum[1]);
+        }
     }
-    if (lane % 4 == 0) {
-        logsumexp[lse_offset(
-            batch, head, top_query, heads, sequence_length)] =
-            row_max[0] + logf(row_sum[0]);
-        logsumexp[lse_offset(
-            batch, head, bottom_query, heads, sequence_length)] =
-            row_max[1] + logf(row_sum[1]);
+    if (warp == 0 && lane % 4 == 0) {
+        if (top_query < sequence_length) {
+            logsumexp[lse_offset(batch, head, top_query, heads, sequence_length)] =
+                row_max[0] + logf(row_sum[0]);
+        }
+        if (bottom_query < sequence_length) {
+            logsumexp[lse_offset(batch, head, bottom_query, heads, sequence_length)] =
+                row_max[1] + logf(row_sum[1]);
+        }
     }
 }
 
-}  // namespace mla_tensor_core
+}  // namespace mla_forward
 
 __global__ void mla_query_backward_kernel(
     float* query_latent_gradient,
@@ -915,31 +694,10 @@ void mla_compressed_attention_forward_cuda(
     int rope_size,
     float scale,
     cudaStream_t stream) {
-    if (kv_rank == mla_tensor_core::C
-        && rope_size == mla_tensor_core::R
-        && sequence_length % mla_tensor_core::BM == 0) {
-        const dim3 tensor_grid(
-            sequence_length / mla_tensor_core::BM,
-            batch_size * heads);
-        mla_tensor_core::mla_forward_tensor_core_kernel<<<
-            tensor_grid,
-            mla_tensor_core::THREADS,
-            0,
-            stream>>>(
-                output,
-                logsumexp,
-                query_latent,
-                query_rope,
-                kv_latent,
-                key_rope,
-                sequence_length,
-                heads,
-                scale);
-        CUDA_CHECK(cudaGetLastError());
-        return;
-    }
-    const dim3 grid(sequence_length, heads, batch_size);
-    mla_forward_kernel<<<grid, BLOCK_SIZE, 0, stream>>>(
+    check_shape(kv_rank, rope_size);
+    const dim3 grid((sequence_length + mla_forward::BM - 1) / mla_forward::BM,
+                    batch_size * heads);
+    mla_forward::mla_forward_kernel<<<grid, mla_forward::THREADS, 0, stream>>>(
         output,
         logsumexp,
         query_latent,
@@ -948,8 +706,6 @@ void mla_compressed_attention_forward_cuda(
         key_rope,
         sequence_length,
         heads,
-        kv_rank,
-        rope_size,
         scale);
     CUDA_CHECK(cudaGetLastError());
 }
@@ -974,6 +730,7 @@ void mla_compressed_attention_backward_cuda(
     float scale,
     bool accumulate,
     cudaStream_t stream) {
+    check_shape(kv_rank, rope_size);
     const dim3 query_grid(sequence_length, heads, batch_size);
     mla_query_backward_kernel<<<query_grid, BLOCK_SIZE, 0, stream>>>(
         query_latent_gradient,
@@ -1039,6 +796,7 @@ void mla_decode_forward_cuda(
     int splits,
     float scale,
     cudaStream_t stream) {
+    check_shape(kv_rank, rope_size);
     const dim3 split_grid(splits, heads, batch_size);
     mla_decode_split_kernel<<<split_grid, BLOCK_SIZE, 0, stream>>>(
         query_latent,

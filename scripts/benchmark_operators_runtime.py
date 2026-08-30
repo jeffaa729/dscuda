@@ -11,7 +11,8 @@ import subprocess
 import sys
 import time
 
-from benchmark_flash_attention_runtime import Captured, positive, summarize, table
+from benchmark_flash_attention_runtime import (
+    Captured, add_reference_percentages, format_percentage, positive, summarize, table)
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "reference" / "python"))
@@ -149,12 +150,13 @@ def measure(workload, args):
 
 
 def result_table(rows):
-    headers = ("size", "dtype", "operation", "backend", "median us")
+    add_reference_percentages(rows, "reference", ("size", "dtype", "operation", "reference"))
+    headers = ("size", "dtype", "operation", "backend", "median us", "reference %")
     values = [(r["size"], r["dtype"], r["operation"],
                r["reference"] if r["backend"] == "reference" else "custom",
-               f'{1000*r["median_ms"]:.2f}')
+               f'{1000*r["median_ms"]:.2f}', format_percentage(r["reference_pct"]))
               for r in rows]
-    return table(headers, values, {0, 4})
+    return table(headers, values, {0, 4, 5})
 
 
 def main():
@@ -206,7 +208,7 @@ def main():
     note += ("\nWarm-cache CUDA Graph measurements; allocations, state resets, and graph construction "
              "are excluded.\n")
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    fields = ("size", "dtype", "operation", "backend", "reference", "median_ms")
+    fields = ("size", "dtype", "operation", "backend", "reference", "median_ms", "reference_pct")
     with (args.output_dir / f"{args.family}.csv").open("w", newline="") as file:
         writer = csv.DictWriter(file, fieldnames=fields, extrasaction="ignore")
         writer.writeheader()

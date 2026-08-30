@@ -13,7 +13,8 @@ import subprocess
 import sys
 import time
 
-from benchmark_flash_attention_runtime import Captured, positive, summarize, table
+from benchmark_flash_attention_runtime import (
+    Captured, add_reference_percentages, format_percentage, positive, summarize, table)
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "reference/python"))
@@ -42,8 +43,8 @@ class Case:
             raise ValueError("mode must be prefill or decode")
         if min(self.batch, self.sequence, self.heads, self.rank, self.rope, self.splits) < 1:
             raise ValueError("shape dimensions and splits must be positive")
-        if self.rank > 512 or self.rope > 256:
-            raise ValueError("current CUDA kernels require C <= 512 and R <= 256")
+        if (self.rank, self.rope) != (512, 64):
+            raise ValueError("MLA requires C=512 and RoPE=64")
         if self.lengths and (len(self.lengths) != self.batch
                              or any(n < 1 or n > self.sequence for n in self.lengths)):
             raise ValueError("one cache length in [1, sequence] is required per batch")
@@ -68,7 +69,7 @@ def benchmark_cases(suite):
 
 def correctness_cases():
     return (Case("prefill", 1, 1, 1), Case("prefill", 2, 17, 3),
-            Case("prefill", 1, 64, 4, rank=64, rope=32),
+            Case("prefill", 1, 65, 4),
             Case("decode", 2, 23, 3, lengths=(1, 23)),
             Case("decode", 3, 129, 5, lengths=(129, 7, 64)))
 
@@ -163,12 +164,6 @@ class Workload:
             if not bool(self.torch.isfinite(output).all() & self.torch.isfinite(expected).all()):
                 raise AssertionError(f"{name}: non-finite output")
             atol, rtol = (2e-5, 1e-5) if name == "LSE" else (2e-4, 2e-3)
-            if (name == "output" and self.case.mode == "prefill"
-                    and (self.case.rank, self.case.rope) == (64, 32)
-                    and self.case.sequence % 64 == 0):
-                # This existing small-shape Tensor Core path rounds tile weights
-                # to BF16. The primary C512/R64 benchmark uses the stricter bound.
-                atol, rtol = 1e-3, 5e-3
             self.torch.testing.assert_close(output, expected, atol=atol, rtol=rtol)
             difference = output - expected
             checks.append(dict(tensor=name, max_abs=difference.abs().max().item(),
@@ -205,6 +200,24 @@ def verify_graph(workload, graph, operation):
         tensor.fill_(float("nan"))
     graph.graph.replay()
     return workload.compare(graph.result, operation)
+
+
+def check_extreme_inputs(torch, lib):
+    # Large logits exercise online max rescaling; zero logits give uniform P.
+    # These checks are separate from, and never part of, the timed workload.
+    for factor in (16, 0):
+        workload = Workload(torch, lib, Case("prefill", 2, 33, 3))
+        for tensor in workload.inputs:
+            tensor.mul_(factor)
+        workload.saved = workload.reference_forward()
+        workload.expected = {"forward": workload.saved, "backward": workload.reference_backward()}
+        for operation in workload.case.operations:
+            workload.check(operation)
+        original = workload.custom_forward()[0].clone()
+        workload.inputs[2][:, 17:].fill_(100)
+        workload.inputs[3][:, 17:].fill_(-100)
+        changed = workload.custom_forward()[0]
+        torch.testing.assert_close(changed[:, :17], original[:, :17], atol=0, rtol=0)
 
 
 def measure(workload, operation, args):
@@ -253,15 +266,17 @@ def measure(workload, operation, args):
 
 
 def result_table(rows):
+    add_reference_percentages(rows, "pytorch",
+                              ("mode", "batch", "sequence", "heads", "rank", "rope", "lengths", "splits", "operation"))
     headers = ("B", "Q", "KV", "H", "C", "RoPE", "KV lengths", "dtype",
-               "operation", "backend", "median us")
+               "operation", "backend", "median us", "reference %")
     values = [(r["batch"], r["sequence"] if r["mode"] == "prefill" else 1,
                r["sequence"], r["heads"], r["rank"], r["rope"],
                ",".join(map(str, r["lengths"])) if r["mode"] == "decode" else "-", "bf16",
                r["operation"], "pytorch_unfused" if r["backend"] == "pytorch" else r["backend"],
-               f'{r["median_ms"]*1000:.2f}')
+               f'{r["median_ms"]*1000:.2f}', format_percentage(r["reference_pct"]))
               for r in rows]
-    return table(headers, values, {0, 1, 2, 3, 4, 5, 10})
+    return table(headers, values, {0, 1, 2, 3, 4, 5, 10, 11})
 
 
 def write_results(args, torch, rows, checks):
@@ -272,7 +287,8 @@ def write_results(args, torch, rows, checks):
         "Causal square prefill; single-query decode attends positive per-batch cache lengths. "
         "Decode uses contiguous split latent/RoPE caches, not FlashMLA's paged layout. "
         "PyTorch is an unfused materialized FP32 reference with BF16 upcasts INSIDE each measured call; TF32 is disabled. "
-        "The current custom C512/R64 path uses SIMT FP32 arithmetic, not the small C64/R32 Tensor Core specialization. "
+        "C512/R64 forward uses BF16 Tensor Cores with FP32 accumulation and two-part BF16 softmax weights. "
+        "Backward and decode use SIMT FP32 arithmetic. There is no alternate CUDA forward path. "
         "Backward overwrites gradients and recomputes probabilities; common saved output/LSE and masks are prepared outside timing. "
         "Graph construction and warmup are excluded; these are not API latency measurements. "
         "Replay counts are calibrated per backend to a minimum sample duration, then normalized per operation.")
@@ -293,7 +309,7 @@ def write_results(args, torch, rows, checks):
     args.output_dir.mkdir(parents=True, exist_ok=True)
     with (args.output_dir / "mla.csv").open("w", newline="") as file:
         writer = csv.DictWriter(file, fieldnames=("mode", "batch", "sequence", "heads", "rank",
-                                                "rope", "splits", "lengths", "operation", "backend", "median_ms"),
+                                                "rope", "splits", "lengths", "operation", "backend", "median_ms", "reference_pct"),
                                 extrasaction="ignore")
         writer.writeheader()
         writer.writerows(rows)
@@ -345,6 +361,8 @@ def main():
                     rows.extend(result)
                 checks.append(dict(case=asdict(case), operation=operation, checks=check))
             del workload
+        if args.check_only:
+            check_extreme_inputs(torch, lib)
         stream.synchronize()
     if not args.check_only:
         write_results(args, torch, rows, checks)

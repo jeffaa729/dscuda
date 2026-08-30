@@ -17,14 +17,14 @@ namespace {
 constexpr int B = 2;
 constexpr int MAX_T = 23;
 constexpr int H = 4;
-constexpr int C = 64;
-constexpr int R = 16;
+constexpr int C = dscuda::MLA_KV_RANK;
+constexpr int R = dscuda::MLA_ROPE_SIZE;
 constexpr int SPLITS = 4;
 constexpr int QUERY_ELEMENTS = B * H * C;
 constexpr int QUERY_ROPE_ELEMENTS = B * H * R;
 constexpr int KV_ELEMENTS = B * MAX_T * C;
 constexpr int KEY_ROPE_ELEMENTS = B * MAX_T * R;
-constexpr float SCALE = 0.111803399F;
+constexpr float SCALE = 1.0F / 24.0F;
 
 template <typename T>
 class DeviceBuffer {
@@ -74,6 +74,10 @@ bool check(
     const std::vector<float>& actual) {
     float maximum_error = 0.0F;
     for (std::size_t index = 0; index < expected.size(); ++index) {
+        if (!std::isfinite(expected[index]) || !std::isfinite(actual[index])) {
+            maximum_error = INFINITY;
+            break;
+        }
         maximum_error = std::max(
             maximum_error, std::abs(expected[index] - actual[index]));
     }

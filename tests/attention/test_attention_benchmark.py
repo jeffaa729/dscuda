@@ -53,8 +53,28 @@ class BenchmarkTests(unittest.TestCase):
         self.assertNotIn("6000.00", graph)
         self.assertIn("6000.00", api)
         self.assertNotIn("2000.00", api)
+        self.assertEqual([r["reference_pct"] for r in rows], [50, 100, 200, 100])
 
-    def test_reports_show_only_parameters_and_time(self):
+    def test_percentages_require_matching_shape_and_operation(self):
+        rows = [dict(batch=1, sequence=128, heads=8, head_size=128, mode="graph",
+                     operation=operation, backend=backend, median_ms=elapsed)
+                for operation, backend, elapsed in (("forward", "custom", 2),
+                                                     ("forward", "official", 1),
+                                                     ("backward", "custom", 3))]
+        rows.append(dict(rows[0], sequence=256))
+        benchmark.result_table(rows, "graph")
+        self.assertEqual([r["reference_pct"] for r in rows], [50, 100, None, None])
+        self.assertEqual(benchmark.format_percentage(None), "-")
+
+    def test_invalid_durations_have_no_percentage(self):
+        for invalid in (0, float("nan"), float("inf")):
+            for backend in ("custom", "official"):
+                rows = [dict(backend=name, median_ms=invalid if name == backend else 1)
+                        for name in ("custom", "official")]
+                benchmark.add_reference_percentages(rows, "official", ())
+                self.assertIsNone(rows[0]["reference_pct"])
+
+    def test_reports_show_parameters_time_and_percentage(self):
         rows = [dict(batch=1, sequence=512, heads=8, head_size=128, mode=mode,
                      backend="custom", operation="forward", **benchmark.summarize([1, 2, 9]))
                 for mode in ("graph", "api")]
@@ -66,9 +86,10 @@ class BenchmarkTests(unittest.TestCase):
             with (path / "flash_attention.csv").open() as file:
                 fields = csv.DictReader(file).fieldnames
             self.assertEqual(set(fields), {"batch", "sequence", "heads", "head_size", "mode",
-                                          "backend", "operation", "median_ms"})
+                                          "backend", "operation", "median_ms", "reference_pct"})
             saved = json.loads((path / "flash_attention_samples.json").read_text())
             self.assertEqual(saved["measurements"][0]["samples_ms"], [1, 2, 9])
+            self.assertIsNone(saved["measurements"][0]["reference_pct"])
         for unwanted in ("IQR", "GB/s", "TFLOP", "official %", "WARNING", "Report:", "PASS"):
             self.assertNotIn(unwanted, output.getvalue())
 

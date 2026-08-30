@@ -293,7 +293,7 @@ profile_mla() {
         profile_case \
             "B=1,T=${sequence},H=8,D=512,R=64/custom/forward_backward" \
             "T${sequence}_forward_backward" \
-            'regex:mla_(forward_tensor_core|forward|query_backward|kv_backward)_kernel' \
+            'regex:mla_(forward|query_backward|kv_backward)_kernel' \
             "$build_dir/benchmark_mla" 1 "$sequence" 8 512 64
         profile_case \
             "B=2,KV=${sequence},H=16,D=512,R=64/custom/decode" \

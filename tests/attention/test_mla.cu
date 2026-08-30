@@ -1,5 +1,5 @@
 // Compares the fused BF16 compressed-latent MLA forward and backward paths with the scalar CPU equations.
-// The test uses different compressed and RoPE widths and checks every activation gradient required by end-to-end training.
+// Fixed C512/R64 cases cover causal tile boundaries, sequence tails, and every activation gradient.
 
 #include "cuda_common.h"
 #include "mla.h"
@@ -10,21 +10,14 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <stdexcept>
 #include <vector>
 
 namespace {
 
-constexpr int B = 2;
-constexpr int T = 11;
-constexpr int H = 3;
-constexpr int C = 64;
-constexpr int R = 16;
-constexpr int QUERY_ELEMENTS = B * T * H * C;
-constexpr int QUERY_ROPE_ELEMENTS = B * T * H * R;
-constexpr int KV_ELEMENTS = B * T * C;
-constexpr int KEY_ROPE_ELEMENTS = B * T * R;
-constexpr int ROWS = B * H * T;
-constexpr float SCALE = 0.111803399F;
+constexpr int C = dscuda::MLA_KV_RANK;
+constexpr int R = dscuda::MLA_ROPE_SIZE;
+constexpr float SCALE = 1.0F / 24.0F;
 
 template <typename T>
 class DeviceBuffer {
@@ -94,6 +87,10 @@ bool check(
     float tolerance) {
     float maximum_error = 0.0F;
     for (std::size_t index = 0; index < expected.size(); ++index) {
+        if (!std::isfinite(expected[index]) || !std::isfinite(actual[index])) {
+            maximum_error = INFINITY;
+            break;
+        }
         maximum_error = std::max(
             maximum_error, std::abs(expected[index] - actual[index]));
     }
@@ -106,139 +103,12 @@ bool check(
     return passed;
 }
 
-bool test_tensor_core_path() {
-    constexpr int tensor_batch = 1;
-    constexpr int tensor_sequence = 64;
-    constexpr int tensor_heads = 2;
-    constexpr int tensor_kv_rank = 64;
-    constexpr int tensor_rope_size = 32;
-    constexpr int tensor_query_elements =
-        tensor_batch * tensor_sequence * tensor_heads * tensor_kv_rank;
-    constexpr int tensor_query_rope_elements =
-        tensor_batch * tensor_sequence * tensor_heads * tensor_rope_size;
-    constexpr int tensor_kv_elements =
-        tensor_batch * tensor_sequence * tensor_kv_rank;
-    constexpr int tensor_key_rope_elements =
-        tensor_batch * tensor_sequence * tensor_rope_size;
-    constexpr int tensor_rows =
-        tensor_batch * tensor_heads * tensor_sequence;
-    constexpr float tensor_scale = 0.102062073F;
-
-    auto query = make_values(tensor_query_elements, 0.15F, 0.15F);
-    auto query_rope =
-        make_values(tensor_query_rope_elements, 0.12F, 0.35F);
-    auto kv = make_values(tensor_kv_elements, 0.14F, 0.55F);
-    auto key_rope =
-        make_values(tensor_key_rope_elements, 0.11F, 0.75F);
-    const auto output_gradient =
-        make_values(tensor_query_elements, 0.08F, 0.95F);
-    const auto bf16_query = round_to_bf16(query);
-    const auto bf16_query_rope = round_to_bf16(query_rope);
-    const auto bf16_kv = round_to_bf16(kv);
-    const auto bf16_key_rope = round_to_bf16(key_rope);
-
-    std::vector<float> expected_output(tensor_query_elements);
-    std::vector<float> expected_lse(tensor_rows);
-    std::vector<float> expected_query_gradient(tensor_query_elements, 0.0F);
-    std::vector<float> expected_query_rope_gradient(
-        tensor_query_rope_elements, 0.0F);
-    std::vector<float> expected_kv_gradient(tensor_kv_elements, 0.0F);
-    std::vector<float> expected_key_rope_gradient(
-        tensor_key_rope_elements, 0.0F);
-    dscuda::mla_compressed_attention_forward_cpu(
-        expected_output.data(), expected_lse.data(), query.data(),
-        query_rope.data(), kv.data(), key_rope.data(), tensor_batch,
-        tensor_sequence, tensor_heads, tensor_kv_rank, tensor_rope_size,
-        tensor_scale);
-    dscuda::mla_compressed_attention_backward_cpu(
-        expected_query_gradient.data(),
-        expected_query_rope_gradient.data(),
-        expected_kv_gradient.data(),
-        expected_key_rope_gradient.data(),
-        output_gradient.data(),
-        expected_output.data(),
-        expected_lse.data(),
-        query.data(),
-        query_rope.data(),
-        kv.data(),
-        key_rope.data(),
-        tensor_batch,
-        tensor_sequence,
-        tensor_heads,
-        tensor_kv_rank,
-        tensor_rope_size,
-        tensor_scale);
-
-    DeviceBuffer<__nv_bfloat16> gpu_query(tensor_query_elements);
-    DeviceBuffer<__nv_bfloat16> gpu_query_rope(tensor_query_rope_elements);
-    DeviceBuffer<__nv_bfloat16> gpu_kv(tensor_kv_elements);
-    DeviceBuffer<__nv_bfloat16> gpu_key_rope(tensor_key_rope_elements);
-    DeviceBuffer<float> gpu_output_gradient(tensor_query_elements);
-    DeviceBuffer<float> gpu_output(tensor_query_elements);
-    DeviceBuffer<float> gpu_lse(tensor_rows);
-    DeviceBuffer<float> gpu_query_gradient(tensor_query_elements);
-    DeviceBuffer<float> gpu_query_rope_gradient(tensor_query_rope_elements);
-    DeviceBuffer<float> gpu_kv_gradient(tensor_kv_elements);
-    DeviceBuffer<float> gpu_key_rope_gradient(tensor_key_rope_elements);
-    gpu_query.upload(bf16_query);
-    gpu_query_rope.upload(bf16_query_rope);
-    gpu_kv.upload(bf16_kv);
-    gpu_key_rope.upload(bf16_key_rope);
-    gpu_output_gradient.upload(output_gradient);
-    gpu_query_gradient.zero();
-    gpu_query_rope_gradient.zero();
-    gpu_kv_gradient.zero();
-    gpu_key_rope_gradient.zero();
-
-    dscuda::mla_compressed_attention_forward_cuda(
-        gpu_output.data(), gpu_lse.data(), gpu_query.data(),
-        gpu_query_rope.data(), gpu_kv.data(), gpu_key_rope.data(),
-        tensor_batch, tensor_sequence, tensor_heads, tensor_kv_rank,
-        tensor_rope_size, tensor_scale);
-    dscuda::mla_compressed_attention_backward_cuda(
-        gpu_query_gradient.data(),
-        gpu_query_rope_gradient.data(),
-        gpu_kv_gradient.data(),
-        gpu_key_rope_gradient.data(),
-        gpu_output_gradient.data(),
-        gpu_output.data(),
-        gpu_lse.data(),
-        gpu_query.data(),
-        gpu_query_rope.data(),
-        gpu_kv.data(),
-        gpu_key_rope.data(),
-        tensor_batch,
-        tensor_sequence,
-        tensor_heads,
-        tensor_kv_rank,
-        tensor_rope_size,
-        tensor_scale);
-    dscuda::synchronize();
-
-    std::printf("MLA SM89 Tensor Core path\n");
-    bool passed = true;
-    passed &= check(
-        "Tensor Core output", expected_output, gpu_output.download(), 8.0e-3F);
-    passed &= check(
-        "Tensor Core logsumexp", expected_lse, gpu_lse.download(), 2.0e-3F);
-    passed &= check(
-        "Tensor Core query gradient", expected_query_gradient,
-        gpu_query_gradient.download(), 3.0e-3F);
-    passed &= check(
-        "Tensor Core query RoPE grad", expected_query_rope_gradient,
-        gpu_query_rope_gradient.download(), 3.0e-3F);
-    passed &= check(
-        "Tensor Core shared KV grad", expected_kv_gradient,
-        gpu_kv_gradient.download(), 4.0e-3F);
-    passed &= check(
-        "Tensor Core key RoPE grad", expected_key_rope_gradient,
-        gpu_key_rope_gradient.download(), 4.0e-3F);
-    return passed;
-}
-
-}  // namespace
-
-int main() {
+bool run_case(int B, int T, int H) {
+    const int QUERY_ELEMENTS = B * T * H * C;
+    const int QUERY_ROPE_ELEMENTS = B * T * H * R;
+    const int KV_ELEMENTS = B * T * C;
+    const int KEY_ROPE_ELEMENTS = B * T * R;
+    const int ROWS = B * H * T;
     auto query_latent = make_values(QUERY_ELEMENTS, 0.15F, 0.1F);
     auto query_rope = make_values(QUERY_ROPE_ELEMENTS, 0.12F, 0.3F);
     auto kv_latent = make_values(KV_ELEMENTS, 0.14F, 0.5F);
@@ -326,7 +196,7 @@ int main() {
         SCALE);
     dscuda::synchronize();
 
-    std::printf("MLA compressed attention test\n");
+    std::printf("MLA C512/R64: B=%d T=%d H=%d\n", B, T, H);
     bool passed = true;
     passed &= check("output", expected_output, gpu_output.download(), 2.0e-5F);
     passed &= check("logsumexp", expected_lse, gpu_lse.download(), 2.0e-5F);
@@ -343,6 +213,26 @@ int main() {
         "shared key RoPE gradient", expected_key_rope_gradient,
         gpu_key_rope_gradient.download(), 4.0e-5F);
 
-    passed &= test_tensor_core_path();
+    return passed;
+}
+
+}  // namespace
+
+int main() {
+    bool passed = true;
+    passed &= run_case(1, 1, 1);
+    passed &= run_case(2, 11, 3);
+    passed &= run_case(1, 16, 2);
+    passed &= run_case(1, 17, 2);
+    passed &= run_case(1, 65, 2);
+    bool rejected = false;
+    try {
+        dscuda::mla_compressed_attention_forward_cuda(
+            nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+            1, 64, 1, 64, 32, SCALE);
+    } catch (const std::invalid_argument&) {
+        rejected = true;
+    }
+    passed &= rejected;
     return passed ? 0 : 1;
 }

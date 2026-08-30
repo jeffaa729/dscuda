@@ -37,15 +37,25 @@ class OperatorBenchmarkTests(unittest.TestCase):
         self.assertIn("500.00", report)
         self.assertEqual(len(set(map(len, report.strip().splitlines()))), 1)
         self.assertEqual([cell.strip() for cell in report.splitlines()[0].split("|")[1:-1]],
-                         ["size", "dtype", "operation", "backend", "median us"])
+                         ["size", "dtype", "operation", "backend", "median us", "reference %"])
+        self.assertEqual(row["reference_pct"], 100)
+
+    def test_percentage_matches_dtype(self):
+        rows = [dict(size=2048, dtype="fp32", operation="forward", backend=backend,
+                     reference="cuBLAS", median_ms=elapsed)
+                for backend, elapsed in (("custom", 1), ("reference", 2))]
+        rows.append(dict(rows[0], dtype="bf16"))
+        benchmark.result_table(rows)
+        self.assertEqual([r["reference_pct"] for r in rows], [200, 100, None])
 
     def test_ncu_only_reports_collected_metrics(self):
         kernel = dict(workload="M=2048,N=2048,K=2048", backend="fp32", operation="forward",
                       time_us=100, dram_read_mb=2, dram_write_mb=1, dram_pct=20, sm_pct=80,
                       occupancy_pct=50, l1_hit_pct=30, l2_hit_pct=90, registers=64,
                       static_smem_bytes=1024, dynamic_smem_bytes=0, spills=0)
-        rows = extract_ncu.totals([kernel])
+        rows = extract_ncu.totals([kernel, dict(kernel, backend="cublas_fp32", time_us=200)])
         report = extract_ncu.result_table(rows)
+        self.assertEqual([r["reference_pct"] for r in rows], [200, 100])
         self.assertIn("100.00", report)
         self.assertIn("DRAM MB", report)
         self.assertIn("SM %", report)
@@ -73,7 +83,7 @@ class OperatorBenchmarkTests(unittest.TestCase):
             report = (path / "summary.md").read_text()
             self.assertIn("100.00", report)
             self.assertNotIn("bottleneck", report)
-            self.assertNotIn("reference", report)
+            self.assertIn("reference %", report)
 
     def test_runner_hides_success_but_preserves_failures(self):
         with tempfile.TemporaryDirectory() as directory:

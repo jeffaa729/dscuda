@@ -22,6 +22,13 @@ class MlaBenchmarkTests(unittest.TestCase):
             cases = benchmark.benchmark_cases(suite)
             self.assertEqual({c.mode for c in cases}, {"prefill", "decode"})
             self.assertTrue(all((c.rank, c.rope) == (512, 64) for c in cases))
+        self.assertTrue(all((c.rank, c.rope) == (512, 64) for c in benchmark.correctness_cases()))
+
+    def test_no_legacy_shape(self):
+        for mode in ("prefill", "decode"):
+            for rank, rope in ((64, 32), (64, 16), (512, 32)):
+                with self.assertRaisesRegex(ValueError, "C=512 and RoPE=64"):
+                    benchmark.Case(mode, 1, 64, 4, rank=rank, rope=rope)
 
     def test_positive_cache_contract(self):
         with self.assertRaises(ValueError):
@@ -47,6 +54,17 @@ class MlaBenchmarkTests(unittest.TestCase):
         self.assertIn("512", report)
         self.assertIn("64", report)
         self.assertIn("500.00", report)
+        self.assertEqual(row["reference_pct"], 100)
+
+    def test_percentage_matches_decode_lengths(self):
+        case = asdict(benchmark.Case("decode", 2, 1024, 16, lengths=(1024, 768)))
+        rows = [dict(**case, operation="decode", backend="custom", median_ms=2),
+                dict(**case, operation="decode", backend="pytorch", median_ms=1)]
+        rows[1]["lengths"] = [1024, 768]  # JSON uses lists rather than tuples.
+        rows.append(dict(rows[0], lengths=(1024, 512)))
+        rows.append(dict(rows[0], splits=4))
+        benchmark.result_table(rows)
+        self.assertEqual([r["reference_pct"] for r in rows], [50, 100, None, None])
 
     def test_saved_and_printed_report_is_only_the_table(self):
         row = dict(**asdict(benchmark.Case("decode", 2, 1024, 16, lengths=(1024, 768))),
@@ -64,9 +82,10 @@ class MlaBenchmarkTests(unittest.TestCase):
             with (path / "mla.csv").open() as file:
                 fields = csv.DictReader(file).fieldnames
             self.assertEqual(set(fields), {"mode", "batch", "sequence", "heads", "rank", "rope",
-                                          "splits", "lengths", "operation", "backend", "median_ms"})
+                                          "splits", "lengths", "operation", "backend", "median_ms", "reference_pct"})
             saved = json.loads((path / "mla_samples.json").read_text())
             self.assertEqual(saved["results"][0]["samples_ms"], [1, 2, 9])
+            self.assertEqual(saved["results"][0]["reference_pct"], 100)
             self.assertEqual(saved["environment"]["flashmla"]["status"], "not_implemented")
         self.assertIn("1024,768", output.getvalue())
         self.assertIn("pytorch_unfused", output.getvalue())

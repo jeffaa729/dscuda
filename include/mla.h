@@ -7,10 +7,14 @@
 
 namespace dscuda {
 
+constexpr int MLA_KV_RANK = 512;
+constexpr int MLA_ROPE_SIZE = 64;
+
 // Implements the absorbed-query form of MLA. Query latents use [B,T,H,C],
 // query RoPE uses [B,T,H,R], shared KV latents use [B,T,C], shared key RoPE
 // uses [B,T,R], output uses [B,T,H,C], and logsumexp uses [B,H,T] (natural log).
-// The current kernels support 1 <= C <= 512 and 1 <= R <= 256.
+// One supported CUDA shape: C=512, R=64; B, T and H may vary. Forward uses
+// BF16 Tensor Cores with FP32 accumulation, including incomplete sequence tiles.
 void mla_compressed_attention_forward_cuda(
     float* output,
     float* logsumexp,

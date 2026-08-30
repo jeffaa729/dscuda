@@ -11,7 +11,7 @@ import re
 import subprocess
 from pathlib import Path
 
-from benchmark_flash_attention_runtime import table
+from benchmark_flash_attention_runtime import add_reference_percentages, format_percentage, table
 
 
 SPEED_SECTION = "GPU Speed Of Light Throughput"
@@ -19,6 +19,10 @@ MEMORY_SECTION = "Memory Workload Analysis"
 LAUNCH_SECTION = "Launch Statistics"
 OCCUPANCY_SECTION = "Occupancy"
 COMMAND_SECTION = "Command line profiler metrics"
+REFERENCE_BACKENDS = {"fp32": "cublas_fp32", "bf16": "cublas_bf16",
+                      "custom_bf16": "cublas_bf16", "custom": "official",
+                      "cublas_fp32": "cublas_fp32", "cublas_bf16": "cublas_bf16",
+                      "official": "official"}
 
 
 def arguments():
@@ -253,17 +257,18 @@ def totals(rows):
 
 
 def result_table(summary):
-    # Only report time and counters read from Nsight, not shape/runtime estimates.
+    # Percentages compare measured times; hardware metrics come only from Nsight.
+    add_reference_percentages(summary, REFERENCE_BACKENDS, ("workload", "operation"), "time_us")
     def number(value, digits=2):
         return f"{value:.{digits}f}" if math.isfinite(value) else "-"
 
     headers = ("workload", "backend", "operation", "launches", "time us", "DRAM MB",
-               "DRAM %", "SM %", "occ %", "L2 hit %", "regs", "shared KiB", "spills")
+               "DRAM %", "SM %", "occ %", "L2 hit %", "regs", "shared KiB", "spills", "reference %")
     values = [(r["workload"], r["backend"], r["operation"], r["launches"], number(r["time_us"]),
                number(r["dram_read_mb"] + r["dram_write_mb"]), number(r["dram_pct"]),
                number(r["sm_pct"]), number(r["occupancy_pct"]), number(r["l2_hit_pct"]),
                number(r["max_registers"], 0), number(r["max_smem_bytes"] / 1024),
-               number(r["spills"], 0)) for r in summary]
+               number(r["spills"], 0), format_percentage(r["reference_pct"])) for r in summary]
     return table(headers, values, set(range(3, len(headers))))
 
 
