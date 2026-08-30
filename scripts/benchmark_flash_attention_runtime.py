@@ -279,15 +279,48 @@ def table(headers, rows, numeric):
     return "\n".join([line(headers), separator, *(line(row) for row in rows)]) + "\n"
 
 
+def comparison_table(rows, keys, size, dtype, reference, *,
+                     custom_backend="custom", reference_backend="reference",
+                     time_field="median_ms", time_scale=1000.0):
+    """Pair identical workloads without changing the raw per-backend records."""
+    groups = {}
+    for row in rows:
+        backend = row["backend"]
+        if backend not in (custom_backend, reference_backend):
+            raise ValueError(f"unexpected comparison backend: {backend}")
+        key = tuple(tuple(row[k]) if isinstance(row[k], (list, tuple)) else row[k] for k in keys)
+        group = groups.setdefault(key, {})
+        if backend in group:
+            raise ValueError(f"duplicate measurement for {backend}: {key}")
+        group[backend] = row
+
+    def elapsed(row):
+        value = float(row[time_field]) * time_scale if row is not None else math.nan
+        return value if math.isfinite(value) and value > 0 else None
+
+    def number(value):
+        return "-" if value is None else f"{value:.2f}"
+
+    values = []
+    for group in groups.values():
+        row = next(iter(group.values()))
+        custom = elapsed(group.get(custom_backend))
+        baseline = elapsed(group.get(reference_backend))
+        percent = 100 * baseline / custom if custom is not None and baseline is not None else None
+        values.append((size(row), dtype(row), row["operation"],
+                       number(custom), number(baseline), format_percentage(percent)))
+    return table(("size", "dtype", "operation", "custom us", f"reference ({reference}) us",
+                  "reference %"), values, {0, 3, 4, 5})
+
+
 def result_table(rows, mode):
     add_reference_percentages(rows, "official",
                               ("batch", "sequence", "heads", "head_size", "operation", "mode"))
-    headers = ("B", "T", "H", "D", "dtype", "causal", "backend", "operation", "median us", "reference %")
-    values = [(r["batch"], r["sequence"], r["heads"], r["head_size"], "bf16", "yes",
-               r["backend"], r["operation"], f'{1000*r["median_ms"]:.2f}',
-               format_percentage(r["reference_pct"]))
-              for r in rows if r["mode"] == mode]
-    return table(headers, values, {0, 1, 2, 3, 8, 9})
+    return comparison_table(
+        [r for r in rows if r["mode"] == mode],
+        ("batch", "sequence", "heads", "head_size", "operation", "mode"),
+        lambda r: f'B={r["batch"]},T={r["sequence"]},H={r["heads"]},D={r["head_size"]}',
+        lambda r: "bf16", "FA-2", reference_backend="official")
 
 
 def write_results(directory, rows, checks, args):

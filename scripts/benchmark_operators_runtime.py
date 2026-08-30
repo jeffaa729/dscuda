@@ -12,7 +12,7 @@ import sys
 import time
 
 from benchmark_flash_attention_runtime import (
-    Captured, add_reference_percentages, format_percentage, positive, summarize, table)
+    Captured, add_reference_percentages, comparison_table, positive, summarize)
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -130,12 +130,9 @@ def measure(workload, args):
 
 def result_table(rows):
     add_reference_percentages(rows, "reference", ("size", "dtype", "operation", "reference"))
-    headers = ("size", "dtype", "operation", "backend", "median us", "reference %")
-    values = [(r["size"], r["dtype"], r["operation"],
-               r["reference"] if r["backend"] == "reference" else "custom",
-               f'{1000*r["median_ms"]:.2f}', format_percentage(r["reference_pct"]))
-              for r in rows]
-    return table(headers, values, {0, 4, 5})
+    return comparison_table(
+        rows, ("size", "dtype", "operation", "reference"),
+        lambda r: r["size"], lambda r: r["dtype"], "cuBLAS")
 
 
 def main():

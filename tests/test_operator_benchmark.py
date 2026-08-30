@@ -37,8 +37,29 @@ class OperatorBenchmarkTests(unittest.TestCase):
         self.assertIn("500.00", report)
         self.assertEqual(len(set(map(len, report.strip().splitlines()))), 1)
         self.assertEqual([cell.strip() for cell in report.splitlines()[0].split("|")[1:-1]],
-                         ["size", "dtype", "operation", "backend", "median us", "reference %"])
+                         ["size", "dtype", "operation", "custom us", "reference (cuBLAS) us", "reference %"])
         self.assertEqual(row["reference_pct"], 100)
+
+    def test_custom_and_reference_share_one_row(self):
+        rows = [dict(size=2048, dtype="fp32", operation="forward", backend=backend,
+                     reference="cuBLAS", median_ms=elapsed)
+                for backend, elapsed in (("custom", 1), ("reference", 1.07))]
+        lines = benchmark.result_table(rows).splitlines()
+        self.assertEqual(len(lines), 3)
+        self.assertEqual([cell.strip() for cell in lines[2].split("|")[1:-1]],
+                         ["2048", "fp32", "forward", "1000.00", "1070.00", "107.0"])
+
+    def test_ncu_pairs_each_precision(self):
+        rows = [dict(workload="M=2048,N=2048,K=2048", operation="forward",
+                     backend=backend, time_us=elapsed)
+                for backend, elapsed in (("cublas_fp32", 107), ("bf16", 5),
+                                         ("fp32", 100), ("cublas_bf16", 10))]
+        lines = extract_ncu.result_table(rows).splitlines()
+        self.assertEqual(len(lines), 4)
+        self.assertIn("107.0", lines[2])
+        self.assertIn("200.0", lines[3])
+        self.assertEqual([cell.strip() for cell in lines[3].split("|")[2:7]],
+                         ["bf16", "forward", "5.00", "10.00", "200.0"])
 
     def test_percentage_matches_dtype(self):
         rows = [dict(size=2048, dtype="fp32", operation="forward", backend=backend,
@@ -57,9 +78,9 @@ class OperatorBenchmarkTests(unittest.TestCase):
         report = extract_ncu.result_table(rows)
         self.assertEqual([r["reference_pct"] for r in rows], [200, 100])
         self.assertIn("100.00", report)
-        self.assertIn("DRAM MB", report)
-        self.assertIn("SM %", report)
-        for unwanted in ("TFLOP", "GB/s", "ref %", "bottleneck", "IQR"):
+        self.assertEqual(rows[0]["dram_read_mb"], 2)
+        self.assertEqual(rows[0]["sm_pct"], 80)
+        for unwanted in ("TFLOP", "GB/s", "ref %", "bottleneck", "IQR", "DRAM MB", "SM %", "backend"):
             self.assertNotIn(unwanted, report)
         self.assertEqual(len(set(map(len, report.strip().splitlines()))), 1)
         output = io.StringIO()

@@ -14,7 +14,7 @@ import sys
 import time
 
 from benchmark_flash_attention_runtime import (
-    Captured, add_reference_percentages, format_percentage, positive, summarize, table)
+    Captured, add_reference_percentages, comparison_table, positive, summarize)
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "reference/python"))
@@ -268,15 +268,17 @@ def measure(workload, operation, args):
 def result_table(rows):
     add_reference_percentages(rows, "pytorch",
                               ("mode", "batch", "sequence", "heads", "rank", "rope", "lengths", "splits", "operation"))
-    headers = ("B", "Q", "KV", "H", "C", "RoPE", "KV lengths", "dtype",
-               "operation", "backend", "median us", "reference %")
-    values = [(r["batch"], r["sequence"] if r["mode"] == "prefill" else 1,
-               r["sequence"], r["heads"], r["rank"], r["rope"],
-               ",".join(map(str, r["lengths"])) if r["mode"] == "decode" else "-", "bf16",
-               r["operation"], "pytorch_unfused" if r["backend"] == "pytorch" else r["backend"],
-               f'{r["median_ms"]*1000:.2f}', format_percentage(r["reference_pct"]))
-              for r in rows]
-    return table(headers, values, {0, 1, 2, 3, 4, 5, 10, 11})
+    def size(row):
+        query = row["sequence"] if row["mode"] == "prefill" else 1
+        shape = (f'B={row["batch"]},Q={query},KV={row["sequence"]},H={row["heads"]},'
+                 f'C={row["rank"]},RoPE={row["rope"]}')
+        if row["mode"] == "decode":
+            shape += f',lengths=({",".join(map(str, row["lengths"]))}),splits={row["splits"]}'
+        return shape
+
+    return comparison_table(
+        rows, ("mode", "batch", "sequence", "heads", "rank", "rope", "lengths", "splits", "operation"),
+        size, lambda r: "bf16", "PyTorch unfused", reference_backend="pytorch")
 
 
 def write_results(args, torch, rows, checks):

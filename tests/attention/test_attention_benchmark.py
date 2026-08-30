@@ -66,6 +66,33 @@ class BenchmarkTests(unittest.TestCase):
         self.assertEqual([r["reference_pct"] for r in rows], [50, 100, None, None])
         self.assertEqual(benchmark.format_percentage(None), "-")
 
+    def test_paired_rows_preserve_missing_sides(self):
+        rows = [dict(batch=1, sequence=128, heads=8, head_size=128, mode="graph",
+                     backend=backend, operation=operation, median_ms=time)
+                for backend, operation, time in (("official", "forward", 1),
+                                                   ("custom", "forward", 2),
+                                                   ("custom", "backward", 3))]
+        lines = benchmark.result_table(rows, "graph").splitlines()
+        self.assertEqual(len(lines), 4)
+        self.assertEqual([cell.strip() for cell in lines[2].split("|")[1:-1]],
+                         ["B=1,T=128,H=8,D=128", "bf16", "forward", "2000.00", "1000.00", "50.0"])
+        self.assertEqual([cell.strip() for cell in lines[3].split("|")[4:7]],
+                         ["3000.00", "-", "-"])
+        reference_only = benchmark.result_table(rows[:1], "graph").splitlines()[2]
+        self.assertEqual([cell.strip() for cell in reference_only.split("|")[4:7]],
+                         ["-", "1000.00", "-"])
+
+    def test_duplicate_rows_are_not_silently_paired(self):
+        row = dict(batch=1, sequence=128, heads=8, head_size=128, mode="graph",
+                   backend="custom", operation="forward", median_ms=1)
+        with self.assertRaisesRegex(ValueError, "duplicate measurement"):
+            benchmark.result_table([row, row], "graph")
+
+    def test_empty_comparison_still_has_six_columns(self):
+        lines = benchmark.result_table([], "graph").splitlines()
+        self.assertEqual(len(lines), 2)
+        self.assertEqual(len(lines[0].split("|")[1:-1]), 6)
+
     def test_invalid_durations_have_no_percentage(self):
         for invalid in (0, float("nan"), float("inf")):
             for backend in ("custom", "official"):

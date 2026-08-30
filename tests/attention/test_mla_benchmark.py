@@ -56,6 +56,17 @@ class MlaBenchmarkTests(unittest.TestCase):
         self.assertIn("500.00", report)
         self.assertEqual(row["reference_pct"], 100)
 
+    def test_paired_decode_row_keeps_input_dimensions(self):
+        case = asdict(benchmark.Case("decode", 2, 1024, 16, lengths=(1024, 768)))
+        rows = [dict(**case, operation="decode", backend=backend, median_ms=time)
+                for backend, time in (("custom", 2), ("pytorch", 1))]
+        lines = benchmark.result_table(rows).splitlines()
+        self.assertEqual(len(lines), 3)
+        cells = [cell.strip() for cell in lines[2].split("|")[1:-1]]
+        self.assertEqual(cells[1:], ["bf16", "decode", "2000.00", "1000.00", "50.0"])
+        self.assertIn("B=2,Q=1,KV=1024,H=16,C=512,RoPE=64", cells[0])
+        self.assertIn("lengths=(1024,768),splits=8", cells[0])
+
     def test_percentage_matches_decode_lengths(self):
         case = asdict(benchmark.Case("decode", 2, 1024, 16, lengths=(1024, 768)))
         rows = [dict(**case, operation="decode", backend="custom", median_ms=2),
@@ -88,7 +99,7 @@ class MlaBenchmarkTests(unittest.TestCase):
             self.assertEqual(saved["results"][0]["reference_pct"], 100)
             self.assertEqual(saved["environment"]["flashmla"]["status"], "not_implemented")
         self.assertIn("1024,768", output.getvalue())
-        self.assertIn("pytorch_unfused", output.getvalue())
+        self.assertIn("reference (PyTorch unfused) us", output.getvalue())
         self.assertTrue(all(line.startswith("|") for line in output.getvalue().splitlines()))
         for unwanted in ("IQR", "GB/s", "TFLOP", "PyTorch %", "FlashMLA:", "Results:", "PASS"):
             self.assertNotIn(unwanted, output.getvalue())

@@ -11,7 +11,7 @@ import re
 import subprocess
 from pathlib import Path
 
-from benchmark_flash_attention_runtime import add_reference_percentages, format_percentage, table
+from benchmark_flash_attention_runtime import add_reference_percentages, comparison_table
 
 
 SPEED_SECTION = "GPU Speed Of Light Throughput"
@@ -256,24 +256,44 @@ def totals(rows):
     return result
 
 
-def result_table(summary):
-    # Percentages compare measured times; hardware metrics come only from Nsight.
+def result_table(summary, family=""):
+    # The display is timing-only; collected hardware counters remain in the CSV.
     add_reference_percentages(summary, REFERENCE_BACKENDS, ("workload", "operation"), "time_us")
-    def number(value, digits=2):
-        return f"{value:.{digits}f}" if math.isfinite(value) else "-"
+    backends = {r["backend"] for r in summary}
+    if backends & {"fp32", "bf16", "custom_bf16", "cublas_fp32", "cublas_bf16"}:
+        reference = "cuBLAS"
+    elif "official" in backends or family == "flash_attention":
+        reference = "FA-2"
+    elif backends & {"pytorch", "pytorch_unfused"}:
+        reference = "PyTorch unfused"
+    elif "flashmla" in backends:
+        reference = "FlashMLA"
+    else:
+        reference = "not measured"
 
-    headers = ("workload", "backend", "operation", "launches", "time us", "DRAM MB",
-               "DRAM %", "SM %", "occ %", "L2 hit %", "regs", "shared KiB", "spills", "reference %")
-    values = [(r["workload"], r["backend"], r["operation"], r["launches"], number(r["time_us"]),
-               number(r["dram_read_mb"] + r["dram_write_mb"]), number(r["dram_pct"]),
-               number(r["sm_pct"]), number(r["occupancy_pct"]), number(r["l2_hit_pct"]),
-               number(r["max_registers"], 0), number(r["max_smem_bytes"] / 1024),
-               number(r["spills"], 0), format_percentage(r["reference_pct"])) for r in summary]
-    return table(headers, values, set(range(3, len(headers))))
+    normalized = []
+    reference_backends = {"official", "cublas_fp32", "cublas_bf16",
+                          "pytorch", "pytorch_unfused", "flashmla"}
+    for row in summary:
+        backend = row["backend"]
+        if backend in {"fp32", "cublas_fp32"}:
+            dtype = "fp32"
+        elif backend in {"bf16", "custom_bf16", "cublas_bf16", "official"} or family in {"flash_attention", "mla"}:
+            dtype = "bf16"
+        elif reference == "FA-2":
+            dtype = "bf16"
+        else:
+            dtype = row.get("dtype", "-")
+        normalized.append(dict(row, dtype=dtype,
+                               backend="reference" if backend in reference_backends else "custom"))
+    return comparison_table(
+        normalized, ("workload", "dtype", "operation"),
+        lambda r: r["workload"], lambda r: r["dtype"], reference,
+        time_field="time_us", time_scale=1.0)
 
 
-def print_totals(summary):
-    print(result_table(summary), end="")
+def print_totals(summary, family=""):
+    print(result_table(summary, family), end="")
 
 
 def write_csv(path, rows):
@@ -285,9 +305,9 @@ def write_csv(path, rows):
         writer.writerows(rows)
 
 
-def write_markdown(path, summary):
+def write_markdown(path, summary, family=""):
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(result_table(summary), encoding="utf-8")
+    path.write_text(result_table(summary, family), encoding="utf-8")
 
 
 def main():
@@ -303,11 +323,12 @@ def main():
             )
         )
     summary = totals(rows)
-    print_totals(summary)
+    family = args.csv_out.stem if args.csv_out else ""
+    print_totals(summary, family)
     if args.csv_out:
         write_csv(args.csv_out, summary)
     if args.markdown_out:
-        write_markdown(args.markdown_out, summary)
+        write_markdown(args.markdown_out, summary, family)
 
 
 if __name__ == "__main__":
