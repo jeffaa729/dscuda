@@ -132,27 +132,67 @@ def write_csv(path, rows):
 
 
 def write_markdown(path, rows):
+    headers = (
+        "B",
+        "T",
+        "H",
+        "D",
+        "backend",
+        "operation",
+        "median ms",
+        "min ms",
+        "max ms",
+        "TFLOP/s",
+        "API GB/s",
+        "official %",
+    )
+    right_aligned = {0, 1, 2, 3, 6, 7, 8, 9, 10, 11}
+    table_rows = [
+        (
+            str(row["batch"]),
+            str(row["sequence"]),
+            str(row["heads"]),
+            str(row["head_size"]),
+            row["backend"],
+            row["operation"],
+            f"{row['median_ms']:.4f}",
+            f"{row['minimum_ms']:.4f}",
+            f"{row['maximum_ms']:.4f}",
+            f"{row['tflops']:.2f}",
+            f"{row['api_gb_s']:.2f}",
+            f"{row['relative_pct']:.1f}%",
+        )
+        for row in rows
+    ]
+    widths = [
+        max(2, len(header), *(len(row[column]) for row in table_rows))
+        for column, header in enumerate(headers)
+    ]
+
+    def formatted_row(values):
+        cells = []
+        for column, (value, width) in enumerate(zip(values, widths)):
+            alignment = ">" if column in right_aligned else "<"
+            cells.append(f" {value:{alignment}{width}} ")
+        return "|" + "|".join(cells) + "|\n"
+
+    separators = (
+        "-" * (width + 1) + ":"
+        if column in right_aligned
+        else ":" + "-" * (width + 1)
+        for column, width in enumerate(widths)
+    )
+
     with path.open("w", encoding="utf-8") as destination:
         destination.write("# FlashAttention CUDA-event runtime\n\n")
         destination.write(
             "All listed shapes passed the custom-versus-official output and gradient "
             "comparison before timing. Each value is the median trial average.\n\n"
         )
-        destination.write(
-            "| B | T | H | D | backend | operation | median ms | min ms | max ms | "
-            "TFLOP/s | API GB/s | official % |\n"
-        )
-        destination.write(
-            "|---:|---:|---:|---:|---|---|---:|---:|---:|---:|---:|---:|\n"
-        )
-        for row in rows:
-            destination.write(
-                f"| {row['batch']} | {row['sequence']} | {row['heads']} | "
-                f"{row['head_size']} | {row['backend']} | {row['operation']} | "
-                f"{row['median_ms']:.4f} | {row['minimum_ms']:.4f} | "
-                f"{row['maximum_ms']:.4f} | {row['tflops']:.2f} | "
-                f"{row['api_gb_s']:.2f} | {row['relative_pct']:.1f}% |\n"
-            )
+        destination.write(formatted_row(headers))
+        destination.write("|" + "|".join(separators) + "|\n")
+        for row in table_rows:
+            destination.write(formatted_row(row))
         destination.write(
             "\n`official %` is official latency divided by backend latency; official is "
             "therefore 100%. TFLOP/s counts causal QK/PV matmuls in forward and their "

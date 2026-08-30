@@ -23,28 +23,28 @@ target_include_directories(dscuda_data PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/includ
 add_library(dscuda_kernels STATIC
     src/checkpoint.cpp
     src/generation.cpp
-    kernels/adamw.cu
-    kernels/attention.cu
-    kernels/cross_entropy.cu
-    kernels/cuda_common.cu
-    kernels/deepseek_moe.cu
-    kernels/deepseek_v3_block.cu
-    kernels/deepseek_v3_dense_block.cu
-    kernels/deepseek_v3_model.cu
-    kernels/embedding.cu
-    kernels/expert_dispatch.cu
-    kernels/flash_attention.cu
-    kernels/global_norm.cu
-    kernels/matmul.cu
-    kernels/mla.cu
-    kernels/model.cu
-    kernels/mtp.cu
-    kernels/rmsnorm.cu
-    kernels/residual.cu
-    kernels/rope.cu
-    kernels/softmax.cu
-    kernels/swiglu.cu
-    kernels/transformer_block.cu
+    kernels/attention/attention.cu
+    kernels/attention/flash_attention.cu
+    kernels/attention/mla.cu
+    kernels/attention/rope.cu
+    kernels/common/cuda_common.cu
+    kernels/elementwise/residual.cu
+    kernels/elementwise/swiglu.cu
+    kernels/embedding/embedding.cu
+    kernels/matmul/matmul.cu
+    kernels/model/deepseek_v3_block.cu
+    kernels/model/deepseek_v3_dense_block.cu
+    kernels/model/deepseek_v3_model.cu
+    kernels/model/model.cu
+    kernels/model/mtp.cu
+    kernels/model/transformer_block.cu
+    kernels/moe/deepseek_moe.cu
+    kernels/moe/expert_dispatch.cu
+    kernels/normalization/rmsnorm.cu
+    kernels/normalization/softmax.cu
+    kernels/training/adamw.cu
+    kernels/training/cross_entropy.cu
+    kernels/training/global_norm.cu
     reference/attention_cpu.cpp
     reference/cross_entropy_cpu.cpp
     reference/deepseek_moe_cpu.cpp
