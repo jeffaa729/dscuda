@@ -149,9 +149,6 @@ class Workload:
         self.custom_backward()
         for actual, previous in zip(self.gradients, first):
             self.torch.testing.assert_close(actual, previous, atol=0, rtol=0)
-        print(table(("tensor", "max abs", "RMS", "result"),
-                    [(c["tensor"], f'{c["max_abs"]:.3e}', f'{c["rms"]:.3e}', "PASS")
-                     for c in checks], {1, 2}), flush=True)
         return checks
 
 
@@ -250,29 +247,6 @@ def measure_operation(workload, operation, args):
     return rows
 
 
-def attention_flops(row):
-    pairs = row["batch"] * row["heads"] * row["sequence"] * (row["sequence"] + 1) // 2
-    return (4 if row["operation"] == "forward" else 8) * pairs * row["head_size"]
-
-
-def api_bytes(row):
-    elements = row["batch"] * row["sequence"] * row["heads"] * row["head_size"]
-    lse_bytes = 4 * row["batch"] * row["heads"] * row["sequence"]
-    return (8 if row["operation"] == "forward" else 16) * elements + lse_bytes
-
-
-def row_key(row):
-    return tuple(row[key] for key in ("batch", "sequence", "heads", "head_size", "operation", "mode"))
-
-
-def add_derived_metrics(rows):
-    official = {row_key(row): row["median_ms"] for row in rows if row["backend"] == "official"}
-    for row in rows:
-        row["tflops"] = attention_flops(row) / (row["median_ms"] * 1.0e9)
-        row["io_gb_s"] = api_bytes(row) / (row["median_ms"] * 1.0e6)
-        row["relative_pct"] = official[row_key(row)] / row["median_ms"] * 100
-
-
 def table(headers, rows, numeric):
     widths = [max(3, len(h), *(len(str(row[i])) for row in rows)) for i, h in enumerate(headers)]
     def line(values):
@@ -286,80 +260,33 @@ def table(headers, rows, numeric):
 
 
 def result_table(rows, mode):
-    headers = ("B", "T", "H", "D", "backend", "operation", "median us", "min us",
-               "max us", "IQR %", "TFLOP/s", "min IO GB/s", "official %")
-    values = [(r["batch"], r["sequence"], r["heads"], r["head_size"], r["backend"],
-               r["operation"], f'{1000*r["median_ms"]:.2f}', f'{1000*r["minimum_ms"]:.2f}',
-               f'{1000*r["maximum_ms"]:.2f}', f'{r["iqr_pct"]:.1f}',
-               f'{r["tflops"]:.2f}', f'{r["io_gb_s"]:.2f}', f'{r["relative_pct"]:.1f}%')
+    headers = ("B", "T", "H", "D", "dtype", "causal", "backend", "operation", "median us")
+    values = [(r["batch"], r["sequence"], r["heads"], r["head_size"], "bf16", "yes",
+               r["backend"], r["operation"], f'{1000*r["median_ms"]:.2f}')
               for r in rows if r["mode"] == mode]
-    return table(headers, values, set(range(4)) | set(range(6, len(headers))))
+    return table(headers, values, {0, 1, 2, 3, 8})
 
 
 def write_results(directory, rows, checks, args):
     directory.mkdir(parents=True, exist_ok=True)
-    fields = [key for key in rows[0] if key != "samples_ms"]
+    fields = ("batch", "sequence", "heads", "head_size", "mode", "backend", "operation", "median_ms")
     with (directory / "flash_attention.csv").open("w", newline="") as destination:
         writer = csv.DictWriter(destination, fieldnames=fields, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(rows)
     (directory / "flash_attention_samples.json").write_text(
         json.dumps({"settings": {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
+                    "contract": {"input_dtype": "bf16", "output_and_gradient_dtype": "bf16",
+                                 "lse_dtype": "fp32", "layout": "BTHD", "causal": True,
+                                 "dropout": 0, "softmax_scale": "1/sqrt(D)",
+                                 "backward": "overwrite, forward setup excluded",
+                                 "graph": "CUDA events, warm repeated-input graph replay",
+                                 "api": "synchronized wall time, includes Python dispatch and allocations"},
                     "correctness": checks, "measurements": rows}, indent=2) + "\n")
-    text = """# FlashAttention matched BF16 comparison
-
-Both implementations run in one process on the same GPU stream, reading the same
-contiguous BF16 Q/K/V and upstream gradient. Output and all three gradients are
-BF16; log-sum-exp and accumulation are FP32. Both overwrite gradient outputs.
-Attention is causal MHA with D=128, scale=1/sqrt(D), dropout=0, no ALiBi/window/softcap.
-Output, LSE, gradients, overwrite behavior and replay outputs are checked before
-accepting timings. Backward-only measurements exclude forward setup.
-
-## Primary: CUDA Graph GPU operator time
-
-Graphs capture repeated full forward or backward operations, including all kernels
-and GPU scratch-buffer work required by each implementation. Replay reuses captured
-allocations; capture, per-operation Python dispatch and host allocations are outside
-timing. The remaining graph-replay launch overhead is amortized across captured operations.
-No cast or gradient-zeroing kernels are silently excluded. These are warm, repeated-input
-operator measurements, not cold-cache inference or end-to-end training throughput.
-
-"""
-    text += result_table(rows, "graph")
-    text += """
-## Secondary: Python API wall time
-
-This is synchronized wall time per call averaged over a loop: custom ctypes bridge
-with caller-owned buffers versus official flash_attn_func / torch.autograd.grad.
-It includes Python, allocation bookkeeping and dispatch; it is NOT a CUDA kernel
-speedup. Forward disables autograd recording but still computes O and LSE. Backward
-uses a previously built autograd graph. Buffer-ownership differences are intentional
-in this API-level table and absent as repeated host costs during graph replay.
-
-"""
-    text += result_table(rows, "api")
-    text += """
-Each value is the median of alternating custom/official trials. IQR is the
-interquartile range divided by the median; graph rows above 10% are flagged as
-unstable and should not be used for performance claims. Raw samples and correctness
-errors are saved in flash_attention_samples.json.
-
-"official %" means official latency / backend latency * 100 within the SAME timing
-mode and shape. TFLOP/s counts useful causal matmul work (4 per pair in forward,
-8 in backward); recomputation and softmax are excluded from that FLOP count.
-"min IO GB/s" uses the same minimum tensor-byte count for both backends. It is NOT
-measured DRAM bandwidth, peak-memory usage or hardware utilization.
-"""
-    unstable = [r for r in rows if r["mode"] == "graph" and r["iqr_pct"] > 10]
-    if unstable:
-        warning = "WARNING: Unstable graph rows (IQR > 10%; do not use for performance claims): " + ", ".join(
-            f'{r["backend"]}/{r["operation"]}/B{r["batch"]}T{r["sequence"]}H{r["heads"]}'
-            for r in unstable)
-        text += "\n" + warning + "\n"
-        print(warning, flush=True)
-    (directory / "flash_attention.md").write_text(text)
-    print("\nCUDA Graph GPU operator time\n" + result_table(rows, "graph"), flush=True)
-    print("Python API wall time\n" + result_table(rows, "api"), flush=True)
+    report = ("CUDA Graph GPU time\n\n" + result_table(rows, "graph")
+              + "\nPython API wall time\n\n" + result_table(rows, "api"))
+    (directory / "flash_attention.md").write_text(report)
+    print(report, end="", flush=True)
 
 
 def write_environment(directory, args, torch):
@@ -401,24 +328,19 @@ def main():
     if not torch.cuda.is_available():
         raise SystemExit("CUDA is required")
     library = load_library(args.library)
-    print(f"GPU: {torch.cuda.get_device_name()}; matched BF16 IO, D128, causal", flush=True)
     rows, checks = [], []
     stream = torch.cuda.Stream()
     for shape in benchmark_cases(args.suite):
-        print(f"\nChecking B={shape[0]}, T={shape[1]}, H={shape[2]}, D={shape[3]}", flush=True)
         with torch.cuda.stream(stream):
             workload = Workload(torch, library, shape)
             checks.append({"shape": shape, "errors": workload.check()})
             for operation in ("forward", "backward"):
-                print(f"Capturing and measuring {operation}", flush=True)
                 rows.extend(measure_operation(workload, operation, args))
         stream.synchronize()
         del workload
         gc.collect()
-    add_derived_metrics(rows)
     write_results(args.output_dir, rows, checks, args)
     write_environment(args.output_dir, args, torch)
-    print(f"\nReport: {args.output_dir / 'flash_attention.md'}", flush=True)
 
 
 if __name__ == "__main__":

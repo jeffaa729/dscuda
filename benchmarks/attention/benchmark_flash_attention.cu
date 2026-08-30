@@ -243,14 +243,13 @@ int main(int argc, char** argv) {
             head_size,
             operation);
         if (timing.enabled) {
-            std::printf("Native C++ eager timing only; use scripts/benchmark.sh for matched graph comparisons.\n");
             const TimingResult result = measure_gpu(
                 run_selected,
                 timing.warmup,
                 timing.iterations,
                 timing.trials);
             std::printf(
-                "DSCUDA_TIMING {\"backend\":\"custom\","
+                "DSCUDA_TIMING {\"backend\":\"custom\",\"mode\":\"native_eager\","
                 "\"operation\":\"%s\",\"batch\":%d,\"sequence\":%d,"
                 "\"heads\":%d,\"head_size\":%d,\"warmup\":%d,"
                 "\"iterations\":%d,\"trials\":%d,"

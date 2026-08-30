@@ -1,5 +1,5 @@
 // Runs the selected BF16 compressed-MLA forward and backward kernels for external Nsight Compute measurement.
-// The profiled region contains causal Tensor Core forward plus both backward ownership kernels so the report exposes end-to-end time, traffic, occupancy, registers, and spills.
+// The profiled region contains causal forward plus both backward ownership kernels so the report exposes end-to-end time, traffic, occupancy, registers, and spills.
 
 #include "cuda_common.h"
 #include "mla.h"
@@ -15,11 +15,11 @@
 
 int main(int argc, char** argv) {
     try {
-        const int batch_size = argc > 1 ? std::atoi(argv[1]) : 2;
-        const int sequence_length = argc > 2 ? std::atoi(argv[2]) : 256;
-        const int heads = argc > 3 ? std::atoi(argv[3]) : 4;
-        const int kv_rank = argc > 4 ? std::atoi(argv[4]) : 64;
-        const int rope_size = argc > 5 ? std::atoi(argv[5]) : 32;
+        const int batch_size = argc > 1 ? std::atoi(argv[1]) : 1;
+        const int sequence_length = argc > 2 ? std::atoi(argv[2]) : 128;
+        const int heads = argc > 3 ? std::atoi(argv[3]) : 8;
+        const int kv_rank = argc > 4 ? std::atoi(argv[4]) : 512;
+        const int rope_size = argc > 5 ? std::atoi(argv[5]) : 64;
         const float scale =
             1.0F / std::sqrt(static_cast<float>(kv_rank + rope_size));
         const std::size_t query_elements =
@@ -88,18 +88,6 @@ int main(int argc, char** argv) {
             output_gradient, host_output_gradient.data(),
             query_elements * sizeof(float), cudaMemcpyHostToDevice));
 
-        auto zero_gradients = [&]() {
-            CUDA_CHECK(cudaMemset(
-                query_gradient, 0, query_elements * sizeof(float)));
-            CUDA_CHECK(cudaMemset(
-                query_rope_gradient, 0,
-                query_rope_elements * sizeof(float)));
-            CUDA_CHECK(cudaMemset(
-                kv_gradient, 0, kv_elements * sizeof(float)));
-            CUDA_CHECK(cudaMemset(
-                key_rope_gradient, 0,
-                key_rope_elements * sizeof(float)));
-        };
         auto run = [&]() {
             dscuda::mla_compressed_attention_forward_cuda(
                 output, logsumexp, query, query_rope, kv, key_rope,
@@ -109,13 +97,10 @@ int main(int argc, char** argv) {
                 query_gradient, query_rope_gradient, kv_gradient,
                 key_rope_gradient, output_gradient, output, logsumexp, query,
                 query_rope, kv, key_rope, batch_size, sequence_length, heads,
-                kv_rank, rope_size, scale);
+                kv_rank, rope_size, scale, false);
         };
 
-        zero_gradients();
         run();
-        dscuda::synchronize();
-        zero_gradients();
         dscuda::synchronize();
 
         std::printf(

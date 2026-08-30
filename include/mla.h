@@ -9,7 +9,8 @@ namespace dscuda {
 
 // Implements the absorbed-query form of MLA. Query latents use [B,T,H,C],
 // query RoPE uses [B,T,H,R], shared KV latents use [B,T,C], shared key RoPE
-// uses [B,T,R], output uses [B,T,H,C], and logsumexp uses [B,H,T].
+// uses [B,T,R], output uses [B,T,H,C], and logsumexp uses [B,H,T] (natural log).
+// The current kernels support 1 <= C <= 512 and 1 <= R <= 256.
 void mla_compressed_attention_forward_cuda(
     float* output,
     float* logsumexp,
@@ -26,7 +27,8 @@ void mla_compressed_attention_forward_cuda(
     cudaStream_t stream = nullptr);
 
 // Recomputes causal probabilities from the saved logsumexp. Every gradient
-// element has one writer, and all four FP32 gradient buffers are accumulated.
+// element has one writer. Set accumulate=false to overwrite all four FP32
+// gradient buffers without clearing them before every benchmark replay.
 void mla_compressed_attention_backward_cuda(
     float* query_latent_gradient,
     float* query_rope_gradient,
@@ -45,6 +47,7 @@ void mla_compressed_attention_backward_cuda(
     int kv_rank,
     int rope_size,
     float scale,
+    bool accumulate = true,
     cudaStream_t stream = nullptr);
 
 // Returns the FP32 workspace for split maxima, normalizers, and unnormalized
@@ -57,6 +60,7 @@ std::size_t mla_decode_workspace_elements(
 
 // Decodes one query per batch from a BF16 compressed KV cache. Independent
 // split CTAs produce online-softmax states, then one combine CTA merges them.
+// Cache lengths must be in [1, maximum_sequence_length]; splits must be positive.
 void mla_decode_forward_cuda(
     float* output,
     float* logsumexp,

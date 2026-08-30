@@ -41,6 +41,8 @@ __device__ __forceinline__ float block_reduce_sum(float value) {
     if (warp == 0) {
         value = warp_reduce_sum<BLOCK_SIZE / WARP_SIZE>(value);
     }
+    // All warps must finish reading scratch before the next reduction reuses it.
+    __syncthreads();
     return value;
 }
 
@@ -581,7 +583,8 @@ __global__ void mla_query_backward_kernel(
     int heads,
     int kv_rank,
     int rope_size,
-    float scale) {
+    float scale,
+    bool accumulate) {
     __shared__ float delta;
     __shared__ float score_gradient;
 
@@ -657,10 +660,12 @@ __global__ void mla_query_backward_kernel(
     for (int column = threadIdx.x, slot = 0;
          column < kv_rank;
          column += BLOCK_SIZE, ++slot) {
-        query_latent_gradient[query_base + column] += latent_update[slot];
+        query_latent_gradient[query_base + column] =
+            (accumulate ? query_latent_gradient[query_base + column] : 0.0F) + latent_update[slot];
     }
     if (threadIdx.x < rope_size) {
-        query_rope_gradient[query_rope_base + threadIdx.x] += rope_update;
+        query_rope_gradient[query_rope_base + threadIdx.x] =
+            (accumulate ? query_rope_gradient[query_rope_base + threadIdx.x] : 0.0F) + rope_update;
     }
 }
 
@@ -678,7 +683,8 @@ __global__ void mla_kv_backward_kernel(
     int heads,
     int kv_rank,
     int rope_size,
-    float scale) {
+    float scale,
+    bool accumulate) {
     __shared__ float delta;
     __shared__ float score_gradient;
     __shared__ float probability;
@@ -758,10 +764,12 @@ __global__ void mla_kv_backward_kernel(
     for (int column = threadIdx.x, slot = 0;
          column < kv_rank;
          column += BLOCK_SIZE, ++slot) {
-        kv_latent_gradient[kv_base + column] += latent_update[slot];
+        kv_latent_gradient[kv_base + column] =
+            (accumulate ? kv_latent_gradient[kv_base + column] : 0.0F) + latent_update[slot];
     }
     if (threadIdx.x < rope_size) {
-        key_rope_gradient[key_rope_base + threadIdx.x] += rope_update;
+        key_rope_gradient[key_rope_base + threadIdx.x] =
+            (accumulate ? key_rope_gradient[key_rope_base + threadIdx.x] : 0.0F) + rope_update;
     }
 }
 
@@ -964,6 +972,7 @@ void mla_compressed_attention_backward_cuda(
     int kv_rank,
     int rope_size,
     float scale,
+    bool accumulate,
     cudaStream_t stream) {
     const dim3 query_grid(sequence_length, heads, batch_size);
     mla_query_backward_kernel<<<query_grid, BLOCK_SIZE, 0, stream>>>(
@@ -980,7 +989,8 @@ void mla_compressed_attention_backward_cuda(
         heads,
         kv_rank,
         rope_size,
-        scale);
+        scale,
+        accumulate);
     CUDA_CHECK(cudaGetLastError());
 
     const dim3 kv_grid(sequence_length, batch_size);
@@ -998,7 +1008,8 @@ void mla_compressed_attention_backward_cuda(
         heads,
         kv_rank,
         rope_size,
-        scale);
+        scale,
+        accumulate);
     CUDA_CHECK(cudaGetLastError());
 }
 

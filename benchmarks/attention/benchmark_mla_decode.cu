@@ -15,12 +15,12 @@
 
 int main(int argc, char** argv) {
     try {
-        const int batch_size = argc > 1 ? std::atoi(argv[1]) : 1;
-        const int context_length = argc > 2 ? std::atoi(argv[2]) : 512;
-        const int heads = argc > 3 ? std::atoi(argv[3]) : 4;
-        const int kv_rank = argc > 4 ? std::atoi(argv[4]) : 64;
-        const int rope_size = argc > 5 ? std::atoi(argv[5]) : 32;
-        const int splits = argc > 6 ? std::atoi(argv[6]) : 4;
+        const int batch_size = argc > 1 ? std::atoi(argv[1]) : 2;
+        const int context_length = argc > 2 ? std::atoi(argv[2]) : 1024;
+        const int heads = argc > 3 ? std::atoi(argv[3]) : 16;
+        const int kv_rank = argc > 4 ? std::atoi(argv[4]) : 512;
+        const int rope_size = argc > 5 ? std::atoi(argv[5]) : 64;
+        const int splits = argc > 6 ? std::atoi(argv[6]) : 8;
         const float scale =
             1.0F / std::sqrt(static_cast<float>(kv_rank + rope_size));
         const std::size_t query_elements =

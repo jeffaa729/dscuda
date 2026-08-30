@@ -171,8 +171,7 @@ def main():
     print(
         "Official FlashAttention workload: "
         f"B={args.batch} T={args.sequence} H={args.heads} "
-        f"D={args.head_size} operation={args.operation} "
-        f"torch={torch.__version__}"
+        f"D={args.head_size} operation={args.operation}"
     )
     if timing_result is not None:
         print("DSCUDA_TIMING " + json.dumps(timing_result, sort_keys=True))

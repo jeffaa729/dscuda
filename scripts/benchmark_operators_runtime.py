@@ -66,10 +66,6 @@ class Workload:
             self.transpose_left = operation == "right_backward"
             self.transpose_right = operation == "left_backward"
             self.initial = (torch.zeros((size, size), device="cuda", dtype=torch.float32),)
-            self.flops = 2 * size**3
-            self.minimum_bytes = 2 * size**2 * self.left.element_size() + 4 * size**2
-            if operation != "forward":
-                self.minimum_bytes += 4 * size**2
         else:
             self.gradient = torch.randn(size, device="cuda") * 0.01
             self.initial = (torch.randn_like(self.gradient),
@@ -78,8 +74,6 @@ class Workload:
             # Quantize scalar constants to FP32 on both sides, including beta.
             self.config = tuple(ctypes.c_float(v).value for v in (3e-4, .9, .95, 1e-8, .1))
             self.step = 100
-            self.flops = 0
-            self.minimum_bytes = 7 * 4 * size  # read p,m,v,g; write p,m,v
         self.buffers = {name: tuple(t.clone() for t in self.initial) for name in BACKENDS}
 
     def reset(self, name):
@@ -146,29 +140,21 @@ def measure(workload, args):
             samples[name].append(start.elapsed_time(stop) /
                                  (args.graph_replays * args.graph_operations))
     postcheck = workload.check(graphs)
-    reference_ms = summarize(samples["reference"])["median_ms"]
     rows = []
     for name in BACKENDS:
         summary = summarize(samples[name])
-        duration = summary["median_ms"]
         rows.append(dict(size=workload.size, dtype=workload.dtype, operation=workload.operation,
-                         backend=name, reference=workload.reference, **summary,
-                         reference_pct=100 * reference_ms / duration,
-                         tflops=workload.flops / (duration * 1e9),
-                         min_io_gb_s=workload.minimum_bytes / (duration * 1e6)))
+                         backend=name, reference=workload.reference, **summary))
     return rows, dict(before=precheck, graph=graph_check, after=postcheck)
 
 
 def result_table(rows):
-    headers = ("size", "dtype", "operation", "backend", "median us", "IQR %",
-               "TFLOP/s", "min IO GB/s", "reference %")
+    headers = ("size", "dtype", "operation", "backend", "median us")
     values = [(r["size"], r["dtype"], r["operation"],
                r["reference"] if r["backend"] == "reference" else "custom",
-               f'{1000*r["median_ms"]:.2f}', f'{r["iqr_pct"]:.1f}',
-               f'{r["tflops"]:.2f}' if r["tflops"] else "-",
-               f'{r["min_io_gb_s"]:.2f}', f'{r["reference_pct"]:.1f}')
+               f'{1000*r["median_ms"]:.2f}')
               for r in rows]
-    return table(headers, values, {0, 4, 5, 6, 7, 8})
+    return table(headers, values, {0, 4})
 
 
 def main():
@@ -204,7 +190,6 @@ def main():
                     results, errors = measure(workload, args)
                     rows.extend(results)
                 checks.append(dict(size=size, dtype=dtype, operation=operation, errors=errors))
-                print(f"{args.family} size={size} {dtype} {operation}: PASS", flush=True)
                 del workload
             stream.synchronize()
     finally:
@@ -212,22 +197,21 @@ def main():
     if args.check_only:
         return
     report = result_table(rows)
-    print("\nCUDA Graph GPU time per operation\n" + report)
+    print(report, end="", flush=True)
     note = ("FP32 disables TF32; BF16 inputs accumulate and output FP32. "
             "Backward GEMMs accumulate FP32 gradients." if args.family == "matmul" else
             "FP32 fixed-step AdamW update (step=100), versus unfused PyTorch equations, "
             "not torch.optim.AdamW(fused=True). Both replay the same fixed bias correction; "
             "state is reset outside timing. This is not an optimizer training trajectory.")
     note += ("\nWarm-cache CUDA Graph measurements; allocations, state resets, and graph construction "
-             "are excluded. min IO GB/s is a compulsory-buffer-traffic estimate, not measured DRAM bandwidth. "
-             "IQR above 10% indicates noisy samples.\n")
+             "are excluded.\n")
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    fields = [key for key in rows[0] if key != "samples_ms"]
+    fields = ("size", "dtype", "operation", "backend", "reference", "median_ms")
     with (args.output_dir / f"{args.family}.csv").open("w", newline="") as file:
         writer = csv.DictWriter(file, fieldnames=fields, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(rows)
-    (args.output_dir / f"{args.family}.md").write_text(report + "\n" + note)
+    (args.output_dir / f"{args.family}.md").write_text(report)
     metadata = dict(gpu=torch.cuda.get_device_name(), torch=torch.__version__,
                     cublas=cublas_version,
                     cuda=torch.version.cuda, python=sys.version, contract=note,
@@ -240,7 +224,6 @@ def main():
                     controls={k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()})
     (args.output_dir / f"{args.family}_samples.json").write_text(
         json.dumps(dict(environment=metadata, checks=checks, results=rows), indent=2) + "\n")
-    print(note)
 
 
 if __name__ == "__main__":

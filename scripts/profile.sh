@@ -103,9 +103,18 @@ case "$family" in
         ;;
 esac
 
-CUDACXX="$nvcc_bin" DSCUDA_CUDA_ARCH="$cuda_arch" \
-    bash "$repo_root/scripts/build.sh" "${build_targets[@]}"
-ctest --test-dir "$build_dir" --output-on-failure -R "$test_regex"
+mkdir -p "$build_dir"
+if ! CUDACXX="$nvcc_bin" DSCUDA_CUDA_ARCH="$cuda_arch" \
+        bash "$repo_root/scripts/build.sh" "${build_targets[@]}" \
+        >"$build_dir/${family}_build.log" 2>&1; then
+    cat "$build_dir/${family}_build.log" >&2
+    exit 1
+fi
+if ! ctest --test-dir "$build_dir" --output-on-failure -R "$test_regex" \
+        >"$build_dir/${family}_tests.log" 2>&1; then
+    cat "$build_dir/${family}_tests.log" >&2
+    exit 1
+fi
 
 mkdir -p "$report_dir" "$result_dir"
 report_arguments=()
@@ -144,7 +153,6 @@ profile_case() {
     local metrics_report="$report_dir/${family}_${stem}_metrics.ncu-rep"
 
     if [[ "$run_mode" == "profile" ]]; then
-        printf 'Profiling %s\n' "$label"
         if ! "$ncu_bin" \
             --profile-from-start off \
             --cache-control none \
@@ -172,7 +180,6 @@ profile_case() {
             return 1
         fi
     else
-        printf 'Extracting %s\n' "$label"
         [[ -f "$speed_report" && -f "$metrics_report" ]] || {
             echo "missing report pair for $label" >&2
             exit 1
@@ -231,7 +238,7 @@ profile_flash_attention() {
         echo "PyTorch and the official flash-attn package are required" >&2
         exit 1
     else
-        echo "Official flash-attn is not installed; profiling the custom kernel only."
+        echo "Official flash-attn is not installed; profiling the custom kernel only." >&2
     fi
 
     local case_spec batch sequence heads dimension operation shape stem
@@ -250,9 +257,13 @@ profile_flash_attention() {
             "$python_bin" "$repo_root/reference/python/flash_attention_official.py" \
                 "$batch" "$sequence" "$heads" "$dimension" all \
                 "$official_dump" >/dev/null
-            "$python_bin" "$repo_root/scripts/compare_attention_dumps.py" \
+            if ! "$python_bin" "$repo_root/scripts/compare_attention_dumps.py" \
                 "$custom_dump" "$official_dump" \
-                "$batch" "$sequence" "$heads" "$dimension"
+                "$batch" "$sequence" "$heads" "$dimension" \
+                >"$build_dir/flash_attention_comparison.log" 2>&1; then
+                cat "$build_dir/flash_attention_comparison.log" >&2
+                exit 1
+            fi
             rm -f -- "$custom_dump" "$official_dump"
         fi
 
@@ -275,19 +286,19 @@ profile_flash_attention() {
 }
 
 profile_mla() {
-    local sequences=(256)
+    local sequences=(128)
     [[ "$suite" != "quick" ]] && sequences=(128 256 512)
     local sequence
     for sequence in "${sequences[@]}"; do
         profile_case \
-            "B=2,T=${sequence},H=4,D=64,R=32/custom/forward_backward" \
+            "B=1,T=${sequence},H=8,D=512,R=64/custom/forward_backward" \
             "T${sequence}_forward_backward" \
             'regex:mla_(forward_tensor_core|forward|query_backward|kv_backward)_kernel' \
-            "$build_dir/benchmark_mla" 2 "$sequence" 4 64 32
+            "$build_dir/benchmark_mla" 1 "$sequence" 8 512 64
         profile_case \
-            "B=1,KV=${sequence},H=4,D=64,R=32/custom/decode" \
+            "B=2,KV=${sequence},H=16,D=512,R=64/custom/decode" \
             "KV${sequence}_decode" 'regex:mla_decode_(split|combine)_kernel' \
-            "$build_dir/benchmark_mla_decode" 1 "$sequence" 4 64 32 4
+            "$build_dir/benchmark_mla_decode" 2 "$sequence" 16 512 64 8
     done
 }
 
@@ -335,6 +346,3 @@ esac
     --markdown-out "$result_dir/${family}.md" \
     "$ncu_bin" "${report_arguments[@]}"
 "$python_bin" "$repo_root/scripts/update_benchmark_summary.py" "$result_dir"
-printf '\nRaw reports: %s/%s_*\n' "$report_dir" "$family"
-printf 'Tables: %s/%s.csv and %s/%s.md\n' \
-    "$result_dir" "$family" "$result_dir" "$family"

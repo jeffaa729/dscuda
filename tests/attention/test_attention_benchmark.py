@@ -1,8 +1,14 @@
-"""CPU-only regression tests for the comparison's shape, metric and report contract."""
+"""CPU-only regression tests for comparison shapes, timing and concise reports."""
 
 import argparse
+from contextlib import redirect_stdout
+import csv
+import io
+import json
 from pathlib import Path
 import sys
+import tempfile
+from types import SimpleNamespace
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
@@ -35,21 +41,36 @@ class BenchmarkTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 benchmark.summarize(samples)
 
-    def test_modes_never_share_a_reference_time(self):
+    def test_timing_modes_remain_separate(self):
         rows = []
         for mode, custom, official in (("graph", 2.0, 1.0), ("api", 3.0, 6.0)):
             for name, elapsed in (("custom", custom), ("official", official)):
                 rows.append(dict(batch=1, sequence=512, heads=8, head_size=128,
                                  mode=mode, backend=name, operation="forward", median_ms=elapsed))
-        benchmark.add_derived_metrics(rows)
-        self.assertEqual([r["relative_pct"] for r in rows], [50.0, 100.0, 200.0, 100.0])
-        self.assertEqual(benchmark.api_bytes(rows[0]), benchmark.api_bytes(rows[1]))
+        graph = benchmark.result_table(rows, "graph")
+        api = benchmark.result_table(rows, "api")
+        self.assertIn("2000.00", graph)
+        self.assertNotIn("6000.00", graph)
+        self.assertIn("6000.00", api)
+        self.assertNotIn("2000.00", api)
 
-    def test_bf16_io_byte_counts_include_lse(self):
-        row = dict(batch=1, sequence=512, heads=8, head_size=128, operation="forward")
-        self.assertEqual(benchmark.api_bytes(row), 8 * 524288 + 4 * 4096)
-        row["operation"] = "backward"
-        self.assertEqual(benchmark.api_bytes(row), 16 * 524288 + 4 * 4096)
+    def test_reports_show_only_parameters_and_time(self):
+        rows = [dict(batch=1, sequence=512, heads=8, head_size=128, mode=mode,
+                     backend="custom", operation="forward", **benchmark.summarize([1, 2, 9]))
+                for mode in ("graph", "api")]
+        output = io.StringIO()
+        with tempfile.TemporaryDirectory() as directory, redirect_stdout(output):
+            path = Path(directory)
+            benchmark.write_results(path, rows, [], SimpleNamespace())
+            self.assertEqual(output.getvalue(), (path / "flash_attention.md").read_text())
+            with (path / "flash_attention.csv").open() as file:
+                fields = csv.DictReader(file).fieldnames
+            self.assertEqual(set(fields), {"batch", "sequence", "heads", "head_size", "mode",
+                                          "backend", "operation", "median_ms"})
+            saved = json.loads((path / "flash_attention_samples.json").read_text())
+            self.assertEqual(saved["measurements"][0]["samples_ms"], [1, 2, 9])
+        for unwanted in ("IQR", "GB/s", "TFLOP", "official %", "WARNING", "Report:", "PASS"):
+            self.assertNotIn(unwanted, output.getvalue())
 
     def test_table_columns_remain_aligned(self):
         table = benchmark.table(("backend", "median us"),

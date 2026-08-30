@@ -101,12 +101,29 @@ add_library(dscuda_flash_attention_bench SHARED benchmarks/bindings/flash_attent
 target_link_libraries(dscuda_flash_attention_bench PRIVATE dscuda_kernels)
 add_library(dscuda_operator_bench SHARED benchmarks/bindings/operators_bridge.cu)
 target_link_libraries(dscuda_operator_bench PRIVATE dscuda_kernels CUDA::cublas)
+add_library(dscuda_mla_bench SHARED benchmarks/bindings/mla_bridge.cu)
+target_link_libraries(dscuda_mla_bench PRIVATE dscuda_kernels)
 
 if(Python3_Interpreter_FOUND)
+    add_test(NAME mla_benchmark_python
+        COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/attention/test_mla_benchmark.py)
     add_test(NAME operator_benchmark_python
         COMMAND ${Python3_EXECUTABLE}
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_operator_benchmark.py)
     add_test(NAME attention_benchmark_python
         COMMAND ${Python3_EXECUTABLE}
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/attention/test_attention_benchmark.py)
+endif()
+
+# Optional PyTorch checks use the uv environment, not the system Python.
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/.venv/bin/python")
+    add_test(NAME mla_reference_python
+        COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/.venv/bin/python
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/attention/test_mla_reference.py)
+    add_test(NAME mla_pytorch_cuda
+        COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/.venv/bin/python
+        ${CMAKE_CURRENT_SOURCE_DIR}/scripts/benchmark_mla_runtime.py
+        --library $<TARGET_FILE:dscuda_mla_bench> --check-only)
+    set_tests_properties(mla_pytorch_cuda PROPERTIES LABELS "attention" RESOURCE_LOCK gpu)
 endif()
