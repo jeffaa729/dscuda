@@ -1,5 +1,5 @@
-// Implements dense linear projections with native FP32 CUDA Core and BF16 Tensor Core matrix multiplication.
-// Compile-time transpose modes reuse both kernels for the forward pass and the two analytical gradients.
+// Implements generic row-major GEMM with native FP32 CUDA Core and BF16 Tensor Core kernels.
+// Compile-time transpose and accumulation modes share the same tiled implementations.
 
 #include "cuda_common.h"
 #include "matmul.h"
@@ -84,6 +84,9 @@ __device__ __forceinline__ float4 load_float4(
     if (width > 2) {
         value.z = input[index + 2];
     }
+    if (width > 3) {
+        value.w = input[index + 3];
+    }
     return value;
 }
 
@@ -106,10 +109,7 @@ __global__ void matmul_kernel(
     int inner_size,
     int left_stride,
     int right_stride,
-    int output_stride,
-    int left_batch_stride,
-    int right_batch_stride,
-    int output_batch_stride) {
+    int output_stride) {
     constexpr int kWarpsPerRow = kBN / kWN;
     constexpr int kNumThreads = (kBM / kWM) * (kBN / kWN) * 32;
     constexpr int kLeftLoads = (kBM * BK / VECTOR_WIDTH) / kNumThreads;
@@ -127,10 +127,6 @@ __global__ void matmul_kernel(
     // shared_right[stage][inner][column].
     __shared__ float shared_left[2 * BK * kBM];
     __shared__ float shared_right[2 * BK * kBN];
-
-    left += blockIdx.z * left_batch_stride;
-    right += blockIdx.z * right_batch_stride;
-    output += blockIdx.z * output_batch_stride;
 
     const int tid = threadIdx.x;
     const int warp_id = tid / 32;
@@ -461,6 +457,13 @@ __global__ void matmul_kernel(
                         output[index + 2] += value.z;
                     } else {
                         output[index + 2] = value.z;
+                    }
+                }
+                if (width > 3) {
+                    if constexpr (kAccumulate) {
+                        output[index + 3] += value.w;
+                    } else {
+                        output[index + 3] = value.w;
                     }
                 }
             }
@@ -1084,16 +1087,11 @@ void launch_matmul_config(
     int left_stride,
     int right_stride,
     int output_stride,
-    cudaStream_t stream,
-    int batch_count = 1,
-    int left_batch_stride = 0,
-    int right_batch_stride = 0,
-    int output_batch_stride = 0) {
+    cudaStream_t stream) {
     constexpr int kNumThreads = (kBM / kWM) * (kBN / kWN) * 32;
     const dim3 blocks(
         (output_columns + kBN - 1) / kBN,
-        (output_rows + kBM - 1) / kBM,
-        batch_count);
+        (output_rows + kBM - 1) / kBM);
     matmul_kernel<
         kBM,
         kBN,
@@ -1113,10 +1111,7 @@ void launch_matmul_config(
             inner_size,
             left_stride,
             right_stride,
-            output_stride,
-            left_batch_stride,
-            right_batch_stride,
-            output_batch_stride);
+            output_stride);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -1131,11 +1126,7 @@ void launch_matmul(
     int left_stride,
     int right_stride,
     int output_stride,
-    cudaStream_t stream,
-    int batch_count = 1,
-    int left_batch_stride = 0,
-    int right_batch_stride = 0,
-    int output_batch_stride = 0) {
+    cudaStream_t stream) {
     // A 512x512 GEMM has only sixteen 128x128 blocks, so use the smaller
     // configuration to keep every SM supplied with multiple warps.
     if (output_rows <= 512 && output_columns <= 512) {
@@ -1158,11 +1149,7 @@ void launch_matmul(
             left_stride,
             right_stride,
             output_stride,
-            stream,
-            batch_count,
-            left_batch_stride,
-            right_batch_stride,
-            output_batch_stride);
+            stream);
     } else {
         launch_matmul_config<
             BM,
@@ -1183,11 +1170,7 @@ void launch_matmul(
             left_stride,
             right_stride,
             output_stride,
-            stream,
-            batch_count,
-            left_batch_stride,
-            right_batch_stride,
-            output_batch_stride);
+            stream);
     }
 }
 
@@ -1321,17 +1304,13 @@ void launch_tensor_core_matmul(
 
 }  // namespace
 
-void matmul_fp32_strided_batched_cuda(
+void gemm_fp32_cuda(
     float* output,
     const float* left,
     const float* right,
     int M,
     int N,
     int K,
-    int batch_count,
-    int left_batch_stride,
-    int right_batch_stride,
-    int output_batch_stride,
     bool transpose_left,
     bool transpose_right,
     bool accumulate,
@@ -1339,103 +1318,38 @@ void matmul_fp32_strided_batched_cuda(
     const int left_stride = transpose_left ? M : K;
     const int right_stride = transpose_right ? K : N;
 
-#define LAUNCH_FP32_BATCHED(TL, TR, ACC)                                        \
-    launch_matmul<TL, TR, ACC>(                                                \
-        output,                                                               \
-        left,                                                                 \
-        right,                                                                \
-        M,                                                                    \
-        N,                                                                    \
-        K,                                                                    \
-        left_stride,                                                          \
-        right_stride,                                                         \
-        N,                                                                    \
-        stream,                                                               \
-        batch_count,                                                          \
-        left_batch_stride,                                                    \
-        right_batch_stride,                                                   \
-        output_batch_stride)
+#define LAUNCH_FP32(TL, TR, ACC)                                              \
+    launch_matmul<TL, TR, ACC>(                                              \
+        output, left, right, M, N, K, left_stride, right_stride, N, stream)
 
     if (transpose_left) {
         if (transpose_right) {
             if (accumulate) {
-                LAUNCH_FP32_BATCHED(true, true, true);
+                LAUNCH_FP32(true, true, true);
             } else {
-                LAUNCH_FP32_BATCHED(true, true, false);
+                LAUNCH_FP32(true, true, false);
             }
         } else if (accumulate) {
-            LAUNCH_FP32_BATCHED(true, false, true);
+            LAUNCH_FP32(true, false, true);
         } else {
-            LAUNCH_FP32_BATCHED(true, false, false);
+            LAUNCH_FP32(true, false, false);
         }
     } else if (transpose_right) {
         if (accumulate) {
-            LAUNCH_FP32_BATCHED(false, true, true);
+            LAUNCH_FP32(false, true, true);
         } else {
-            LAUNCH_FP32_BATCHED(false, true, false);
+            LAUNCH_FP32(false, true, false);
         }
     } else if (accumulate) {
-        LAUNCH_FP32_BATCHED(false, false, true);
+        LAUNCH_FP32(false, false, true);
     } else {
-        LAUNCH_FP32_BATCHED(false, false, false);
+        LAUNCH_FP32(false, false, false);
     }
 
-#undef LAUNCH_FP32_BATCHED
+#undef LAUNCH_FP32
 }
 
-void matmul_fp32_forward_cuda(
-    float* output,
-    const float* left,
-    const float* right,
-    int M,
-    int N,
-    int K,
-    cudaStream_t stream) {
-    launch_matmul<false, false, false>(
-        output, left, right, M, N, K, K, N, N, stream);
-}
-
-void matmul_fp32_backward_cuda(
-    float* left_gradient,
-    float* right_gradient,
-    const float* output_gradient,
-    const float* left,
-    const float* right,
-    int M,
-    int N,
-    int K,
-    cudaStream_t stream) {
-    matmul_fp32_left_backward_cuda(
-        left_gradient, output_gradient, right, M, N, K, stream);
-    matmul_fp32_right_backward_cuda(
-        right_gradient, left, output_gradient, M, N, K, stream);
-}
-
-void matmul_fp32_left_backward_cuda(
-    float* left_gradient,
-    const float* output_gradient,
-    const float* right,
-    int M,
-    int N,
-    int K,
-    cudaStream_t stream) {
-    launch_matmul<false, true, true>(
-        left_gradient, output_gradient, right, M, K, N, N, N, K, stream);
-}
-
-void matmul_fp32_right_backward_cuda(
-    float* right_gradient,
-    const float* left,
-    const float* output_gradient,
-    int M,
-    int N,
-    int K,
-    cudaStream_t stream) {
-    launch_matmul<true, false, true>(
-        right_gradient, left, output_gradient, K, N, M, K, N, N, stream);
-}
-
-void matmul_bf16_strided_cuda(
+void gemm_bf16_cuda(
     float* output,
     const __nv_bfloat16* left,
     const __nv_bfloat16* right,
@@ -1478,58 +1392,6 @@ void matmul_bf16_strided_cuda(
     }
 
 #undef LAUNCH_BF16
-}
-
-void matmul_bf16_forward_cuda(
-    float* output,
-    const __nv_bfloat16* left,
-    const __nv_bfloat16* right,
-    int M,
-    int N,
-    int K,
-    cudaStream_t stream) {
-    launch_tensor_core_matmul<false, false, false>(
-        output, left, right, M, N, K, K, N, N, stream);
-}
-
-void matmul_bf16_backward_cuda(
-    float* left_gradient,
-    float* right_gradient,
-    const __nv_bfloat16* output_gradient,
-    const __nv_bfloat16* left,
-    const __nv_bfloat16* right,
-    int M,
-    int N,
-    int K,
-    cudaStream_t stream) {
-    matmul_bf16_left_backward_cuda(
-        left_gradient, output_gradient, right, M, N, K, stream);
-    matmul_bf16_right_backward_cuda(
-        right_gradient, left, output_gradient, M, N, K, stream);
-}
-
-void matmul_bf16_left_backward_cuda(
-    float* left_gradient,
-    const __nv_bfloat16* output_gradient,
-    const __nv_bfloat16* right,
-    int M,
-    int N,
-    int K,
-    cudaStream_t stream) {
-    launch_tensor_core_matmul<false, true, true>(
-        left_gradient, output_gradient, right, M, K, N, N, N, K, stream);
-}
-
-void matmul_bf16_right_backward_cuda(
-    float* right_gradient,
-    const __nv_bfloat16* left,
-    const __nv_bfloat16* output_gradient,
-    int M,
-    int N,
-    int K,
-    cudaStream_t stream) {
-    launch_tensor_core_matmul<true, false, true>(
-        right_gradient, left, output_gradient, K, N, M, K, N, N, stream);
 }
 
 }  // namespace dscuda

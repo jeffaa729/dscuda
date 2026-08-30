@@ -21,16 +21,36 @@ class OperatorBenchmarkTests(unittest.TestCase):
         cases = benchmark.cases("matmul", "full")
         self.assertEqual({c[0] for c in cases}, {2048, 4096, 8192})
         self.assertEqual({c[1] for c in cases}, {"fp32", "bf16"})
-        self.assertEqual({c[2] for c in cases}, {"forward", "left_backward", "right_backward"})
+        self.assertEqual({c[2] for c in cases}, {"NN", "NT", "TN"})
         self.assertEqual(len(cases), 18)
         self.assertEqual(len(benchmark.cases("matmul", "quick")), 6)
+
+    def test_generic_call_uses_transposes_not_gradient_semantics(self):
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        expected = {"NN": (0, 0), "NT": (0, 1), "TN": (1, 0), "TT": (1, 1)}
+        self.assertEqual(benchmark.TRANSPOSES, expected)
+        buffer = SimpleNamespace(data_ptr=lambda: 123)
+        for dtype in ("fp32", "bf16"):
+            for operation, flags in expected.items():
+                workload = object.__new__(benchmark.Workload)
+                workload.lib = SimpleNamespace(dscuda_gemm=Mock(return_value=0))
+                workload.left = workload.right = buffer
+                workload.buffers = {name: (buffer,) for name in benchmark.BACKENDS}
+                workload.size, workload.dtype, workload.stream = 2048, dtype, 456
+                workload.transpose_left, workload.transpose_right = benchmark.TRANSPOSES[operation]
+                for backend in benchmark.BACKENDS:
+                    workload.run(backend)
+                    workload.lib.dscuda_gemm.assert_called_with(
+                        123, 123, 123, 2048, 2048, 2048, int(dtype == "bf16"),
+                        *flags, 0, int(backend == "reference"), 456)
 
     def test_removed_family_is_rejected(self):
         with self.assertRaises(ValueError):
             benchmark.cases("unsupported", "quick")
 
     def test_table(self):
-        row = dict(size=2048, dtype="fp32", operation="forward", backend="reference",
+        row = dict(size=2048, dtype="fp32", operation="NN", backend="reference",
                    reference="cuBLAS", median_ms=0.5)
         report = benchmark.result_table([row])
         self.assertIn("cuBLAS", report)
@@ -41,16 +61,16 @@ class OperatorBenchmarkTests(unittest.TestCase):
         self.assertEqual(row["reference_pct"], 100)
 
     def test_custom_and_reference_share_one_row(self):
-        rows = [dict(size=2048, dtype="fp32", operation="forward", backend=backend,
+        rows = [dict(size=2048, dtype="fp32", operation="NN", backend=backend,
                      reference="cuBLAS", median_ms=elapsed)
                 for backend, elapsed in (("custom", 1), ("reference", 1.07))]
         lines = benchmark.result_table(rows).splitlines()
         self.assertEqual(len(lines), 3)
         self.assertEqual([cell.strip() for cell in lines[2].split("|")[1:-1]],
-                         ["2048", "fp32", "forward", "1000.00", "1070.00", "107.0"])
+                         ["2048", "fp32", "NN", "1000.00", "1070.00", "107.0"])
 
     def test_ncu_pairs_each_precision(self):
-        rows = [dict(workload="M=2048,N=2048,K=2048", operation="forward",
+        rows = [dict(workload="M=2048,N=2048,K=2048", operation="NN",
                      backend=backend, time_us=elapsed)
                 for backend, elapsed in (("cublas_fp32", 107), ("bf16", 5),
                                          ("fp32", 100), ("cublas_bf16", 10))]
@@ -59,10 +79,10 @@ class OperatorBenchmarkTests(unittest.TestCase):
         self.assertIn("107.0", lines[2])
         self.assertIn("200.0", lines[3])
         self.assertEqual([cell.strip() for cell in lines[3].split("|")[2:7]],
-                         ["bf16", "forward", "5.00", "10.00", "200.0"])
+                         ["bf16", "NN", "5.00", "10.00", "200.0"])
 
     def test_percentage_matches_dtype(self):
-        rows = [dict(size=2048, dtype="fp32", operation="forward", backend=backend,
+        rows = [dict(size=2048, dtype="fp32", operation="NN", backend=backend,
                      reference="cuBLAS", median_ms=elapsed)
                 for backend, elapsed in (("custom", 1), ("reference", 2))]
         rows.append(dict(rows[0], dtype="bf16"))
@@ -70,7 +90,7 @@ class OperatorBenchmarkTests(unittest.TestCase):
         self.assertEqual([r["reference_pct"] for r in rows], [200, 100, None])
 
     def test_ncu_only_reports_collected_metrics(self):
-        kernel = dict(workload="M=2048,N=2048,K=2048", backend="fp32", operation="forward",
+        kernel = dict(workload="M=2048,N=2048,K=2048", backend="fp32", operation="NN",
                       time_us=100, dram_read_mb=2, dram_write_mb=1, dram_pct=20, sm_pct=80,
                       occupancy_pct=50, l1_hit_pct=30, l2_hit_pct=90, registers=64,
                       static_smem_bytes=1024, dynamic_smem_bytes=0, spills=0)
@@ -98,7 +118,7 @@ class OperatorBenchmarkTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory)
             extract_ncu.write_csv(path / "matmul.csv", [dict(workload="M=2048,N=2048,K=2048",
-                                  backend="custom", operation="forward", time_us=100)])
+                                  backend="custom", operation="NN", time_us=100)])
             with patch.object(sys, "argv", ["update_benchmark_summary.py", directory]):
                 update_benchmark_summary.main()
             report = (path / "summary.md").read_text()

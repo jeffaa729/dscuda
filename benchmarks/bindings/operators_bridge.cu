@@ -49,14 +49,14 @@ extern "C" int dscuda_gemm(
     try {
         if (!reference) {
             if (bf16) {
-                dscuda::matmul_bf16_strided_cuda(
+                dscuda::gemm_bf16_cuda(
                     output, static_cast<const __nv_bfloat16*>(left),
                     static_cast<const __nv_bfloat16*>(right),
                     M, N, K, transpose_left, transpose_right, accumulate, stream);
             } else {
-                dscuda::matmul_fp32_strided_batched_cuda(
+                dscuda::gemm_fp32_cuda(
                     output, static_cast<const float*>(left), static_cast<const float*>(right),
-                    M, N, K, 1, 0, 0, 0, transpose_left, transpose_right, accumulate, stream);
+                    M, N, K, transpose_left, transpose_right, accumulate, stream);
             }
         } else {
             cublas_check(cublasSetStream(handle, stream));

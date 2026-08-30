@@ -17,6 +17,8 @@ from benchmark_flash_attention_runtime import (
 ROOT = Path(__file__).resolve().parents[1]
 
 BACKENDS = ("custom", "reference")
+TRANSPOSES = {"NN": (False, False), "NT": (False, True),
+              "TN": (True, False), "TT": (True, True)}
 
 
 def cases(family, suite):
@@ -24,7 +26,7 @@ def cases(family, suite):
         raise ValueError("only the matmul comparison belongs in dscuda")
     sizes = (2048,) if suite == "quick" else (2048, 4096, 8192)
     return [(size, dtype, operation) for size in sizes for dtype in ("fp32", "bf16")
-            for operation in ("forward", "left_backward", "right_backward")]
+            for operation in ("NN", "NT", "TN")]
 
 
 def load_library(path):
@@ -57,9 +59,7 @@ class Workload:
         precision = torch.bfloat16 if dtype == "bf16" else torch.float32
         self.left = torch.randn((size, size), device="cuda", dtype=precision) * 0.1
         self.right = torch.randn_like(self.left) * 0.1
-        # Backward is a GEMM with the indicated transpose and += contract.
-        self.transpose_left = operation == "right_backward"
-        self.transpose_right = operation == "left_backward"
+        self.transpose_left, self.transpose_right = TRANSPOSES[operation]
         self.initial = (torch.zeros((size, size), device="cuda", dtype=torch.float32),)
         self.buffers = {name: tuple(t.clone() for t in self.initial) for name in BACKENDS}
 
@@ -72,12 +72,12 @@ class Workload:
         checked(self.lib, self.lib.dscuda_gemm(
             outputs[0].data_ptr(), self.left.data_ptr(), self.right.data_ptr(),
             self.size, self.size, self.size, int(self.dtype == "bf16"),
-            int(self.transpose_left), int(self.transpose_right), int(self.operation != "forward"),
+            int(self.transpose_left), int(self.transpose_right), 0,
             int(name == "reference"), self.stream))
         return outputs
 
     def check(self, graphs=None):
-        # Repeated execution checks accumulation/state updates, not only one call.
+        # Repeated execution must overwrite C rather than accumulate into the previous result.
         for name in BACKENDS:
             self.reset(name)
             if graphs is None:
@@ -177,7 +177,7 @@ def main():
     report = result_table(rows)
     print(report, end="", flush=True)
     note = ("FP32 disables TF32; BF16 inputs accumulate and output FP32. "
-            "Backward GEMMs accumulate FP32 gradients.")
+            "NN/NT/TN describe op(A)/op(B); all timed GEMMs overwrite C (alpha=1, beta=0).")
     note += ("\nWarm-cache CUDA Graph measurements; allocations, state resets, and graph construction "
              "are excluded.\n")
     args.output_dir.mkdir(parents=True, exist_ok=True)

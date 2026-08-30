@@ -2,22 +2,16 @@
 
 namespace dscuda {
 
-void matmul_forward_cpu(
+// Scalar reference for the same row-major transpose/accumulation contract as the CUDA GEMMs.
+void gemm_cpu(
     float* output,
     const float* left,
     const float* right,
     int M,
     int N,
-    int K);
-
-void matmul_backward_cpu(
-    float* left_gradient,
-    float* right_gradient,
-    const float* output_gradient,
-    const float* left,
-    const float* right,
-    int M,
-    int N,
-    int K);
+    int K,
+    bool transpose_left = false,
+    bool transpose_right = false,
+    bool accumulate = false);
 
 }  // namespace dscuda

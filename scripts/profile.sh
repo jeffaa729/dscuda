@@ -188,7 +188,7 @@ profile_matmul() {
     local sizes=(2048)
     [[ "$suite" != "quick" ]] && sizes=(2048 4096 8192)
     local backends=(fp32 bf16 cublas_fp32 cublas_bf16)
-    local operations=(forward left_backward right_backward)
+    local operations=(NN NT TN)
     local size backend operation pattern label stem
     for size in "${sizes[@]}"; do
         for backend in "${backends[@]}"; do
