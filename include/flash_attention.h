@@ -75,7 +75,7 @@ void flash_attention_backward_bf16_cuda(
 
 // Native BF16 IO for same-contract library comparisons: Q/K/V/O/dO/dQ/dK/dV
 // are BF16, accumulators and LSE are FP32. Requires D=128 and T a multiple of 64.
-// Unlike the training-facing functions above, backward OVERWRITES gradients.
+// Unlike the FP32-output functions above, backward OVERWRITES gradients.
 void flash_attention_forward_bf16_io_cuda(
     __nv_bfloat16* output, float* logsumexp,
     const __nv_bfloat16* query, const __nv_bfloat16* key, const __nv_bfloat16* value,

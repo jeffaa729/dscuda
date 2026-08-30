@@ -1,12 +1,8 @@
 #pragma once
 
-#include <cuda_runtime.h>
-
 namespace dscuda {
 
-// Converts router logits to sigmoid affinities, selects top-k with the routing
-// bias, normalizes the original affinities, and counts assignments per expert.
-void expert_route_forward_cuda(
+void expert_route_forward_cpu(
     float* scores,
     int* expert_indices,
     float* route_weights,
@@ -16,13 +12,9 @@ void expert_route_forward_cuda(
     int rows,
     int experts,
     int top_k,
-    float route_scale,
-    cudaStream_t stream = nullptr);
+    float route_scale);
 
-// Builds expert-grouped slots in parallel and copies [rows,D] tokens into the
-// no-drop dispatched layout [rows*top_k,D]. Slot order within one expert is
-// intentionally unspecified; route_to_slot restores the original token order.
-void expert_dispatch_forward_cuda(
+void expert_dispatch_forward_cpu(
     float* dispatched_input,
     int* expert_offsets,
     int* route_to_slot,
@@ -34,12 +26,9 @@ void expert_dispatch_forward_cuda(
     int rows,
     int hidden_size,
     int experts,
-    int top_k,
-    cudaStream_t stream = nullptr);
+    int top_k);
 
-// Adds the shared-expert output to the weighted routed outputs. Backward
-// produces routed-output gradients, gating-weight gradients, and shared output.
-void expert_combine_forward_cuda(
+void expert_combine_forward_cpu(
     float* output,
     const float* shared_output,
     const float* dispatched_output,
@@ -47,10 +36,9 @@ void expert_combine_forward_cuda(
     const int* route_to_slot,
     int rows,
     int hidden_size,
-    int top_k,
-    cudaStream_t stream = nullptr);
+    int top_k);
 
-void expert_combine_backward_cuda(
+void expert_combine_backward_cpu(
     float* dispatched_output_gradient,
     float* route_weight_gradient,
     float* shared_output_gradient,
@@ -60,21 +48,17 @@ void expert_combine_backward_cuda(
     const int* route_to_slot,
     int rows,
     int hidden_size,
-    int top_k,
-    cudaStream_t stream = nullptr);
+    int top_k);
 
-void expert_unroute_backward_cuda(
+void expert_unroute_backward_cpu(
     float* input_gradient,
     const float* dispatched_input_gradient,
     const int* route_to_slot,
     int rows,
     int hidden_size,
-    int top_k,
-    cudaStream_t stream = nullptr);
+    int top_k);
 
-// Differentiates normalized selected sigmoid affinities while treating top-k
-// indices and the load-balancing bias as non-differentiable routing decisions.
-void expert_route_backward_cuda(
+void expert_route_backward_cpu(
     float* router_logit_gradient,
     const float* route_weight_gradient,
     const float* scores,
@@ -82,15 +66,13 @@ void expert_route_backward_cuda(
     int rows,
     int experts,
     int top_k,
-    float route_scale,
-    cudaStream_t stream = nullptr);
+    float route_scale);
 
-void update_routing_bias_cuda(
+void update_routing_bias_cpu(
     float* routing_bias,
     const int* expert_counts,
     int experts,
     int total_routes,
-    float update_speed,
-    cudaStream_t stream = nullptr);
+    float update_speed);
 
 }  // namespace dscuda

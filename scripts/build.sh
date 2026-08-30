@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+nvcc_bin="${CUDACXX:-/usr/local/cuda/bin/nvcc}"
+if [[ ! -x "$nvcc_bin" ]]; then
+    nvcc_bin="$(command -v nvcc || true)"
+fi
+if [[ -z "$nvcc_bin" ]]; then
+    echo "CUDA compiler not found; set CUDACXX to nvcc." >&2
+    exit 1
+fi
+cuda_arch="${DSCUDA_CUDA_ARCH:-}"
+if [[ -z "$cuda_arch" ]] && command -v nvidia-smi >/dev/null; then
+    cuda_arch="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -n 1 | tr -d '. ' || true)"
+fi
+cmake -S "$repo_root" -B "$repo_root/build" \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_CUDA_ARCHITECTURES="${cuda_arch:-89}" \
+    -DCMAKE_CUDA_COMPILER="$nvcc_bin"
+targets=()
+(( $# == 0 )) || targets=(--target "$@")
+cmake --build "$repo_root/build" -j "${DSCUDA_BUILD_JOBS:-6}" "${targets[@]}"
