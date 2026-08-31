@@ -48,7 +48,8 @@ def dispatch(x, expert_ids, experts):
     route_to_slot = torch.empty_like(order).scatter(
         0, order, torch.arange(order.numel(), device=x.device)
     )
-    counts = torch.bincount(flat, minlength=experts)
+    counts = torch.zeros(experts, device=flat.device, dtype=flat.dtype)
+    counts.scatter_add_(0, flat, torch.ones_like(flat))
     offsets = torch.cat((counts.new_zeros(1), counts.cumsum(0)))
     packed = x[order // expert_ids.shape[-1]]
     return packed, offsets, route_to_slot.reshape_as(expert_ids)

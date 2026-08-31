@@ -119,3 +119,19 @@ extern "C" int dscuda_grouped_gemm(
         return 1;
     }
 }
+
+// Exposes the existing FP32 grouped gradients for PyTorch correctness checks.
+// The caller owns gradient initialization and the accumulation policy.
+extern "C" int dscuda_grouped_backward(
+    float* dx, float* dw, const float* dy, const float* x, const float* w,
+    const int* offsets, const int* slot_expert,
+    int rows, int experts, int n, int k, int accumulate, cudaStream_t stream) {
+    try {
+        dscuda::grouped_linear_backward_cuda(dx, dw, dy, x, w, offsets, slot_expert,
+                                           rows, experts, n, k, accumulate, stream);
+        return 0;
+    } catch (const std::exception& error) {
+        last_error = error.what();
+        return 1;
+    }
+}

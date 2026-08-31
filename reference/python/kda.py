@@ -50,7 +50,7 @@ def kda_forward(q, k, v, log_decay, beta, initial_state=None, scale=None):
 def fla_forward(q, k, v, log_decay, beta, initial_state=None, scale=None):
     """Official FLA chunk_kda with exactly the oracle's prepared-input contract.
 
-    Import lazily to keep CPU-only reference tests usable. Prewarm before graph
+    Import lazily so the PyTorch reference does not require FLA. Prewarm before graph
     capture; outputs and final state participate in FLA's analytical backward.
     """
     from fla.ops.kda import chunk_kda

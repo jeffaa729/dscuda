@@ -11,8 +11,6 @@ import re
 import subprocess
 from pathlib import Path
 
-from benchmark_flash_attention_runtime import add_reference_percentages, comparison_table
-
 
 SPEED_SECTION = "GPU Speed Of Light Throughput"
 MEMORY_SECTION = "Memory Workload Analysis"
@@ -23,6 +21,59 @@ REFERENCE_BACKENDS = {"fp32": "cublas_fp32", "bf16": "cublas_bf16",
                       "custom_bf16": "cublas_bf16", "custom": "official",
                       "cublas_fp32": "cublas_fp32", "cublas_bf16": "cublas_bf16",
                       "official": "official"}
+
+
+# These formatting helpers belong to Nsight extraction now that the old runtime
+# runner is removed. Keep the existing report format and pairing unchanged.
+def add_reference_percentages(rows, reference, keys, time_field="median_ms"):
+    def key(row):
+        return tuple(tuple(row[k]) if isinstance(row[k], (list, tuple)) else row[k] for k in keys)
+    times = {(row["backend"], key(row)): float(row[time_field]) for row in rows}
+    for row in rows:
+        backend = reference.get(row["backend"]) if isinstance(reference, dict) else reference
+        baseline = times.get((backend, key(row)))
+        elapsed = float(row[time_field])
+        row["reference_pct"] = (
+            100 * baseline / elapsed
+            if baseline is not None and math.isfinite(baseline) and baseline > 0
+            and math.isfinite(elapsed) and elapsed > 0 else None)
+
+
+def comparison_table(rows, keys, size, dtype, reference, *,
+                     custom_backend="custom", reference_backend="reference",
+                     time_field="median_ms", time_scale=1000.0):
+    groups = {}
+    for row in rows:
+        backend = row["backend"]
+        if backend not in (custom_backend, reference_backend):
+            raise ValueError(f"unexpected comparison backend: {backend}")
+        key = tuple(tuple(row[k]) if isinstance(row[k], (list, tuple)) else row[k] for k in keys)
+        group = groups.setdefault(key, {})
+        if backend in group:
+            raise ValueError(f"duplicate measurement for {backend}: {key}")
+        group[backend] = row
+    def elapsed(row):
+        value = float(row[time_field]) * time_scale if row is not None else math.nan
+        return value if math.isfinite(value) and value > 0 else None
+    def number(value):
+        return "-" if value is None else f"{value:.2f}"
+    values = []
+    for group in groups.values():
+        row = next(iter(group.values()))
+        custom, baseline = elapsed(group.get(custom_backend)), elapsed(group.get(reference_backend))
+        percent = f"{100 * baseline / custom:.1f}" if custom is not None and baseline is not None else "-"
+        values.append((size(row), dtype(row), row["operation"], number(custom), number(baseline), percent))
+    headers = ("size", "dtype", "operation", "custom us", f"reference ({reference}) us", "reference %")
+    numeric = {0, 3, 4, 5}
+    widths = [max(3, len(h), *(len(str(row[i])) for row in values)) for i, h in enumerate(headers)]
+    def line(cells):
+        return "|" + "|".join(
+            f" {str(value):{('>' if i in numeric else '<')}{width}} "
+            for i, (value, width) in enumerate(zip(cells, widths))) + "|"
+    separator = "|" + "|".join(
+        "-" * (width + 1) + ":" if i in numeric else ":" + "-" * (width + 1)
+        for i, width in enumerate(widths)) + "|"
+    return "\n".join([line(headers), separator, *(line(row) for row in values)]) + "\n"
 
 
 def arguments():
