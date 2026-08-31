@@ -1,0 +1,36 @@
+{
+  "precision": "Unquantized BF16/FP32 mathematical references. No FP4, FP8 QAT, distributed collectives or model projections.",
+  "mla_implementation": {
+    "source": "https://github.com/AppMana/forks-flash-mla-int/tree/7f41a5baa5cf57bfbce06458794b4b05737a162a",
+    "role": "Implementation guidance for custom MLA kernels.",
+    "dense_paths": ["csrc/flash_fwd_mla_kernel_sm80.h", "csrc/flash_fwd_mla_kernel_sm80_ws.h"],
+    "sparse_paths": ["csrc/flash_sparse_mla_decode_sm80.cu", "csrc/flash_sparse_mla_prefill_fused_sm80.cu"],
+    "scope": "Current MLA remains dense absorbed C512/R64 (QK=576,V=512). Study split-KV, BF16 MMA, asynchronous staging, warp specialization and shared-memory budgeting; adapt tile sizes for SM89 rather than copying A100 assumptions. The fork's sparse V4 D512 V=K and quantized caches are different contracts, not replacements for current MLA. No fork kernel has been ported by this source-registration change.",
+    "benchmark_references": ["reference/python/mla.py", "https://github.com/deepseek-ai/FlashMLA"]
+  },
+  "hca_csa": {
+    "source": "https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/blob/60d8d70770c6776ff598c94bb586a859a38244f1/inference/model.py",
+    "contract": "Compressor, Indexer and Attention equations; independent implementation. HCA ratio128, CSA ratio4 overlap, sink, partial RoPE/inverse output RoPE. Supplied angle table supports the model's YaRN policy. Index keys are separate from attention KV. Orthogonal index rotation may be omitted only with quantization disabled."
+  },
+  "dsa": {
+    "source": "https://github.com/deepseek-ai/DeepSeek-V3.2-Exp",
+    "contract": "Prepared lightning-indexer inputs, weighted ReLU score, causal topk, sparse absorbed-query MLA. No gradient through discrete topk; indexer scores are differentiable separately."
+  },
+  "moe": {
+    "source": "https://github.com/deepseek-ai/DeepSeek-V3/blob/main/inference/model.py",
+    "contract": "V3 sigmoid routing with selection bias, optional group limiting, no capacity drops, SwiGLU experts. The native grouped comparison measures only packed GEMMs, not routing/dispatch."
+  },
+  "kda": {
+    "source": "https://github.com/fla-org/flash-linear-attention/tree/v0.5.2/fla/ops/kda",
+    "package": "fla-core==0.5.2 (uv.lock)",
+    "contract": "Independent recurrent oracle plus official FLA chunk forward/backward, prepared normalized q/k and activated log-decay/beta. FP32 final state in key-first layout."
+  },
+  "flashmla": {
+    "source": "https://github.com/deepseek-ai/FlashMLA/tree/15f13e5030374295491c5ce31b02d7e63a7772c6",
+    "contract": "Official deepseek-ai/FlashMLA benchmark reference. The MLA runner supports its BF16 paged dense decode on SM90; custom/PyTorch output casts to BF16 are included in timing, while cache packing is outside timing. The default PyTorch comparison retains FP32 outputs and prefill/backward coverage. Sparse prefill remains a separate adapter; H100 execution is not verified on SM89."
+  },
+  "deepgemm": {
+    "source": "https://github.com/deepseek-ai/DeepGEMM/tree/559d79fb6994a58b8a15b4b93bf13ccc16edf247",
+    "contract": "Optional masked M-grouped BF16 GEMM with BF16 output. Only valid expert rows are defined; H100 execution is not verified on SM89."
+  }
+}

@@ -17,6 +17,7 @@ fi
 cmake -S "$repo_root" -B "$repo_root/build" \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_CUDA_ARCHITECTURES="${cuda_arch:-89}" \
+    -DDSCUDA_PYTHON="${DSCUDA_PYTHON:-$repo_root/.venv/bin/python}" \
     -DCMAKE_CUDA_COMPILER="$nvcc_bin"
 targets=()
 (( $# == 0 )) || targets=(--target "$@")

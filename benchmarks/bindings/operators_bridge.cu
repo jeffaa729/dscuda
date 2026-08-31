@@ -1,6 +1,7 @@
 // Exposes GEMM to Python-owned CUDA buffers without a PyTorch extension build.
 // cuBLAS uses the same stream and operand/output precision as the custom GEMM.
 #include "matmul.h"
+#include "grouped_gemm.h"
 
 #include <cublas_v2.h>
 #include <stdexcept>
@@ -49,14 +50,14 @@ extern "C" int dscuda_gemm(
     try {
         if (!reference) {
             if (bf16) {
-                dscuda::matmul_bf16_strided_cuda(
+                dscuda::gemm_bf16_cuda(
                     output, static_cast<const __nv_bfloat16*>(left),
                     static_cast<const __nv_bfloat16*>(right),
                     M, N, K, transpose_left, transpose_right, accumulate, stream);
             } else {
-                dscuda::matmul_fp32_strided_batched_cuda(
+                dscuda::gemm_fp32_cuda(
                     output, static_cast<const float*>(left), static_cast<const float*>(right),
-                    M, N, K, 1, 0, 0, 0, transpose_left, transpose_right, accumulate, stream);
+                    M, N, K, transpose_left, transpose_right, accumulate, stream);
             }
         } else {
             cublas_check(cublasSetStream(handle, stream));
@@ -76,6 +77,58 @@ extern "C" int dscuda_gemm(
                 bf16 ? CUBLAS_COMPUTE_32F : CUBLAS_COMPUTE_32F_PEDANTIC,
                 bf16 ? CUBLAS_GEMM_DEFAULT_TENSOR_OP : CUBLAS_GEMM_DEFAULT));
         }
+        return 0;
+    } catch (const std::exception& error) {
+        last_error = error.what();
+        return 1;
+    }
+}
+
+// Uses the same packed expert rows for custom CUDA and the cuBLAS-per-expert reference.
+// Host offsets are prepared before graph capture, so no device-to-host copy is timed.
+extern "C" int dscuda_grouped_gemm(
+    float* output, const void* input, const void* weights,
+    const int* device_offsets, const int* slot_expert, const int* host_offsets,
+    int rows, int experts, int N, int K, int bf16, int reference, cudaStream_t stream) {
+    try {
+        if (!reference) {
+            if (bf16) {
+                dscuda::grouped_linear_bf16_forward_cuda(output,
+                    static_cast<const __nv_bfloat16*>(input),
+                    static_cast<const __nv_bfloat16*>(weights), device_offsets,
+                    rows, experts, N, K, stream);
+            } else {
+                dscuda::grouped_linear_forward_cuda(output,
+                    static_cast<const float*>(input), static_cast<const float*>(weights),
+                    slot_expert, rows, N, K, stream);
+            }
+        } else {
+            const int bytes = bf16 ? 2 : 4;
+            for (int e = 0; e < experts; ++e) {
+                const int begin = host_offsets[e], count = host_offsets[e + 1] - begin;
+                if (!count) continue;
+                const auto* x = static_cast<const char*>(input) + static_cast<size_t>(begin) * K * bytes;
+                const auto* w = static_cast<const char*>(weights) + static_cast<size_t>(e) * K * N * bytes;
+                if (dscuda_gemm(output + static_cast<size_t>(begin) * N, x, w,
+                               count, N, K, bf16, 0, 0, 0, 1, stream)) return 1;
+            }
+        }
+        return 0;
+    } catch (const std::exception& error) {
+        last_error = error.what();
+        return 1;
+    }
+}
+
+// Exposes the existing FP32 grouped gradients for PyTorch correctness checks.
+// The caller owns gradient initialization and the accumulation policy.
+extern "C" int dscuda_grouped_backward(
+    float* dx, float* dw, const float* dy, const float* x, const float* w,
+    const int* offsets, const int* slot_expert,
+    int rows, int experts, int n, int k, int accumulate, cudaStream_t stream) {
+    try {
+        dscuda::grouped_linear_backward_cuda(dx, dw, dy, x, w, offsets, slot_expert,
+                                           rows, experts, n, k, accumulate, stream);
         return 0;
     } catch (const std::exception& error) {
         last_error = error.what();

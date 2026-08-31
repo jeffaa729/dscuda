@@ -73,23 +73,23 @@ cuda_arch="${cuda_arch:-89}"
 case "$family" in
     matmul)
         test_regex='^matmul$'
-        build_targets=(test_matmul benchmark_matmul)
+        build_targets=(dscuda_operator_bench benchmark_matmul)
         ;;
     flash_attention)
         test_regex='^flash_attention$'
-        build_targets=(test_flash_attention benchmark_flash_attention)
+        build_targets=(dscuda_flash_attention_bench benchmark_flash_attention)
         ;;
     mla)
-        test_regex='^(mla|mla_decode)$'
+        test_regex='^mla$'
         build_targets=(
-            test_mla test_mla_decode
+            dscuda_mla_bench
             benchmark_mla benchmark_mla_decode
         )
         ;;
     grouped_gemm)
         test_regex='^(expert_dispatch|grouped_gemm)$'
         build_targets=(
-            test_expert_dispatch test_grouped_gemm
+            dscuda_expert_dispatch_bench dscuda_operator_bench
             benchmark_grouped_gemm
         )
         ;;
@@ -188,7 +188,7 @@ profile_matmul() {
     local sizes=(2048)
     [[ "$suite" != "quick" ]] && sizes=(2048 4096 8192)
     local backends=(fp32 bf16 cublas_fp32 cublas_bf16)
-    local operations=(forward left_backward right_backward)
+    local operations=(NN NT TN)
     local size backend operation pattern label stem
     for size in "${sizes[@]}"; do
         for backend in "${backends[@]}"; do

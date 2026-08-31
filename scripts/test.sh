@@ -2,9 +2,16 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-if (( $# > 1 )); then
-    echo "usage: bash scripts/test.sh [test-name-regex]" >&2
+python_bin="${DSCUDA_PYTHON:-$repo_root/.venv/bin/python}"
+if [[ ! -x "$python_bin" ]]; then
+    echo "Run uv sync --locked first." >&2
     exit 1
 fi
-bash "$repo_root/scripts/build.sh"
-ctest --test-dir "$repo_root/build" --output-on-failure -R "${1:-.*}"
+family="${1:-all}"
+(( $# == 0 )) || shift
+mkdir -p "$repo_root/build"
+if ! bash "$repo_root/scripts/build.sh" >"$repo_root/build/test_build.log" 2>&1; then
+    cat "$repo_root/build/test_build.log" >&2
+    exit 1
+fi
+exec "$python_bin" "$repo_root/benchmarks/run.py" "$family" --test "$@"
