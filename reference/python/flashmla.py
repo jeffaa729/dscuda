@@ -8,6 +8,19 @@ benchmark's FP32-output contract: these adapters return BF16 output.
 import torch
 
 
+def load_decode(device=None):
+    if torch.cuda.get_device_capability(device)[0] != 9:
+        raise RuntimeError("FlashMLA dense BF16 decode requires SM90 (H100/H800); use --reference pytorch here.")
+    try:
+        from flash_mla import flash_mla_with_kvcache, get_mla_metadata
+    except ImportError as error:
+        raise RuntimeError(
+            "Install FlashMLA in this uv environment: uv pip install --no-build-isolation "
+            "git+https://github.com/deepseek-ai/FlashMLA.git@15f13e5030374295491c5ce31b02d7e63a7772c6"
+        ) from error
+    return flash_mla_with_kvcache, get_mla_metadata
+
+
 def require_hopper(x):
     if not x.is_cuda or torch.cuda.get_device_capability(x.device)[0] not in (9, 10):
         raise RuntimeError(
@@ -46,12 +59,11 @@ def flatten_sparse_indices(indices, kv_length):
 
 
 class FlashMLADecode:
-    """Prepared, fixed-shape/cache-length decode workload; prewarm before capture."""
+    """Fixed-shape decode; the runner's untimed check initializes scheduler metadata."""
 
     def __init__(self, q, kv, lengths, scale=None):
         require_hopper(q)
-        if torch.cuda.get_device_capability(q.device)[0] != 9:
-            raise RuntimeError("the upstream dense BF16 decode path requires SM90")
+        self.call, get_mla_metadata = load_decode(q.device)
         if q.shape[-1] != 576 or kv.shape[-1] != 576 or q.shape[1] != 1:
             raise ValueError("dense decode requires Q=1 and packed C512/R64 Q/KV")
         if kv.dtype != q.dtype or kv.device != q.device or kv.shape[0] != q.shape[0]:
@@ -62,9 +74,6 @@ class FlashMLADecode:
             raise ValueError(
                 "cache lengths must be positive and within each packed sequence"
             )
-        from flash_mla import flash_mla_with_kvcache, get_mla_metadata
-
-        self.call = flash_mla_with_kvcache
         self.q, self.cache = q.contiguous(), pack_cache(kv)
         self.lengths = lengths.to(device=q.device, dtype=torch.int32).contiguous()
         self.metadata, self.splits = get_mla_metadata()
@@ -82,6 +91,7 @@ class FlashMLADecode:
             self.splits,
             softmax_scale=self.scale,
             causal=False,
+            is_fp8_kvcache=False,
         )
 
 

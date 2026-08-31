@@ -27,10 +27,6 @@
   },
   "flashmla": {
     "source": "https://github.com/deepseek-ai/FlashMLA/tree/15f13e5030374295491c5ce31b02d7e63a7772c6",
-    "contract": "Official deepseek-ai/FlashMLA benchmark reference. The MLA runner supports its BF16 paged dense decode on SM90; custom/PyTorch output casts to BF16 are included in timing, while cache packing is outside timing. The default PyTorch comparison retains FP32 outputs and prefill/backward coverage. Sparse prefill remains a separate adapter; H100 execution is not verified on SM89."
-  },
-  "deepgemm": {
-    "source": "https://github.com/deepseek-ai/DeepGEMM/tree/559d79fb6994a58b8a15b4b93bf13ccc16edf247",
-    "contract": "Optional masked M-grouped BF16 GEMM with BF16 output. Only valid expert rows are defined; H100 execution is not verified on SM89."
+    "contract": "Official deepseek-ai/FlashMLA BF16 paged dense decode on SM90, Q=1, C512/R64, one shared KV head. MLA --reference flashmla selects the library alone; both/all also includes PyTorch. The h100 runtime suite defaults to both with H=64/128 and KV=1024/4096/8192. Custom/PyTorch output casts to BF16 are timed; packing and scheduler initialization are outside CUDA Graph timing. Every backend is checked against PyTorch output and natural-log FP32 LSE. Default local tests cover cache-page boundaries and the BF16 output contract without a mock library. Dense prefill/backward remains PyTorch-only: upstream dense prefill is SM100 MHA, not this absorbed-query contract. H100 execution is not verified on SM89."
   }
 }

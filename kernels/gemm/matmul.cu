@@ -1,5 +1,4 @@
-// Implements generic row-major GEMM with native FP32 CUDA Core and BF16 Tensor Core kernels.
-// Compile-time transpose and accumulation modes share the same tiled implementations.
+// Implements row-major C[M,N] = A[M,K] * B[K,N] with FP32 CUDA Core and BF16 Tensor Core kernels.
 
 #include "cuda_common.h"
 #include "matmul.h"
@@ -96,20 +95,14 @@ template <
     int kWM,
     int kWN,
     int kTM,
-    int kTN,
-    bool kTransposeLeft,
-    bool kTransposeRight,
-    bool kAccumulate>
+    int kTN>
 __global__ void matmul_kernel(
     float* __restrict__ output,
     const float* __restrict__ left,
     const float* __restrict__ right,
     int output_rows,
     int output_columns,
-    int inner_size,
-    int left_stride,
-    int right_stride,
-    int output_stride) {
+    int inner_size) {
     constexpr int kWarpsPerRow = kBN / kWN;
     constexpr int kNumThreads = (kBM / kWM) * (kBN / kWN) * 32;
     constexpr int kLeftLoads = (kBM * BK / VECTOR_WIDTH) / kNumThreads;
@@ -144,9 +137,7 @@ __global__ void matmul_kernel(
         block_row + kBM <= output_rows &&
         block_column + kBN <= output_columns &&
         inner_size % BK == 0 &&
-        left_stride % VECTOR_WIDTH == 0 &&
-        right_stride % VECTOR_WIDTH == 0 &&
-        output_stride % VECTOR_WIDTH == 0;
+        output_columns % VECTOR_WIDTH == 0;
 
     float accumulator[kTM][kTN] = {};
     float left_fragment[2][kTM];
@@ -165,77 +156,41 @@ __global__ void matmul_kernel(
 #pragma unroll
             for (int load = 0; load < kLeftLoads; ++load) {
                 const int vector_index = tid + load * kNumThreads;
-                if constexpr (!kTransposeLeft) {
-                    const int vectors_per_row = BK / VECTOR_WIDTH;
-                    const int tile_row = vector_index / vectors_per_row;
-                    const int tile_inner =
-                        (vector_index % vectors_per_row) * VECTOR_WIDTH;
-                    const int global_row = block_row + tile_row;
-                    const int global_inner = tile_to_load + tile_inner;
-                    const int index = global_row * left_stride + global_inner;
-                    loaded_left[load] = full_tile
-                        ? *reinterpret_cast<const float4*>(left + index)
-                        : load_float4(
-                              left,
-                              index,
-                              global_row < output_rows,
-                              global_inner,
-                              inner_size);
-                } else {
-                    const int vectors_per_inner = kBM / VECTOR_WIDTH;
-                    const int tile_inner = vector_index / vectors_per_inner;
-                    const int tile_row =
-                        (vector_index % vectors_per_inner) * VECTOR_WIDTH;
-                    const int global_inner = tile_to_load + tile_inner;
-                    const int global_row = block_row + tile_row;
-                    const int index = global_inner * left_stride + global_row;
-                    loaded_left[load] = full_tile
-                        ? *reinterpret_cast<const float4*>(left + index)
-                        : load_float4(
-                              left,
-                              index,
-                              global_inner < inner_size,
-                              global_row,
-                              output_rows);
-                }
+                const int vectors_per_row = BK / VECTOR_WIDTH;
+                const int tile_row = vector_index / vectors_per_row;
+                const int tile_inner =
+                    (vector_index % vectors_per_row) * VECTOR_WIDTH;
+                const int global_row = block_row + tile_row;
+                const int global_inner = tile_to_load + tile_inner;
+                const int index = global_row * inner_size + global_inner;
+                loaded_left[load] = full_tile
+                    ? *reinterpret_cast<const float4*>(left + index)
+                    : load_float4(
+                          left,
+                          index,
+                          global_row < output_rows,
+                          global_inner,
+                          inner_size);
             }
 
 #pragma unroll
             for (int load = 0; load < kRightLoads; ++load) {
                 const int vector_index = tid + load * kNumThreads;
-                if constexpr (!kTransposeRight) {
-                    const int vectors_per_inner = kBN / VECTOR_WIDTH;
-                    const int tile_inner = vector_index / vectors_per_inner;
-                    const int tile_column =
-                        (vector_index % vectors_per_inner) * VECTOR_WIDTH;
-                    const int global_inner = tile_to_load + tile_inner;
-                    const int global_column = block_column + tile_column;
-                    const int index = global_inner * right_stride + global_column;
-                    loaded_right[load] = full_tile
-                        ? *reinterpret_cast<const float4*>(right + index)
-                        : load_float4(
-                              right,
-                              index,
-                              global_inner < inner_size,
-                              global_column,
-                              output_columns);
-                } else {
-                    const int vectors_per_column = BK / VECTOR_WIDTH;
-                    const int tile_column = vector_index / vectors_per_column;
-                    const int tile_inner =
-                        (vector_index % vectors_per_column) * VECTOR_WIDTH;
-                    const int global_column = block_column + tile_column;
-                    const int global_inner = tile_to_load + tile_inner;
-                    const int index = global_column * right_stride + global_inner;
-                    loaded_right[load] = full_tile
-                        ? *reinterpret_cast<const float4*>(right + index)
-                        : load_float4(
-                              right,
-                              index,
-                              global_column < output_columns,
-                              global_inner,
-                              inner_size);
-                }
+                const int vectors_per_inner = kBN / VECTOR_WIDTH;
+                const int tile_inner = vector_index / vectors_per_inner;
+                const int tile_column =
+                    (vector_index % vectors_per_inner) * VECTOR_WIDTH;
+                const int global_inner = tile_to_load + tile_inner;
+                const int global_column = block_column + tile_column;
+                const int index = global_inner * output_columns + global_column;
+                loaded_right[load] = full_tile
+                    ? *reinterpret_cast<const float4*>(right + index)
+                    : load_float4(
+                          right,
+                          index,
+                          global_inner < inner_size,
+                          global_column,
+                          output_columns);
             }
         }
 
@@ -295,69 +250,37 @@ __global__ void matmul_kernel(
 #pragma unroll
             for (int load = 0; load < kLeftLoads; ++load) {
                 const int vector_index = tid + load * kNumThreads;
-                if constexpr (!kTransposeLeft) {
-                    const int vectors_per_row = BK / VECTOR_WIDTH;
-                    const int tile_row = vector_index / vectors_per_row;
-                    const int tile_inner =
-                        (vector_index % vectors_per_row) * VECTOR_WIDTH;
-                    shared_left[
-                        (write_stage * BK + tile_inner + 0) * kBM +
-                        tile_row] = loaded_left[load].x;
-                    shared_left[
-                        (write_stage * BK + tile_inner + 1) * kBM +
-                        tile_row] = loaded_left[load].y;
-                    shared_left[
-                        (write_stage * BK + tile_inner + 2) * kBM +
-                        tile_row] = loaded_left[load].z;
-                    shared_left[
-                        (write_stage * BK + tile_inner + 3) * kBM +
-                        tile_row] = loaded_left[load].w;
-                } else {
-                    const int vectors_per_inner = kBM / VECTOR_WIDTH;
-                    const int tile_inner = vector_index / vectors_per_inner;
-                    const int tile_row =
-                        (vector_index % vectors_per_inner) * VECTOR_WIDTH;
-                    const int index =
-                        (write_stage * BK + tile_inner) * kBM + tile_row;
-                    shared_left[index + 0] = loaded_left[load].x;
-                    shared_left[index + 1] = loaded_left[load].y;
-                    shared_left[index + 2] = loaded_left[load].z;
-                    shared_left[index + 3] = loaded_left[load].w;
-                }
+                const int vectors_per_row = BK / VECTOR_WIDTH;
+                const int tile_row = vector_index / vectors_per_row;
+                const int tile_inner =
+                    (vector_index % vectors_per_row) * VECTOR_WIDTH;
+                shared_left[
+                    (write_stage * BK + tile_inner + 0) * kBM +
+                    tile_row] = loaded_left[load].x;
+                shared_left[
+                    (write_stage * BK + tile_inner + 1) * kBM +
+                    tile_row] = loaded_left[load].y;
+                shared_left[
+                    (write_stage * BK + tile_inner + 2) * kBM +
+                    tile_row] = loaded_left[load].z;
+                shared_left[
+                    (write_stage * BK + tile_inner + 3) * kBM +
+                    tile_row] = loaded_left[load].w;
             }
 
 #pragma unroll
             for (int load = 0; load < kRightLoads; ++load) {
                 const int vector_index = tid + load * kNumThreads;
-                if constexpr (!kTransposeRight) {
-                    const int vectors_per_inner = kBN / VECTOR_WIDTH;
-                    const int tile_inner = vector_index / vectors_per_inner;
-                    const int tile_column =
-                        (vector_index % vectors_per_inner) * VECTOR_WIDTH;
-                    const int index =
-                        (write_stage * BK + tile_inner) * kBN + tile_column;
-                    shared_right[index + 0] = loaded_right[load].x;
-                    shared_right[index + 1] = loaded_right[load].y;
-                    shared_right[index + 2] = loaded_right[load].z;
-                    shared_right[index + 3] = loaded_right[load].w;
-                } else {
-                    const int vectors_per_column = BK / VECTOR_WIDTH;
-                    const int tile_column = vector_index / vectors_per_column;
-                    const int tile_inner =
-                        (vector_index % vectors_per_column) * VECTOR_WIDTH;
-                    shared_right[
-                        (write_stage * BK + tile_inner + 0) * kBN +
-                        tile_column] = loaded_right[load].x;
-                    shared_right[
-                        (write_stage * BK + tile_inner + 1) * kBN +
-                        tile_column] = loaded_right[load].y;
-                    shared_right[
-                        (write_stage * BK + tile_inner + 2) * kBN +
-                        tile_column] = loaded_right[load].z;
-                    shared_right[
-                        (write_stage * BK + tile_inner + 3) * kBN +
-                        tile_column] = loaded_right[load].w;
-                }
+                const int vectors_per_inner = kBN / VECTOR_WIDTH;
+                const int tile_inner = vector_index / vectors_per_inner;
+                const int tile_column =
+                    (vector_index % vectors_per_inner) * VECTOR_WIDTH;
+                const int index =
+                    (write_stage * BK + tile_inner) * kBN + tile_column;
+                shared_right[index + 0] = loaded_right[load].x;
+                shared_right[index + 1] = loaded_right[load].y;
+                shared_right[index + 2] = loaded_right[load].z;
+                shared_right[index + 3] = loaded_right[load].w;
             }
 
             __syncthreads();
@@ -420,7 +343,7 @@ __global__ void matmul_kernel(
                 const int remaining = output_columns - global_column;
                 width = remaining < VECTOR_WIDTH ? remaining : VECTOR_WIDTH;
             }
-            const int index = global_row * output_stride + global_column;
+            const int index = global_row * output_columns + global_column;
             float4 value = make_float4(
                 accumulator[row][thread_column + 0],
                 accumulator[row][thread_column + 1],
@@ -428,60 +351,32 @@ __global__ void matmul_kernel(
                 accumulator[row][thread_column + 3]);
 
             if (width == VECTOR_WIDTH && index % VECTOR_WIDTH == 0) {
-                if constexpr (kAccumulate) {
-                    const float4 previous =
-                        *reinterpret_cast<const float4*>(output + index);
-                    value.x += previous.x;
-                    value.y += previous.y;
-                    value.z += previous.z;
-                    value.w += previous.w;
-                }
                 *reinterpret_cast<float4*>(output + index) = value;
             } else {
                 if (width > 0) {
-                    if constexpr (kAccumulate) {
-                        output[index] += value.x;
-                    } else {
-                        output[index] = value.x;
-                    }
+                    output[index] = value.x;
                 }
                 if (width > 1) {
-                    if constexpr (kAccumulate) {
-                        output[index + 1] += value.y;
-                    } else {
-                        output[index + 1] = value.y;
-                    }
+                    output[index + 1] = value.y;
                 }
                 if (width > 2) {
-                    if constexpr (kAccumulate) {
-                        output[index + 2] += value.z;
-                    } else {
-                        output[index + 2] = value.z;
-                    }
+                    output[index + 2] = value.z;
                 }
                 if (width > 3) {
-                    if constexpr (kAccumulate) {
-                        output[index + 3] += value.w;
-                    } else {
-                        output[index + 3] = value.w;
-                    }
+                    output[index + 3] = value.w;
                 }
             }
         }
     }
 }
 
-template <bool kTransposeLeft, bool kTransposeRight, bool kAccumulate>
 __global__ void matmul_tensor_core_edge_kernel(
     float* output,
     const __nv_bfloat16* left,
     const __nv_bfloat16* right,
     int output_rows,
     int output_columns,
-    int inner_size,
-    int left_stride,
-    int right_stride,
-    int output_stride) {
+    int inner_size) {
     __shared__ __nv_bfloat16 shared_left[tc::BK][tc::BM + tc::SKEW];
     __shared__ __nv_bfloat16 shared_right[tc::BK][tc::BN + tc::SKEW];
 
@@ -520,26 +415,8 @@ __global__ void matmul_tensor_core_edge_kernel(
     for (int tile_row = 0; tile_row < tc::WARP_TILES_M; ++tile_row) {
 #pragma unroll
         for (int tile_column = 0; tile_column < tc::WARP_TILES_N; ++tile_column) {
-            const int output_row =
-                block_row + warp_row * tc::WM + tile_row * tc::MMA_M;
-            const int output_column =
-                block_column + warp_column * tc::WN + tile_column * tc::MMA_N;
-            if constexpr (kAccumulate) {
-                if (output_row + tc::MMA_M <= output_rows &&
-                    output_column + tc::MMA_N <= output_columns) {
-                    nvcuda::wmma::load_matrix_sync(
-                        accumulators[tile_row][tile_column],
-                        output + output_row * output_stride + output_column,
-                        output_stride,
-                        nvcuda::wmma::mem_row_major);
-                } else {
-                    nvcuda::wmma::fill_fragment(
-                        accumulators[tile_row][tile_column], 0.0F);
-                }
-            } else {
-                nvcuda::wmma::fill_fragment(
-                    accumulators[tile_row][tile_column], 0.0F);
-            }
+            nvcuda::wmma::fill_fragment(
+                accumulators[tile_row][tile_column], 0.0F);
         }
     }
 
@@ -551,11 +428,7 @@ __global__ void matmul_tensor_core_edge_kernel(
             const int global_inner = tile_inner + local_inner;
             __nv_bfloat16 value = __float2bfloat16(0.0F);
             if (global_row < output_rows && global_inner < inner_size) {
-                if constexpr (kTransposeLeft) {
-                    value = left[global_inner * left_stride + global_row];
-                } else {
-                    value = left[global_row * left_stride + global_inner];
-                }
+                value = left[global_row * inner_size + global_inner];
             }
             shared_left[local_inner][local_row] = value;
         }
@@ -567,11 +440,7 @@ __global__ void matmul_tensor_core_edge_kernel(
             const int global_column = block_column + local_column;
             __nv_bfloat16 value = __float2bfloat16(0.0F);
             if (global_inner < inner_size && global_column < output_columns) {
-                if constexpr (kTransposeRight) {
-                    value = right[global_column * right_stride + global_inner];
-                } else {
-                    value = right[global_inner * right_stride + global_column];
-                }
+                value = right[global_inner * output_columns + global_column];
             }
             shared_right[local_inner][local_column] = value;
         }
@@ -622,9 +491,9 @@ __global__ void matmul_tensor_core_edge_kernel(
             if (output_row + tc::MMA_M <= output_rows &&
                 output_column + tc::MMA_N <= output_columns) {
                 nvcuda::wmma::store_matrix_sync(
-                    output + output_row * output_stride + output_column,
+                    output + output_row * output_columns + output_column,
                     accumulators[tile_row][tile_column],
-                    output_stride,
+                    output_columns,
                     nvcuda::wmma::mem_row_major);
             }
         }
@@ -673,33 +542,9 @@ __device__ __forceinline__ void load_matrix_x4(
         : "r"(address));
 }
 
-__device__ __forceinline__ void load_matrix_x4_transpose(
-    unsigned int (&fragment)[4],
-    unsigned int address) {
-    asm volatile(
-        "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 "
-        "{%0, %1, %2, %3}, [%4];\n"
-        : "=r"(fragment[0]),
-          "=r"(fragment[1]),
-          "=r"(fragment[2]),
-          "=r"(fragment[3])
-        : "r"(address));
-    const unsigned int off_diagonal = fragment[1];
-    fragment[1] = fragment[2];
-    fragment[2] = off_diagonal;
-}
-
-__device__ __forceinline__ void load_matrix_x2(
-    unsigned int (&fragment)[2],
-    unsigned int address) {
-    asm volatile(
-        "ldmatrix.sync.aligned.m8n8.x2.shared.b16 "
-        "{%0, %1}, [%2];\n"
-        : "=r"(fragment[0]), "=r"(fragment[1])
-        : "r"(address));
-}
-
-__device__ __forceinline__ void load_matrix_x2_transpose(
+// The PTX transpose arranges a row-major B tile into the column operand
+// registers expected by mma.sync; the logical input remains B[K,N].
+__device__ __forceinline__ void load_matrix_b_x2(
     unsigned int (&fragment)[2],
     unsigned int address) {
     asm volatile(
@@ -737,20 +582,13 @@ template <
     int kBM,
     int kBN,
     int kWarpTilesM,
-    int kWarpTilesN,
-    bool kTransposeLeft,
-    bool kTransposeRight,
-    bool kAccumulate>
+    int kWarpTilesN>
 __global__ __launch_bounds__(256, 2) void matmul_tensor_core_mma_kernel(
     float* __restrict__ output,
     const __nv_bfloat16* __restrict__ left,
     const __nv_bfloat16* __restrict__ right,
-    int output_rows,
     int output_columns,
-    int inner_size,
-    int left_stride,
-    int right_stride,
-    int output_stride) {
+    int inner_size) {
     constexpr int kWM = kWarpTilesM * tc_mma::MMA_M;
     constexpr int kWN = kWarpTilesN * tc_mma::MMA_N;
     constexpr int kWarpsN = kBN / kWN;
@@ -758,7 +596,6 @@ __global__ __launch_bounds__(256, 2) void matmul_tensor_core_mma_kernel(
         (kBM / kWM) * kWarpsN * 32;
     constexpr int kLeftStageElements = kBM * tc_mma::BK;
     constexpr int kRightStageElements = tc_mma::BK * kBN;
-    constexpr int kTransposeLeftSwizzle = kBM >= 64 ? 3 : 2;
 
     __shared__ __align__(16)
         __nv_bfloat16 shared_left[tc_mma::STAGES][kLeftStageElements];
@@ -770,24 +607,8 @@ __global__ __launch_bounds__(256, 2) void matmul_tensor_core_mma_kernel(
     const int warp_id = tid / 32;
     const int warp_row = warp_id / kWarpsN;
     const int warp_column = warp_id % kWarpsN;
-    int logical_block_x = blockIdx.x;
-    int logical_block_y = blockIdx.y;
-    if constexpr (kAccumulate) {
-        // dA reuses each transposed weight tile down many output rows, while
-        // dB benefits from the smaller group that preserves activation reuse.
-        constexpr int kRowGroup = kTransposeRight ? 8 : 2;
-        const int linear_block = blockIdx.y * gridDim.x + blockIdx.x;
-        const int first_row =
-            linear_block / (gridDim.x * kRowGroup) * kRowGroup;
-        const int rows_in_group =
-            min(kRowGroup, static_cast<int>(gridDim.y) - first_row);
-        const int block_in_group =
-            linear_block % (gridDim.x * kRowGroup);
-        logical_block_x = block_in_group / rows_in_group;
-        logical_block_y = first_row + block_in_group % rows_in_group;
-    }
-    const int block_row = logical_block_y * kBM;
-    const int block_column = logical_block_x * kBN;
+    const int block_row = blockIdx.y * kBM;
+    const int block_column = blockIdx.x * kBN;
 
     float accumulators[kWarpTilesM][kWarpTilesN][4];
 #pragma unroll
@@ -795,26 +616,9 @@ __global__ __launch_bounds__(256, 2) void matmul_tensor_core_mma_kernel(
 #pragma unroll
         for (int tile_column = 0; tile_column < kWarpTilesN;
              ++tile_column) {
-            const int output_row =
-                block_row + warp_row * kWM +
-                tile_row * tc_mma::MMA_M + lane / 4;
-            const int output_column =
-                block_column + warp_column * kWN +
-                tile_column * tc_mma::MMA_N + (lane % 4) * 2;
-            if constexpr (kAccumulate) {
-                const float2 top = *reinterpret_cast<const float2*>(
-                    output + output_row * output_stride + output_column);
-                const float2 bottom = *reinterpret_cast<const float2*>(
-                    output + (output_row + 8) * output_stride + output_column);
-                accumulators[tile_row][tile_column][0] = top.x;
-                accumulators[tile_row][tile_column][1] = top.y;
-                accumulators[tile_row][tile_column][2] = bottom.x;
-                accumulators[tile_row][tile_column][3] = bottom.y;
-            } else {
 #pragma unroll
-                for (int element = 0; element < 4; ++element) {
-                    accumulators[tile_row][tile_column][element] = 0.0F;
-                }
+            for (int element = 0; element < 4; ++element) {
+                accumulators[tile_row][tile_column][element] = 0.0F;
             }
         }
     }
@@ -827,34 +631,18 @@ __global__ __launch_bounds__(256, 2) void matmul_tensor_core_mma_kernel(
 #pragma unroll
         for (int vector = tid; vector < kLeftVectors;
              vector += kNumThreads) {
-            int shared_offset;
-            int global_offset;
-            if constexpr (kTransposeLeft) {
-                const int local_inner =
-                    vector / (kBM / tc_mma::VECTOR_ELEMENTS);
-                const int local_row =
-                    vector % (kBM / tc_mma::VECTOR_ELEMENTS) *
-                    tc_mma::VECTOR_ELEMENTS;
-                const int logical_offset =
-                    local_inner * kBM + local_row;
-                shared_offset =
-                    swizzle_bf16_offset<kTransposeLeftSwizzle>(logical_offset);
-                global_offset =
-                    (tile_inner + local_inner) * left_stride +
-                    block_row + local_row;
-            } else {
-                const int local_row =
-                    vector / (tc_mma::BK / tc_mma::VECTOR_ELEMENTS);
-                const int local_inner =
-                    vector % (tc_mma::BK / tc_mma::VECTOR_ELEMENTS) *
-                    tc_mma::VECTOR_ELEMENTS;
-                const int logical_offset =
-                    local_row * tc_mma::BK + local_inner;
-                shared_offset = swizzle_bf16_offset<2>(logical_offset);
-                global_offset =
-                    (block_row + local_row) * left_stride +
-                    tile_inner + local_inner;
-            }
+            const int local_row =
+                vector / (tc_mma::BK / tc_mma::VECTOR_ELEMENTS);
+            const int local_inner =
+                vector % (tc_mma::BK / tc_mma::VECTOR_ELEMENTS) *
+                tc_mma::VECTOR_ELEMENTS;
+            const int logical_offset =
+                local_row * tc_mma::BK + local_inner;
+            const int shared_offset =
+                swizzle_bf16_offset<2>(logical_offset);
+            const int global_offset =
+                (block_row + local_row) * inner_size +
+                tile_inner + local_inner;
             cp_async_bf16x8(
                 shared_left[stage] + shared_offset,
                 left + global_offset);
@@ -862,33 +650,18 @@ __global__ __launch_bounds__(256, 2) void matmul_tensor_core_mma_kernel(
 #pragma unroll
         for (int vector = tid; vector < kRightVectors;
              vector += kNumThreads) {
-            int shared_offset;
-            int global_offset;
-            if constexpr (kTransposeRight) {
-                const int local_column =
-                    vector / (tc_mma::BK / tc_mma::VECTOR_ELEMENTS);
-                const int local_inner =
-                    vector % (tc_mma::BK / tc_mma::VECTOR_ELEMENTS) *
-                    tc_mma::VECTOR_ELEMENTS;
-                const int logical_offset =
-                    local_column * tc_mma::BK + local_inner;
-                shared_offset = swizzle_bf16_offset<2>(logical_offset);
-                global_offset =
-                    (block_column + local_column) * right_stride +
-                    tile_inner + local_inner;
-            } else {
-                const int local_inner =
-                    vector / (kBN / tc_mma::VECTOR_ELEMENTS);
-                const int local_column =
-                    vector % (kBN / tc_mma::VECTOR_ELEMENTS) *
-                    tc_mma::VECTOR_ELEMENTS;
-                const int logical_offset =
-                    local_inner * kBN + local_column;
-                shared_offset = swizzle_bf16_offset<3>(logical_offset);
-                global_offset =
-                    (tile_inner + local_inner) * right_stride +
-                    block_column + local_column;
-            }
+            const int local_inner =
+                vector / (kBN / tc_mma::VECTOR_ELEMENTS);
+            const int local_column =
+                vector % (kBN / tc_mma::VECTOR_ELEMENTS) *
+                tc_mma::VECTOR_ELEMENTS;
+            const int logical_offset =
+                local_inner * kBN + local_column;
+            const int shared_offset =
+                swizzle_bf16_offset<3>(logical_offset);
+            const int global_offset =
+                (tile_inner + local_inner) * output_columns +
+                block_column + local_column;
             cp_async_bf16x8(
                 shared_right[stage] + shared_offset,
                 right + global_offset);
@@ -918,30 +691,16 @@ __global__ __launch_bounds__(256, 2) void matmul_tensor_core_mma_kernel(
                  ++tile_row) {
                 const int tile_row_base =
                     warp_row * kWM + tile_row * tc_mma::MMA_M;
-                if constexpr (kTransposeLeft) {
-                    const int fragment_inner = tile_inner + lane % 16;
-                    const int fragment_row = tile_row_base + lane / 16 * 8;
-                    const int logical_offset =
-                        fragment_inner * kBM + fragment_row;
-                    const int swizzled_offset =
-                        swizzle_bf16_offset<kTransposeLeftSwizzle>(
-                            logical_offset);
-                    load_matrix_x4_transpose(
-                        left_fragments[tile_row],
-                        shared_address(
-                            shared_left[stage] + swizzled_offset));
-                } else {
-                    const int fragment_row = tile_row_base + lane % 16;
-                    const int fragment_inner = tile_inner + lane / 16 * 8;
-                    const int logical_offset =
-                        fragment_row * tc_mma::BK + fragment_inner;
-                    const int swizzled_offset =
-                        swizzle_bf16_offset<2>(logical_offset);
-                    load_matrix_x4(
-                        left_fragments[tile_row],
-                        shared_address(
-                            shared_left[stage] + swizzled_offset));
-                }
+                const int fragment_row = tile_row_base + lane % 16;
+                const int fragment_inner = tile_inner + lane / 16 * 8;
+                const int logical_offset =
+                    fragment_row * tc_mma::BK + fragment_inner;
+                const int swizzled_offset =
+                    swizzle_bf16_offset<2>(logical_offset);
+                load_matrix_x4(
+                    left_fragments[tile_row],
+                    shared_address(
+                        shared_left[stage] + swizzled_offset));
             }
 #pragma unroll
             for (int tile_column = 0;
@@ -950,30 +709,16 @@ __global__ __launch_bounds__(256, 2) void matmul_tensor_core_mma_kernel(
                 const int tile_column_base =
                     warp_column * kWN +
                     tile_column * tc_mma::MMA_N;
-                if constexpr (kTransposeRight) {
-                    const int fragment_column = tile_column_base + lane % 8;
-                    const int fragment_inner =
-                        tile_inner + (lane % 16) / 8 * 8;
-                    const int logical_offset =
-                        fragment_column * tc_mma::BK + fragment_inner;
-                    const int swizzled_offset =
-                        swizzle_bf16_offset<2>(logical_offset);
-                    load_matrix_x2(
-                        right_fragments[tile_column],
-                        shared_address(
-                            shared_right[stage] + swizzled_offset));
-                } else {
-                    const int fragment_inner = tile_inner + lane % 16;
-                    const int fragment_column = tile_column_base;
-                    const int logical_offset =
-                        fragment_inner * kBN + fragment_column;
-                    const int swizzled_offset =
-                        swizzle_bf16_offset<3>(logical_offset);
-                    load_matrix_x2_transpose(
-                        right_fragments[tile_column],
-                        shared_address(
-                            shared_right[stage] + swizzled_offset));
-                }
+                const int fragment_inner = tile_inner + lane % 16;
+                const int fragment_column = tile_column_base;
+                const int logical_offset =
+                    fragment_inner * kBN + fragment_column;
+                const int swizzled_offset =
+                    swizzle_bf16_offset<3>(logical_offset);
+                load_matrix_b_x2(
+                    right_fragments[tile_column],
+                    shared_address(
+                        shared_right[stage] + swizzled_offset));
             }
 #pragma unroll
             for (int tile_row = 0; tile_row < kWarpTilesM;
@@ -1014,9 +759,9 @@ __global__ __launch_bounds__(256, 2) void matmul_tensor_core_mma_kernel(
                 accumulators[tile_row][tile_column][2],
                 accumulators[tile_row][tile_column][3]);
             *reinterpret_cast<float2*>(
-                output + output_row * output_stride + output_column) = top;
+                output + output_row * output_columns + output_column) = top;
             *reinterpret_cast<float2*>(
-                output + (output_row + 8) * output_stride + output_column) =
+                output + (output_row + 8) * output_columns + output_column) =
                 bottom;
         }
     }
@@ -1026,10 +771,7 @@ template <
     int kBM,
     int kBN,
     int kWarpTilesM,
-    int kWarpTilesN,
-    bool kTransposeLeft,
-    bool kTransposeRight,
-    bool kAccumulate>
+    int kWarpTilesN>
 void launch_tensor_core_mma_config(
     float* output,
     const __nv_bfloat16* left,
@@ -1037,9 +779,6 @@ void launch_tensor_core_mma_config(
     int output_rows,
     int output_columns,
     int inner_size,
-    int left_stride,
-    int right_stride,
-    int output_stride,
     cudaStream_t stream) {
     constexpr int kWM = kWarpTilesM * tc_mma::MMA_M;
     constexpr int kWN = kWarpTilesN * tc_mma::MMA_N;
@@ -1050,20 +789,13 @@ void launch_tensor_core_mma_config(
         kBM,
         kBN,
         kWarpTilesM,
-        kWarpTilesN,
-        kTransposeLeft,
-        kTransposeRight,
-        kAccumulate>
+        kWarpTilesN>
         <<<blocks, kNumThreads, 0, stream>>>(
             output,
             left,
             right,
-            output_rows,
             output_columns,
-            inner_size,
-            left_stride,
-            right_stride,
-            output_stride);
+            inner_size);
 }
 
 
@@ -1073,10 +805,7 @@ template <
     int kWM,
     int kWN,
     int kTM,
-    int kTN,
-    bool kTransposeLeft,
-    bool kTransposeRight,
-    bool kAccumulate>
+    int kTN>
 void launch_matmul_config(
     float* output,
     const float* left,
@@ -1084,9 +813,6 @@ void launch_matmul_config(
     int output_rows,
     int output_columns,
     int inner_size,
-    int left_stride,
-    int right_stride,
-    int output_stride,
     cudaStream_t stream) {
     constexpr int kNumThreads = (kBM / kWM) * (kBN / kWN) * 32;
     const dim3 blocks(
@@ -1098,24 +824,17 @@ void launch_matmul_config(
         kWM,
         kWN,
         kTM,
-        kTN,
-        kTransposeLeft,
-        kTransposeRight,
-        kAccumulate>
+        kTN>
         <<<blocks, kNumThreads, 0, stream>>>(
             output,
             left,
             right,
             output_rows,
             output_columns,
-            inner_size,
-            left_stride,
-            right_stride,
-            output_stride);
+            inner_size);
     CUDA_CHECK(cudaGetLastError());
 }
 
-template <bool kTransposeLeft, bool kTransposeRight, bool kAccumulate>
 void launch_matmul(
     float* output,
     const float* left,
@@ -1123,9 +842,6 @@ void launch_matmul(
     int output_rows,
     int output_columns,
     int inner_size,
-    int left_stride,
-    int right_stride,
-    int output_stride,
     cudaStream_t stream) {
     // A 512x512 GEMM has only sixteen 128x128 blocks, so use the smaller
     // configuration to keep every SM supplied with multiple warps.
@@ -1136,19 +852,13 @@ void launch_matmul(
             WM,
             SMALL_WN,
             TM,
-            SMALL_TN,
-            kTransposeLeft,
-            kTransposeRight,
-            kAccumulate>(
+            SMALL_TN>(
             output,
             left,
             right,
             output_rows,
             output_columns,
             inner_size,
-            left_stride,
-            right_stride,
-            output_stride,
             stream);
     } else {
         launch_matmul_config<
@@ -1157,24 +867,17 @@ void launch_matmul(
             WM,
             WN,
             TM,
-            TN,
-            kTransposeLeft,
-            kTransposeRight,
-            kAccumulate>(
+            TN>(
             output,
             left,
             right,
             output_rows,
             output_columns,
             inner_size,
-            left_stride,
-            right_stride,
-            output_stride,
             stream);
     }
 }
 
-template <bool kTransposeLeft, bool kTransposeRight, bool kAccumulate>
 void launch_tensor_core_matmul(
     float* output,
     const __nv_bfloat16* left,
@@ -1182,14 +885,10 @@ void launch_tensor_core_matmul(
     int output_rows,
     int output_columns,
     int inner_size,
-    int left_stride,
-    int right_stride,
-    int output_stride,
     cudaStream_t stream) {
     const bool vector_aligned =
         inner_size % tc_mma::BK == 0 &&
-        left_stride % tc_mma::VECTOR_ELEMENTS == 0 &&
-        right_stride % tc_mma::VECTOR_ELEMENTS == 0;
+        output_columns % tc_mma::VECTOR_ELEMENTS == 0;
     const bool use_small_tile =
         output_rows <= 1024 &&
         output_rows % 64 == 0 &&
@@ -1200,104 +899,34 @@ void launch_tensor_core_matmul(
         output_columns % 128 == 0 &&
         vector_aligned;
     if (use_small_tile) {
-        if constexpr (kTransposeLeft) {
-            if (output_rows <= 1024) {
-                launch_tensor_core_mma_config<
-                    32,
-                    128,
-                    2,
-                    4,
-                    kTransposeLeft,
-                    kTransposeRight,
-                    kAccumulate>(
-                        output,
-                        left,
-                        right,
-                        output_rows,
-                        output_columns,
-                        inner_size,
-                        left_stride,
-                        right_stride,
-                        output_stride,
-                        stream);
-            } else {
-                launch_tensor_core_mma_config<
-                    64,
-                    128,
-                    4,
-                    4,
-                    kTransposeLeft,
-                    kTransposeRight,
-                    kAccumulate>(
-                        output,
-                        left,
-                        right,
-                        output_rows,
-                        output_columns,
-                        inner_size,
-                        left_stride,
-                        right_stride,
-                        output_stride,
-                        stream);
-            }
-        } else {
-            launch_tensor_core_mma_config<
-                64,
-                128,
-                4,
-                4,
-                kTransposeLeft,
-                kTransposeRight,
-                kAccumulate>(
-                    output,
-                    left,
-                    right,
-                    output_rows,
-                    output_columns,
-                    inner_size,
-                    left_stride,
-                    right_stride,
-                    output_stride,
-                    stream);
-        }
+        launch_tensor_core_mma_config<64, 128, 4, 4>(
+            output,
+            left,
+            right,
+            output_rows,
+            output_columns,
+            inner_size,
+            stream);
     } else if (use_large_tile) {
-        launch_tensor_core_mma_config<
-            128,
-            128,
-            4,
-            4,
-            kTransposeLeft,
-            kTransposeRight,
-            kAccumulate>
-            (
-                output,
-                left,
-                right,
-                output_rows,
-                output_columns,
-                inner_size,
-                left_stride,
-                right_stride,
-                output_stride,
-                stream);
+        launch_tensor_core_mma_config<128, 128, 4, 4>(
+            output,
+            left,
+            right,
+            output_rows,
+            output_columns,
+            inner_size,
+            stream);
     } else {
         const dim3 blocks(
             (output_columns + tc::BN - 1) / tc::BN,
             (output_rows + tc::BM - 1) / tc::BM);
-        matmul_tensor_core_edge_kernel<
-            kTransposeLeft,
-            kTransposeRight,
-            kAccumulate>
-            <<<blocks, tc::NUM_THREADS, 0, stream>>>(
+        matmul_tensor_core_edge_kernel<<<blocks, tc::NUM_THREADS, 0, stream>>>(
                 output,
                 left,
                 right,
                 output_rows,
                 output_columns,
-                inner_size,
-                left_stride,
-                right_stride,
-                output_stride);
+                inner_size);
     }
     CUDA_CHECK(cudaGetLastError());
 }
@@ -1311,42 +940,8 @@ void gemm_fp32_cuda(
     int M,
     int N,
     int K,
-    bool transpose_left,
-    bool transpose_right,
-    bool accumulate,
     cudaStream_t stream) {
-    const int left_stride = transpose_left ? M : K;
-    const int right_stride = transpose_right ? K : N;
-
-#define LAUNCH_FP32(TL, TR, ACC)                                              \
-    launch_matmul<TL, TR, ACC>(                                              \
-        output, left, right, M, N, K, left_stride, right_stride, N, stream)
-
-    if (transpose_left) {
-        if (transpose_right) {
-            if (accumulate) {
-                LAUNCH_FP32(true, true, true);
-            } else {
-                LAUNCH_FP32(true, true, false);
-            }
-        } else if (accumulate) {
-            LAUNCH_FP32(true, false, true);
-        } else {
-            LAUNCH_FP32(true, false, false);
-        }
-    } else if (transpose_right) {
-        if (accumulate) {
-            LAUNCH_FP32(false, true, true);
-        } else {
-            LAUNCH_FP32(false, true, false);
-        }
-    } else if (accumulate) {
-        LAUNCH_FP32(false, false, true);
-    } else {
-        LAUNCH_FP32(false, false, false);
-    }
-
-#undef LAUNCH_FP32
+    launch_matmul(output, left, right, M, N, K, stream);
 }
 
 void gemm_bf16_cuda(
@@ -1356,42 +951,8 @@ void gemm_bf16_cuda(
     int M,
     int N,
     int K,
-    bool transpose_left,
-    bool transpose_right,
-    bool accumulate,
     cudaStream_t stream) {
-    const int left_stride = transpose_left ? M : K;
-    const int right_stride = transpose_right ? K : N;
-
-#define LAUNCH_BF16(TL, TR, ACC)                                              \
-    launch_tensor_core_matmul<TL, TR, ACC>(                                   \
-        output, left, right, M, N, K, left_stride, right_stride, N, stream)
-
-    if (transpose_left) {
-        if (transpose_right) {
-            if (accumulate) {
-                LAUNCH_BF16(true, true, true);
-            } else {
-                LAUNCH_BF16(true, true, false);
-            }
-        } else if (accumulate) {
-            LAUNCH_BF16(true, false, true);
-        } else {
-            LAUNCH_BF16(true, false, false);
-        }
-    } else if (transpose_right) {
-        if (accumulate) {
-            LAUNCH_BF16(false, true, true);
-        } else {
-            LAUNCH_BF16(false, true, false);
-        }
-    } else if (accumulate) {
-        LAUNCH_BF16(false, false, true);
-    } else {
-        LAUNCH_BF16(false, false, false);
-    }
-
-#undef LAUNCH_BF16
+    launch_tensor_core_matmul(output, left, right, M, N, K, stream);
 }
 
 }  // namespace dscuda

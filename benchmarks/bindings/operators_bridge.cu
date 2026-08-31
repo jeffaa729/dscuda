@@ -44,35 +44,33 @@ extern "C" int dscuda_cublas_version() {
 
 extern "C" int dscuda_gemm(
     float* output, const void* left, const void* right,
-    int M, int N, int K, int bf16,
-    int transpose_left, int transpose_right, int accumulate,
-    int reference, cudaStream_t stream) {
+    int M, int N, int K, int bf16, int reference, cudaStream_t stream) {
     try {
         if (!reference) {
             if (bf16) {
                 dscuda::gemm_bf16_cuda(
                     output, static_cast<const __nv_bfloat16*>(left),
                     static_cast<const __nv_bfloat16*>(right),
-                    M, N, K, transpose_left, transpose_right, accumulate, stream);
+                    M, N, K, stream);
             } else {
                 dscuda::gemm_fp32_cuda(
                     output, static_cast<const float*>(left), static_cast<const float*>(right),
-                    M, N, K, transpose_left, transpose_right, accumulate, stream);
+                    M, N, K, stream);
             }
         } else {
             cublas_check(cublasSetStream(handle, stream));
             cublas_check(cublasSetMathMode(
                 handle, bf16 ? CUBLAS_TENSOR_OP_MATH : CUBLAS_PEDANTIC_MATH));
             const float alpha = 1.0F;
-            const float beta = accumulate ? 1.0F : 0.0F;
+            const float beta = 0.0F;
             const cudaDataType_t type = bf16 ? CUDA_R_16BF : CUDA_R_32F;
             cublas_check(cublasGemmEx(
                 handle,
-                transpose_right ? CUBLAS_OP_T : CUBLAS_OP_N,
-                transpose_left ? CUBLAS_OP_T : CUBLAS_OP_N,
+                CUBLAS_OP_N,
+                CUBLAS_OP_N,
                 N, M, K, &alpha,
-                right, type, transpose_right ? K : N,
-                left, type, transpose_left ? M : K,
+                right, type, N,
+                left, type, K,
                 &beta, output, CUDA_R_32F, N,
                 bf16 ? CUBLAS_COMPUTE_32F : CUBLAS_COMPUTE_32F_PEDANTIC,
                 bf16 ? CUBLAS_GEMM_DEFAULT_TENSOR_OP : CUBLAS_GEMM_DEFAULT));
@@ -110,7 +108,7 @@ extern "C" int dscuda_grouped_gemm(
                 const auto* x = static_cast<const char*>(input) + static_cast<size_t>(begin) * K * bytes;
                 const auto* w = static_cast<const char*>(weights) + static_cast<size_t>(e) * K * N * bytes;
                 if (dscuda_gemm(output + static_cast<size_t>(begin) * N, x, w,
-                               count, N, K, bf16, 0, 0, 0, 1, stream)) return 1;
+                               count, N, K, bf16, 1, stream)) return 1;
             }
         }
         return 0;
