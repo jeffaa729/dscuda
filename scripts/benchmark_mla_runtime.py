@@ -22,7 +22,7 @@ from mla import mla_forward, mla_backward
 
 BACKENDS = ("custom", "pytorch")
 FLASHMLA_SOURCE = "https://github.com/deepseek-ai/FlashMLA#requirements"
-FLASHMLA_STATUS = "not_implemented"
+FLASHMLA_STATUS = "separate_bf16_adapter"
 OUTPUT_NAMES = ("output", "LSE")
 GRADIENT_NAMES = ("dQ_latent", "dQ_rope", "dKV_latent", "dK_rope")
 
@@ -301,7 +301,7 @@ def write_results(args, torch, rows, checks):
                     compute_capability=torch.cuda.get_device_capability(),
                     torch=torch.__version__, cuda=torch.version.cuda, python=sys.version,
                     flashmla=dict(status=FLASHMLA_STATUS, source=FLASHMLA_SOURCE,
-                                  reason="No SM80 support; dense decoding is SM90-only"),
+                                  reason="Optional reference/python/flashmla.py adapter; not timed in this FP32-output comparison"),
                     contract=contract, seed=2026,
                     library_sha256=hashlib.sha256(args.library.read_bytes()).hexdigest(),
                     sources={p: hashlib.sha256((ROOT / p).read_bytes()).hexdigest() for p in files},

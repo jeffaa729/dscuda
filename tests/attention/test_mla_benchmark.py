@@ -42,9 +42,11 @@ class MlaBenchmarkTests(unittest.TestCase):
         self.assertTrue(any(c.mode == "decode" and min(c.cache_lengths) < c.splits
                             for c in benchmark.correctness_cases()))
 
-    def test_flashmla_is_really_blank(self):
-        self.assertEqual(benchmark.FLASHMLA_STATUS, "not_implemented")
-        self.assertEqual((ROOT / "reference/python/flashmla.py").stat().st_size, 0)
+    def test_flashmla_has_a_separate_precision_contract(self):
+        self.assertEqual(benchmark.FLASHMLA_STATUS, "separate_bf16_adapter")
+        source = (ROOT / "reference/python/flashmla.py").read_text()
+        self.assertIn("class FlashMLADecode", source)
+        self.assertIn("class FlashMLASparse", source)
 
     def test_table_alignment(self):
         row = dict(**asdict(benchmark.Case("prefill", 1, 128, 8)), operation="backward",
@@ -97,7 +99,7 @@ class MlaBenchmarkTests(unittest.TestCase):
             saved = json.loads((path / "mla_samples.json").read_text())
             self.assertEqual(saved["results"][0]["samples_ms"], [1, 2, 9])
             self.assertEqual(saved["results"][0]["reference_pct"], 100)
-            self.assertEqual(saved["environment"]["flashmla"]["status"], "not_implemented")
+            self.assertEqual(saved["environment"]["flashmla"]["status"], "separate_bf16_adapter")
         self.assertIn("1024,768", output.getvalue())
         self.assertIn("reference (PyTorch unfused) us", output.getvalue())
         self.assertTrue(all(line.startswith("|") for line in output.getvalue().splitlines()))

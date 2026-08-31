@@ -89,6 +89,17 @@ endif()
 
 # Optional PyTorch checks use the uv environment, not the system Python.
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/.venv/bin/python")
+    add_test(NAME references_python
+        COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/.venv/bin/python
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_references.py)
+    add_test(NAME references_cuda
+        COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/.venv/bin/python
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_references_cuda.py)
+    add_test(NAME grouped_cublas_cuda
+        COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/.venv/bin/python
+        ${CMAKE_CURRENT_SOURCE_DIR}/scripts/benchmark_references.py grouped_gemm
+        --library $<TARGET_FILE:dscuda_operator_bench> --check-only)
+    set_tests_properties(references_cuda grouped_cublas_cuda PROPERTIES LABELS "reference" RESOURCE_LOCK gpu)
     add_test(NAME mla_reference_python
         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/.venv/bin/python
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/attention/test_mla_reference.py)

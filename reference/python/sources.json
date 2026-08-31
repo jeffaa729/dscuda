@@ -1,0 +1,28 @@
+{
+  "precision": "Unquantized BF16/FP32 mathematical references; FP64 for CPU oracles. No FP4, FP8 QAT, distributed collectives or model projections.",
+  "hca_csa": {
+    "source": "https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/blob/60d8d70770c6776ff598c94bb586a859a38244f1/inference/model.py",
+    "contract": "Compressor, Indexer and Attention equations; independent implementation. HCA ratio128, CSA ratio4 overlap, sink, partial RoPE/inverse output RoPE. Supplied angle table supports the model's YaRN policy. Index keys are separate from attention KV. Orthogonal index rotation may be omitted only with quantization disabled."
+  },
+  "dsa": {
+    "source": "https://github.com/deepseek-ai/DeepSeek-V3.2-Exp",
+    "contract": "Prepared lightning-indexer inputs, weighted ReLU score, causal topk, sparse absorbed-query MLA. No gradient through discrete topk; indexer scores are differentiable separately."
+  },
+  "moe": {
+    "source": "https://github.com/deepseek-ai/DeepSeek-V3/blob/main/inference/model.py",
+    "contract": "V3 sigmoid routing with selection bias, optional group limiting, no capacity drops, SwiGLU experts. The native grouped comparison measures only packed GEMMs, not routing/dispatch."
+  },
+  "kda": {
+    "source": "https://github.com/fla-org/flash-linear-attention/tree/v0.5.2/fla/ops/kda",
+    "package": "fla-core==0.5.2 (uv.lock)",
+    "contract": "Independent recurrent oracle plus official FLA chunk forward/backward, prepared normalized q/k and activated log-decay/beta. FP32 final state in key-first layout."
+  },
+  "flashmla": {
+    "source": "https://github.com/deepseek-ai/FlashMLA/tree/15f13e5030374295491c5ce31b02d7e63a7772c6",
+    "contract": "Optional BF16 paged dense decode and BF16 sparse prefill. SM90/SM100 restrictions are checked. Not substituted into the existing local FP32-output MLA comparison. H100 execution is not verified on SM89."
+  },
+  "deepgemm": {
+    "source": "https://github.com/deepseek-ai/DeepGEMM/tree/559d79fb6994a58b8a15b4b93bf13ccc16edf247",
+    "contract": "Optional masked M-grouped BF16 GEMM with BF16 output. Only valid expert rows are defined; H100 execution is not verified on SM89."
+  }
+}
