@@ -2,6 +2,7 @@
 
 Official cache packing stays outside timing; the native FP32-to-BF16 output cast
 is timed. This compares prepared operations with different cache layouts.
+The h100 benchmark suite defaults to PyTorch plus FlashMLA dense decode.
 """
 import ctypes
 
@@ -10,23 +11,35 @@ from reference.python.mla import mla_forward, mla_backward
 
 
 def cases(args, family):
+    reference = args.reference or ("both" if args.suite == "h100" and not args.test else "pytorch")
+    if reference == "all":
+        reference = "both"
+    if reference not in ("pytorch", "flashmla", "both"):
+        raise ValueError("MLA references: pytorch, flashmla, or both (alias: all)")
+    use_flashmla = reference != "pytorch"
+    if use_flashmla:
+        if args.operation not in (None, "decode"):
+            raise ValueError("FlashMLA matches C512/R64 dense decode only; use --reference pytorch for forward/backward.")
+        from reference.python.flashmla import FlashMLADecode, load_decode
+        load_decode()
     lib = library("mla")
     forward = bind(lib, "dscuda_mla_forward", [P] * 6 + [I] * 5 + [F, P])
     backward = bind(lib, "dscuda_mla_backward", [P] * 11 + [I] * 5 + [F, I, P])
     decode = bind(lib, "dscuda_mla_decode", [P] * 8 + [I] * 6 + [F, P])
     workspace_size = bind(lib, "dscuda_mla_workspace_elements", [I] * 4, ctypes.c_size_t)
-    reference = args.reference or "pytorch"
-    if reference not in ("pytorch", "flashmla", "both"):
-        raise ValueError("MLA references: pytorch, flashmla, or both")
     shapes = [("prefill", 1, 128, 8), ("decode", 2, 1024, 16)]
     if args.test:
         shapes = [("prefill", 1, 1, 1), ("prefill", 2, 17, 3), ("prefill", 1, 65, 4),
-                  ("decode", 2, 23, 3), ("decode", 3, 129, 5)]
+                  ("decode", 2, 23, 3), ("decode", 3, 64, 16),
+                  ("decode", 2, 65, 64), ("decode", 3, 129, 128)]
+    elif args.suite == "h100":
+        shapes = [("decode", 1, 1024, 64), ("decode", 4, 4096, 64),
+                  ("decode", 4, 4096, 128), ("decode", 8, 8192, 128)]
     elif args.suite != "quick":
         shapes += [("prefill", 2, 257, 4), ("prefill", 1, 512, 8),
                    ("decode", 1, 256, 16), ("decode", 4, 4096, 32)]
     for mode, b, t, h in shapes:
-        if reference != "pytorch" and mode != "decode":
+        if use_flashmla and mode != "decode":
             continue
         q, c, r, splits = (t if mode == "prefill" else 1), 512, 64, 8
         inputs = tuple((torch.randn(shape, device="cuda") * .25).bfloat16()
@@ -36,7 +49,7 @@ def cases(args, family):
         output, lse = torch.empty(b, q, h, c, device="cuda"), torch.empty(b, h, q, device="cuda")
         lengths = tuple(max(1, t - i * t // (2 * b)) for i in range(b))
         if args.test and mode == "decode":
-            lengths = (1,) + lengths[1:]
+            lengths = (1,) + lengths[1:-1] + (t,)
         length_tensor = torch.tensor(lengths, device="cuda", dtype=torch.int32)
         mask = (torch.ones(t, t, device="cuda", dtype=torch.bool).tril() if mode == "prefill" else
                 (torch.arange(t, device="cuda")[None] < length_tensor[:, None])[:, None, None])
@@ -44,23 +57,22 @@ def cases(args, family):
         saved = tuple(x.detach() for x in saved_oracle)
         workspace = torch.empty(workspace_size(b, h, splits, c), device="cuda")
 
-        def pytorch_forward():
+        def pytorch_forward(bf16_output=use_flashmla):
             out, logsum = mla_forward(*inputs, scale, mask)
-            return (out.bfloat16() if reference != "pytorch" else out), logsum
+            return (out.bfloat16() if bf16_output else out), logsum
 
-        def custom_forward():
+        def custom_forward(bf16_output=use_flashmla):
             params = pointers((output, lse, *inputs))
             if mode == "prefill":
                 checked(lib, "mla", forward(*params, b, t, h, c, r, scale, stream()))
             else:
                 checked(lib, "mla", decode(*params, length_tensor.data_ptr(), workspace.data_ptr(),
                                             b, t, h, c, r, splits, scale, stream()))
-            return (output.bfloat16() if reference != "pytorch" else output), lse
+            return (output.bfloat16() if bf16_output else output), lse
 
         functions = {"custom": custom_forward, "PyTorch": pytorch_forward}
         expected = saved
-        if reference != "pytorch":
-            from reference.python.flashmla import FlashMLADecode
+        if use_flashmla:
             official = FlashMLADecode(torch.cat(inputs[:2], -1), torch.cat(inputs[2:], -1), length_tensor, scale)
             if reference == "flashmla":
                 functions.pop("PyTorch")
@@ -68,11 +80,18 @@ def cases(args, family):
             expected = (saved[0].bfloat16(), saved[1])
         size = f"B={b},Q={q},KV={t},H={h},C={c},RoPE={r}"
         if mode == "decode":
-            size += f",lengths={lengths},splits={splits}"
-        if reference != "pytorch":
-            size += ",out=bf16"
-        yield Operation(size, "bf16", "forward" if mode == "prefill" else "decode",
-                        functions, expected, 5e-4 if reference != "pytorch" else 2e-4, 8e-3)
+            size += f",lengths={lengths},custom_splits={splits}"
+        if use_flashmla:
+            size += ",page=64"
+        dtype = "bf16->bf16" if use_flashmla else "bf16"
+        yield Operation(size, dtype, "forward" if mode == "prefill" else "decode",
+                        functions, expected, (5e-4 if use_flashmla else 2e-4, 1e-5), (8e-3, 1e-4))
+        if args.test and mode == "decode" and not use_flashmla:
+            # Test the library comparison's output cast locally, using real
+            # custom/PyTorch operations; no substitute FlashMLA implementation.
+            yield Operation(size, "bf16->bf16", "decode_bf16",
+                            {"custom": lambda: custom_forward(True), "PyTorch": lambda: pytorch_forward(True)},
+                            (saved[0].bfloat16(), saved[1]), (5e-4, 1e-5), (8e-3, 1e-4))
         if mode == "prefill":
             dout = torch.randn_like(output) * .2
             expected_gradients = torch.autograd.grad(saved_oracle[0], oracle, dout)

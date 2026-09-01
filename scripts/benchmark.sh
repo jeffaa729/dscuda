@@ -7,6 +7,8 @@ if [[ $# == 0 || "$1" == "--help" || "$1" == "-h" ]]; then
     echo "usage: bash scripts/benchmark.sh FAMILY [quick|full|h100] [options]"
     echo "families: matmul, grouped_gemm, flash_attention, mla, expert_dispatch, hca, dsa, csa, kda, all"
     echo "options: --reference pytorch|cublas|flash_attention|flashmla|both|fla, --operation NAME"
+    echo "matmul/grouped_gemm: the benchmark reference is always cuBLAS"
+    echo "mla: --reference both (or all) compares PyTorch and FlashMLA dense decode (SM90); h100 defaults to both"
     exit 0
 fi
 family="$1"
