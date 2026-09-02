@@ -2,7 +2,7 @@
 // The backward kernels compute input and weight gradients using the same expert-grouped layout.
 
 #include "cuda_common.h"
-#include "grouped_gemm.h"
+#include "common.cuh"
 
 #include <mma.h>
 
@@ -240,7 +240,7 @@ __global__ void grouped_linear_weight_backward_kernel(
 
 }  // namespace
 
-void grouped_linear_forward_cuda(
+void grouped_linear_forward_sm89_cuda(
     float* output,
     const float* input,
     const float* weight,
@@ -264,7 +264,7 @@ void grouped_linear_forward_cuda(
     CUDA_CHECK(cudaGetLastError());
 }
 
-void grouped_linear_bf16_forward_cuda(
+void grouped_linear_bf16_forward_sm89_cuda(
     float* output,
     const __nv_bfloat16* input,
     const __nv_bfloat16* weight,
@@ -295,7 +295,7 @@ void grouped_linear_bf16_forward_cuda(
     CUDA_CHECK(cudaGetLastError());
 }
 
-void grouped_linear_backward_cuda(
+void grouped_linear_backward_sm89_cuda(
     float* input_gradient,
     float* weight_gradient,
     const float* output_gradient,

@@ -19,7 +19,7 @@ extern "C" int dscuda_flash_forward(
     const __nv_bfloat16* query, const __nv_bfloat16* key, const __nv_bfloat16* value,
     int batch, int sequence, int heads, int dimension, float scale, cudaStream_t stream) {
     try {
-        dscuda::flash_attention_forward_bf16_io_cuda(
+        dscuda::flash_attention_forward_cuda(
             output, logsumexp, query, key, value,
             batch, sequence, heads, dimension, scale, stream);
         return 0;
@@ -35,52 +35,9 @@ extern "C" int dscuda_flash_backward(
     const __nv_bfloat16* query, const __nv_bfloat16* key, const __nv_bfloat16* value,
     int batch, int sequence, int heads, int dimension, float scale, cudaStream_t stream) {
     try {
-        dscuda::flash_attention_backward_bf16_io_cuda(
+        dscuda::flash_attention_backward_cuda(
             dq, dk, dv, dout, output, logsumexp, query, key, value,
             batch, sequence, heads, dimension, scale, stream);
-        return 0;
-    } catch (const std::exception& error) {
-        last_error = error.what();
-        return 1;
-    }
-}
-
-// The FP32-output entry points also cover the scalar and sequence-tail paths.
-// Their accumulating backward is left unchanged for direct PyTorch tests.
-extern "C" int dscuda_flash_forward_fp32_output(
-    float* output, float* lse, const void* q, const void* k, const void* v,
-    int b, int t, int h, int d, int bf16, float scale, cudaStream_t stream) {
-    try {
-        if (bf16) {
-            dscuda::flash_attention_forward_bf16_cuda(output, lse,
-                static_cast<const __nv_bfloat16*>(q), static_cast<const __nv_bfloat16*>(k),
-                static_cast<const __nv_bfloat16*>(v), b, t, h, d, scale, stream);
-        } else {
-            dscuda::flash_attention_forward_cuda(output, lse,
-                static_cast<const float*>(q), static_cast<const float*>(k),
-                static_cast<const float*>(v), b, t, h, d, scale, stream);
-        }
-        return 0;
-    } catch (const std::exception& error) {
-        last_error = error.what();
-        return 1;
-    }
-}
-
-extern "C" int dscuda_flash_backward_fp32_output(
-    float* dq, float* dk, float* dv, const float* dout, const float* output, const float* lse,
-    const void* q, const void* k, const void* v,
-    int b, int t, int h, int d, int bf16, float scale, cudaStream_t stream) {
-    try {
-        if (bf16) {
-            dscuda::flash_attention_backward_bf16_cuda(dq, dk, dv, dout, output, lse,
-                static_cast<const __nv_bfloat16*>(q), static_cast<const __nv_bfloat16*>(k),
-                static_cast<const __nv_bfloat16*>(v), b, t, h, d, scale, stream);
-        } else {
-            dscuda::flash_attention_backward_cuda(dq, dk, dv, dout, output, lse,
-                static_cast<const float*>(q), static_cast<const float*>(k),
-                static_cast<const float*>(v), b, t, h, d, scale, stream);
-        }
         return 0;
     } catch (const std::exception& error) {
         last_error = error.what();

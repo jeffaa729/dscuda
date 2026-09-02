@@ -2,7 +2,7 @@
 // Its reverse kernels preserve the discrete routing decision while differentiating expert outputs and normalized selected affinities.
 
 #include "cuda_common.h"
-#include "expert_dispatch.h"
+#include "common.cuh"
 
 #include <cmath>
 
@@ -283,7 +283,7 @@ __global__ void update_routing_bias_kernel(
 
 }  // namespace
 
-void expert_route_forward_cuda(
+void expert_route_forward_sm89_cuda(
     float* scores,
     int* expert_indices,
     float* route_weights,
@@ -310,7 +310,7 @@ void expert_route_forward_cuda(
     CUDA_CHECK(cudaGetLastError());
 }
 
-void expert_dispatch_forward_cuda(
+void expert_dispatch_forward_sm89_cuda(
     float* dispatched_input,
     int* expert_offsets,
     int* route_to_slot,
@@ -349,7 +349,7 @@ void expert_dispatch_forward_cuda(
     CUDA_CHECK(cudaGetLastError());
 }
 
-void expert_combine_forward_cuda(
+void expert_combine_forward_sm89_cuda(
     float* output,
     const float* shared_output,
     const float* dispatched_output,
@@ -376,7 +376,7 @@ void expert_combine_forward_cuda(
     CUDA_CHECK(cudaGetLastError());
 }
 
-void expert_combine_backward_cuda(
+void expert_combine_backward_sm89_cuda(
     float* dispatched_output_gradient,
     float* route_weight_gradient,
     float* shared_output_gradient,
@@ -413,7 +413,7 @@ void expert_combine_backward_cuda(
     CUDA_CHECK(cudaGetLastError());
 }
 
-void expert_unroute_backward_cuda(
+void expert_unroute_backward_sm89_cuda(
     float* input_gradient,
     const float* dispatched_input_gradient,
     const int* route_to_slot,
@@ -436,7 +436,7 @@ void expert_unroute_backward_cuda(
     CUDA_CHECK(cudaGetLastError());
 }
 
-void expert_route_backward_cuda(
+void expert_route_backward_sm89_cuda(
     float* router_logit_gradient,
     const float* route_weight_gradient,
     const float* scores,
@@ -462,7 +462,7 @@ void expert_route_backward_cuda(
     CUDA_CHECK(cudaGetLastError());
 }
 
-void update_routing_bias_cuda(
+void update_routing_bias_sm89_cuda(
     float* routing_bias,
     const int* expert_counts,
     int experts,

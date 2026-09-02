@@ -190,7 +190,7 @@ int main(int argc, char** argv) {
             cudaMemcpyHostToDevice));
 
         auto forward = [&]() {
-            dscuda::flash_attention_forward_bf16_io_cuda(
+            dscuda::flash_attention_forward_cuda(
                 output,
                 logsumexp,
                 query,
@@ -203,7 +203,7 @@ int main(int argc, char** argv) {
                 scale);
         };
         auto backward = [&]() {
-            dscuda::flash_attention_backward_bf16_io_cuda(
+            dscuda::flash_attention_backward_cuda(
                 query_gradient,
                 key_gradient,
                 value_gradient,

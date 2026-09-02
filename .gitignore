@@ -11,3 +11,4 @@ __pycache__/
 .dockerignore
 /docs
 /tools
+BENCHMARK_MATRIX.md
