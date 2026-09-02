@@ -1,5 +1,5 @@
 // Exposes standalone compressed MLA forward, backward, and decode to Python-owned CUDA buffers.
-// All operands use BF16 storage; outputs, natural-log LSE, and gradients use FP32.
+// Activations and gradients use BF16 storage; natural-log LSE and workspace use FP32.
 #include "mla.h"
 
 #include <exception>
@@ -14,7 +14,7 @@ extern "C" const char* dscuda_mla_last_error() {
 }
 
 extern "C" int dscuda_mla_forward(
-    float* output, float* lse,
+    __nv_bfloat16* output, float* lse,
     const __nv_bfloat16* query, const __nv_bfloat16* query_rope,
     const __nv_bfloat16* latent, const __nv_bfloat16* key_rope,
     int batch, int sequence, int heads, int rank, int rope, float scale,
@@ -31,17 +31,18 @@ extern "C" int dscuda_mla_forward(
 }
 
 extern "C" int dscuda_mla_backward(
-    float* dquery, float* dquery_rope, float* dlatent, float* dkey_rope,
-    const float* dout, const float* output, const float* lse,
+    __nv_bfloat16* dquery, __nv_bfloat16* dquery_rope,
+    __nv_bfloat16* dlatent, __nv_bfloat16* dkey_rope,
+    const __nv_bfloat16* dout, const __nv_bfloat16* output, const float* lse,
     const __nv_bfloat16* query, const __nv_bfloat16* query_rope,
     const __nv_bfloat16* latent, const __nv_bfloat16* key_rope,
     int batch, int sequence, int heads, int rank, int rope, float scale,
-    int accumulate, cudaStream_t stream) {
+    cudaStream_t stream) {
     try {
         dscuda::mla_compressed_attention_backward_cuda(
             dquery, dquery_rope, dlatent, dkey_rope, dout, output, lse,
             query, query_rope, latent, key_rope,
-            batch, sequence, heads, rank, rope, scale, accumulate, stream);
+            batch, sequence, heads, rank, rope, scale, stream);
         return 0;
     } catch (const std::exception& error) {
         last_error = error.what();
@@ -55,16 +56,15 @@ extern "C" std::size_t dscuda_mla_workspace_elements(
 }
 
 extern "C" int dscuda_mla_decode(
-    float* output, float* lse,
-    const __nv_bfloat16* query, const __nv_bfloat16* query_rope,
-    const __nv_bfloat16* latent, const __nv_bfloat16* key_rope,
-    const int* lengths, float* workspace,
-    int batch, int sequence, int heads, int rank, int rope, int splits,
+    __nv_bfloat16* output, float* lse,
+    const __nv_bfloat16* query, const __nv_bfloat16* paged_cache,
+    const int* block_table, const int* lengths, float* workspace,
+    int batch, int heads, int rank, int rope, int page_size, int pages, int splits,
     float scale, cudaStream_t stream) {
     try {
         dscuda::mla_decode_forward_cuda(
-            output, lse, query, query_rope, latent, key_rope, lengths, workspace,
-            batch, sequence, heads, rank, rope, splits, scale, stream);
+            output, lse, query, paged_cache, block_table, lengths, workspace,
+            batch, heads, rank, rope, page_size, pages, splits, scale, stream);
         return 0;
     } catch (const std::exception& error) {
         last_error = error.what();

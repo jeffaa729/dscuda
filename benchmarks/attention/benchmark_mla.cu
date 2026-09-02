@@ -43,7 +43,8 @@ int main(int argc, char** argv) {
             kv_elements, __float2bfloat16(0.25F));
         std::vector<__nv_bfloat16> host_key_rope(
             key_rope_elements, __float2bfloat16(0.03125F));
-        std::vector<float> host_output_gradient(query_elements, 0.015625F);
+        std::vector<__nv_bfloat16> host_output_gradient(
+            query_elements, __float2bfloat16(0.015625F));
 
         auto* query = static_cast<__nv_bfloat16*>(
             dscuda::device_malloc(query_elements * sizeof(__nv_bfloat16)));
@@ -55,20 +56,20 @@ int main(int argc, char** argv) {
         auto* key_rope = static_cast<__nv_bfloat16*>(
             dscuda::device_malloc(
                 key_rope_elements * sizeof(__nv_bfloat16)));
-        auto* output = static_cast<float*>(
-            dscuda::device_malloc(query_elements * sizeof(float)));
+        auto* output = static_cast<__nv_bfloat16*>(
+            dscuda::device_malloc(query_elements * sizeof(__nv_bfloat16)));
         auto* logsumexp = static_cast<float*>(
             dscuda::device_malloc(rows * sizeof(float)));
-        auto* output_gradient = static_cast<float*>(
-            dscuda::device_malloc(query_elements * sizeof(float)));
-        auto* query_gradient = static_cast<float*>(
-            dscuda::device_malloc(query_elements * sizeof(float)));
-        auto* query_rope_gradient = static_cast<float*>(
-            dscuda::device_malloc(query_rope_elements * sizeof(float)));
-        auto* kv_gradient = static_cast<float*>(
-            dscuda::device_malloc(kv_elements * sizeof(float)));
-        auto* key_rope_gradient = static_cast<float*>(
-            dscuda::device_malloc(key_rope_elements * sizeof(float)));
+        auto* output_gradient = static_cast<__nv_bfloat16*>(
+            dscuda::device_malloc(query_elements * sizeof(__nv_bfloat16)));
+        auto* query_gradient = static_cast<__nv_bfloat16*>(
+            dscuda::device_malloc(query_elements * sizeof(__nv_bfloat16)));
+        auto* query_rope_gradient = static_cast<__nv_bfloat16*>(
+            dscuda::device_malloc(query_rope_elements * sizeof(__nv_bfloat16)));
+        auto* kv_gradient = static_cast<__nv_bfloat16*>(
+            dscuda::device_malloc(kv_elements * sizeof(__nv_bfloat16)));
+        auto* key_rope_gradient = static_cast<__nv_bfloat16*>(
+            dscuda::device_malloc(key_rope_elements * sizeof(__nv_bfloat16)));
 
         CUDA_CHECK(cudaMemcpy(
             query, host_query.data(), query_elements * sizeof(__nv_bfloat16),
@@ -86,7 +87,7 @@ int main(int argc, char** argv) {
             cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(
             output_gradient, host_output_gradient.data(),
-            query_elements * sizeof(float), cudaMemcpyHostToDevice));
+            query_elements * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice));
 
         auto run = [&]() {
             dscuda::mla_compressed_attention_forward_cuda(
@@ -97,7 +98,7 @@ int main(int argc, char** argv) {
                 query_gradient, query_rope_gradient, kv_gradient,
                 key_rope_gradient, output_gradient, output, logsumexp, query,
                 query_rope, kv, key_rope, batch_size, sequence_length, heads,
-                kv_rank, rope_size, scale, false);
+                kv_rank, rope_size, scale);
         };
 
         run();

@@ -2,7 +2,7 @@
 // The backward pass recomputes probabilities from saved FP32 log-sum-exp values and assigns one CTA to every independently writable gradient row.
 
 #include "cuda_common.h"
-#include "mla.h"
+#include "common.cuh"
 
 #include <cuda_bf16.h>
 #include <math_constants.h>
@@ -178,7 +178,7 @@ __device__ __forceinline__ void copy_tile(
 }
 
 // P stays FP32 for softmax statistics. Two BF16 parts approximate each weight
-// for PV, retaining the FP32-output accuracy contract without a SIMT fallback.
+// for PV before the final BF16 output store.
 __device__ __forceinline__ void split_probability(
     float x, float y, unsigned int& high, unsigned int& low) {
     union Packed {
@@ -196,7 +196,7 @@ __device__ __forceinline__ void split_probability(
 // then each warp owns 128 output columns; KV is shared across all query heads.
 __global__ __launch_bounds__(THREADS, 2)
 void mla_forward_kernel(
-    float* __restrict__ output,
+    __nv_bfloat16* __restrict__ output,
     float* __restrict__ logsumexp,
     const __nv_bfloat16* __restrict__ query_latent,
     const __nv_bfloat16* __restrict__ query_rope,
@@ -324,14 +324,18 @@ void mla_forward_kernel(
     for (int tile = 0; tile < OUTPUT_TILES; ++tile) {
         const int column = (warp * OUTPUT_TILES + tile) * 8 + lane % 4 * 2;
         if (top_query < sequence_length) {
-            *reinterpret_cast<float2*>(output + query_offset(
+            *reinterpret_cast<__nv_bfloat162*>(output + query_offset(
                 batch, top_query, head, sequence_length, heads, C) + column) =
-                make_float2(numerator[tile][0] / row_sum[0], numerator[tile][1] / row_sum[0]);
+                __floats2bfloat162_rn(
+                    numerator[tile][0] / row_sum[0],
+                    numerator[tile][1] / row_sum[0]);
         }
         if (bottom_query < sequence_length) {
-            *reinterpret_cast<float2*>(output + query_offset(
+            *reinterpret_cast<__nv_bfloat162*>(output + query_offset(
                 batch, bottom_query, head, sequence_length, heads, C) + column) =
-                make_float2(numerator[tile][2] / row_sum[1], numerator[tile][3] / row_sum[1]);
+                __floats2bfloat162_rn(
+                    numerator[tile][2] / row_sum[1],
+                    numerator[tile][3] / row_sum[1]);
         }
     }
     if (warp == 0 && lane % 4 == 0) {
@@ -349,10 +353,10 @@ void mla_forward_kernel(
 }  // namespace mla_forward
 
 __global__ void mla_query_backward_kernel(
-    float* query_latent_gradient,
-    float* query_rope_gradient,
-    const float* output_gradient,
-    const float* output,
+    __nv_bfloat16* query_latent_gradient,
+    __nv_bfloat16* query_rope_gradient,
+    const __nv_bfloat16* output_gradient,
+    const __nv_bfloat16* output,
     const float* logsumexp,
     const __nv_bfloat16* query_latent,
     const __nv_bfloat16* query_rope,
@@ -362,8 +366,7 @@ __global__ void mla_query_backward_kernel(
     int heads,
     int kv_rank,
     int rope_size,
-    float scale,
-    bool accumulate) {
+    float scale) {
     __shared__ float delta;
     __shared__ float score_gradient;
 
@@ -378,7 +381,8 @@ __global__ void mla_query_backward_kernel(
     float local_delta = 0.0F;
     for (int column = threadIdx.x; column < kv_rank; column += BLOCK_SIZE) {
         local_delta +=
-            output_gradient[query_base + column] * output[query_base + column];
+            __bfloat162float(output_gradient[query_base + column]) *
+            __bfloat162float(output[query_base + column]);
     }
     local_delta = block_reduce_sum(local_delta);
     if (threadIdx.x == 0) {
@@ -412,7 +416,7 @@ __global__ void mla_query_backward_kernel(
         float probability_gradient = 0.0F;
         for (int column = threadIdx.x; column < kv_rank; column += BLOCK_SIZE) {
             probability_gradient +=
-                output_gradient[query_base + column] *
+                __bfloat162float(output_gradient[query_base + column]) *
                 __bfloat162float(kv_latent[kv_base + column]);
         }
         probability_gradient = block_reduce_sum(probability_gradient);
@@ -440,19 +444,19 @@ __global__ void mla_query_backward_kernel(
          column < kv_rank;
          column += BLOCK_SIZE, ++slot) {
         query_latent_gradient[query_base + column] =
-            (accumulate ? query_latent_gradient[query_base + column] : 0.0F) + latent_update[slot];
+            __float2bfloat16(latent_update[slot]);
     }
     if (threadIdx.x < rope_size) {
         query_rope_gradient[query_rope_base + threadIdx.x] =
-            (accumulate ? query_rope_gradient[query_rope_base + threadIdx.x] : 0.0F) + rope_update;
+            __float2bfloat16(rope_update);
     }
 }
 
 __global__ void mla_kv_backward_kernel(
-    float* kv_latent_gradient,
-    float* key_rope_gradient,
-    const float* output_gradient,
-    const float* output,
+    __nv_bfloat16* kv_latent_gradient,
+    __nv_bfloat16* key_rope_gradient,
+    const __nv_bfloat16* output_gradient,
+    const __nv_bfloat16* output,
     const float* logsumexp,
     const __nv_bfloat16* query_latent,
     const __nv_bfloat16* query_rope,
@@ -462,8 +466,7 @@ __global__ void mla_kv_backward_kernel(
     int heads,
     int kv_rank,
     int rope_size,
-    float scale,
-    bool accumulate) {
+    float scale) {
     __shared__ float delta;
     __shared__ float score_gradient;
     __shared__ float probability;
@@ -503,10 +506,12 @@ __global__ void mla_kv_backward_kernel(
             for (int column = threadIdx.x;
                  column < kv_rank;
                  column += BLOCK_SIZE) {
-                const float gradient = output_gradient[query_base + column];
+                const float gradient =
+                    __bfloat162float(output_gradient[query_base + column]);
                 local_probability_gradient +=
                     gradient * __bfloat162float(kv_latent[kv_base + column]);
-                local_delta += gradient * output[query_base + column];
+                local_delta +=
+                    gradient * __bfloat162float(output[query_base + column]);
             }
             local_probability_gradient = block_reduce_sum(local_probability_gradient);
             local_delta = block_reduce_sum(local_delta);
@@ -528,7 +533,8 @@ __global__ void mla_kv_backward_kernel(
                  column < kv_rank;
                  column += BLOCK_SIZE, ++slot) {
                 latent_update[slot] +=
-                    probability * output_gradient[query_base + column] +
+                    probability * __bfloat162float(
+                        output_gradient[query_base + column]) +
                     score_gradient *
                         __bfloat162float(query_latent[query_base + column]);
             }
@@ -544,25 +550,25 @@ __global__ void mla_kv_backward_kernel(
          column < kv_rank;
          column += BLOCK_SIZE, ++slot) {
         kv_latent_gradient[kv_base + column] =
-            (accumulate ? kv_latent_gradient[kv_base + column] : 0.0F) + latent_update[slot];
+            __float2bfloat16(latent_update[slot]);
     }
     if (threadIdx.x < rope_size) {
         key_rope_gradient[key_rope_base + threadIdx.x] =
-            (accumulate ? key_rope_gradient[key_rope_base + threadIdx.x] : 0.0F) + rope_update;
+            __float2bfloat16(rope_update);
     }
 }
 
 __global__ void mla_decode_split_kernel(
-    const __nv_bfloat16* query_latent,
-    const __nv_bfloat16* query_rope,
-    const __nv_bfloat16* kv_cache,
-    const __nv_bfloat16* key_rope_cache,
+    const __nv_bfloat16* query,
+    const __nv_bfloat16* paged_kv_cache,
+    const int* block_table,
     const int* cache_lengths,
     float* workspace,
-    int maximum_sequence_length,
     int heads,
     int kv_rank,
     int rope_size,
+    int page_size,
+    int pages_per_sequence,
     int splits,
     float scale) {
     __shared__ float output_accumulator[MAX_KV_RANK];
@@ -578,8 +584,9 @@ __global__ void mla_decode_split_kernel(
     const int tokens_per_split = (cache_length + splits - 1) / splits;
     const int first_token = split * tokens_per_split;
     const int last_token = min(first_token + tokens_per_split, cache_length);
-    const int query_base = (batch * heads + head) * kv_rank;
-    const int query_rope_base = (batch * heads + head) * rope_size;
+    const int packed_width = kv_rank + rope_size;
+    const int query_base = (batch * heads + head) * packed_width;
+    const int query_rope_base = query_base + kv_rank;
 
     for (int column = threadIdx.x; column < kv_rank; column += BLOCK_SIZE) {
         output_accumulator[column] = 0.0F;
@@ -591,15 +598,18 @@ __global__ void mla_decode_split_kernel(
     __syncthreads();
 
     for (int token = first_token; token < last_token; ++token) {
+        const int logical_page = token / page_size;
+        const int page_offset = token % page_size;
+        const int physical_page =
+            block_table[batch * pages_per_sequence + logical_page];
         const int kv_base =
-            (batch * maximum_sequence_length + token) * kv_rank;
-        const int key_rope_base =
-            (batch * maximum_sequence_length + token) * rope_size;
+            (physical_page * page_size + page_offset) * packed_width;
+        const int key_rope_base = kv_base + kv_rank;
         const float score = dot_query_key(
-            query_latent,
-            query_rope,
-            kv_cache,
-            key_rope_cache,
+            query,
+            query,
+            paged_kv_cache,
+            paged_kv_cache,
             query_base,
             query_rope_base,
             kv_base,
@@ -620,7 +630,8 @@ __global__ void mla_decode_split_kernel(
         for (int column = threadIdx.x; column < kv_rank; column += BLOCK_SIZE) {
             output_accumulator[column] =
                 output_accumulator[column] * previous_scale +
-                probability_scale * __bfloat162float(kv_cache[kv_base + column]);
+                probability_scale *
+                    __bfloat162float(paged_kv_cache[kv_base + column]);
         }
         __syncthreads();
     }
@@ -637,7 +648,7 @@ __global__ void mla_decode_split_kernel(
 }
 
 __global__ void mla_decode_combine_kernel(
-    float* output,
+    __nv_bfloat16* output,
     float* logsumexp,
     const float* workspace,
     int heads,
@@ -674,14 +685,15 @@ __global__ void mla_decode_combine_kernel(
             numerator += workspace[state_base + 2 + column] *
                          expf(workspace[state_base] - row_maximum);
         }
-        output[row * kv_rank + column] = numerator / row_normalizer;
+        output[row * kv_rank + column] =
+            __float2bfloat16(numerator / row_normalizer);
     }
 }
 
 }  // namespace
 
-void mla_compressed_attention_forward_cuda(
-    float* output,
+void mla_compressed_attention_forward_sm89_cuda(
+    __nv_bfloat16* output,
     float* logsumexp,
     const __nv_bfloat16* query_latent,
     const __nv_bfloat16* query_rope,
@@ -710,13 +722,13 @@ void mla_compressed_attention_forward_cuda(
     CUDA_CHECK(cudaGetLastError());
 }
 
-void mla_compressed_attention_backward_cuda(
-    float* query_latent_gradient,
-    float* query_rope_gradient,
-    float* kv_latent_gradient,
-    float* key_rope_gradient,
-    const float* output_gradient,
-    const float* output,
+void mla_compressed_attention_backward_sm89_cuda(
+    __nv_bfloat16* query_latent_gradient,
+    __nv_bfloat16* query_rope_gradient,
+    __nv_bfloat16* kv_latent_gradient,
+    __nv_bfloat16* key_rope_gradient,
+    const __nv_bfloat16* output_gradient,
+    const __nv_bfloat16* output,
     const float* logsumexp,
     const __nv_bfloat16* query_latent,
     const __nv_bfloat16* query_rope,
@@ -728,7 +740,6 @@ void mla_compressed_attention_backward_cuda(
     int kv_rank,
     int rope_size,
     float scale,
-    bool accumulate,
     cudaStream_t stream) {
     check_shape(kv_rank, rope_size);
     const dim3 query_grid(sequence_length, heads, batch_size);
@@ -746,8 +757,7 @@ void mla_compressed_attention_backward_cuda(
         heads,
         kv_rank,
         rope_size,
-        scale,
-        accumulate);
+        scale);
     CUDA_CHECK(cudaGetLastError());
 
     const dim3 kv_grid(sequence_length, batch_size);
@@ -765,12 +775,11 @@ void mla_compressed_attention_backward_cuda(
         heads,
         kv_rank,
         rope_size,
-        scale,
-        accumulate);
+        scale);
     CUDA_CHECK(cudaGetLastError());
 }
 
-std::size_t mla_decode_workspace_elements(
+std::size_t mla_decode_workspace_elements_sm89(
     int batch_size,
     int heads,
     int splits,
@@ -779,36 +788,36 @@ std::size_t mla_decode_workspace_elements(
            (kv_rank + 2);
 }
 
-void mla_decode_forward_cuda(
-    float* output,
+void mla_decode_forward_sm89_cuda(
+    __nv_bfloat16* output,
     float* logsumexp,
-    const __nv_bfloat16* query_latent,
-    const __nv_bfloat16* query_rope,
-    const __nv_bfloat16* kv_cache,
-    const __nv_bfloat16* key_rope_cache,
+    const __nv_bfloat16* query,
+    const __nv_bfloat16* paged_kv_cache,
+    const int* block_table,
     const int* cache_lengths,
     float* workspace,
     int batch_size,
-    int maximum_sequence_length,
     int heads,
     int kv_rank,
     int rope_size,
+    int page_size,
+    int pages_per_sequence,
     int splits,
     float scale,
     cudaStream_t stream) {
     check_shape(kv_rank, rope_size);
     const dim3 split_grid(splits, heads, batch_size);
     mla_decode_split_kernel<<<split_grid, BLOCK_SIZE, 0, stream>>>(
-        query_latent,
-        query_rope,
-        kv_cache,
-        key_rope_cache,
+        query,
+        paged_kv_cache,
+        block_table,
         cache_lengths,
         workspace,
-        maximum_sequence_length,
         heads,
         kv_rank,
         rope_size,
+        page_size,
+        pages_per_sequence,
         splits,
         scale);
     CUDA_CHECK(cudaGetLastError());

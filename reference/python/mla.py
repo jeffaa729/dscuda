@@ -1,9 +1,4 @@
-"""Unfused absorbed-query MLA equations with one shared latent serving as K and V.
-
-The benchmark feeds BF16 operands and returns FP32 output, natural-log LSE,
-and FP32 gradients. Upcasts and all attention math are inside the operator.
-This is a materialized PyTorch reference, not FlashMLA or an optimized SDPA path.
-"""
+"""Unfused absorbed-query MLA with BF16 activations and FP32 math/LSE."""
 
 
 def _compute(tensor):
@@ -28,14 +23,14 @@ def mla_forward(query, query_rope, latent, key_rope, scale, mask):
     lse = score.logsumexp(dim=-1)
     probability = (score - lse.unsqueeze(-1)).exp()
     output = torch.einsum("bhqk,bkc->bqhc", probability, latent)
-    return output.contiguous(), lse.contiguous()
+    return output.bfloat16().contiguous(), lse.contiguous()
 
 
 def mla_backward(dout, output, lse, query, query_rope, latent, key_rope, scale, mask):
     import torch
 
-    query, query_rope, latent, key_rope = map(
-        _compute, (query, query_rope, latent, key_rope))
+    dout, output, query, query_rope, latent, key_rope = map(
+        _compute, (dout, output, query, query_rope, latent, key_rope))
     score = _scores(query, query_rope, latent, key_rope, scale, mask)
     probability = (score - lse.unsqueeze(-1)).exp()
     dprobability = torch.einsum("bqhc,bkc->bhqk", dout, latent)
@@ -47,4 +42,5 @@ def mla_backward(dout, output, lse, query, query_rope, latent, key_rope, scale, 
     dlatent = (torch.einsum("bhqk,bqhc->bkc", dscore, query)
                + torch.einsum("bhqk,bqhc->bkc", probability, dout))
     dkey_rope = torch.einsum("bhqk,bqhr->bkr", dscore, query_rope)
-    return tuple(t.contiguous() for t in (dquery, dquery_rope, dlatent, dkey_rope))
+    return tuple(t.bfloat16().contiguous()
+                 for t in (dquery, dquery_rope, dlatent, dkey_rope))

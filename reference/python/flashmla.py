@@ -1,8 +1,7 @@
 """Optional official FlashMLA adapters; no silent PyTorch fallback.
 
 Dense decode uses paged BF16 C512/R64 storage and SM90. Sparse prefill uses
-the upstream BF16 MQA interface on SM90/SM100. Neither is the local MLA
-benchmark's FP32-output contract: these adapters return BF16 output.
+the upstream BF16 MQA interface on SM90/SM100. Both return BF16 output.
 """
 
 import torch
@@ -61,20 +60,27 @@ def flatten_sparse_indices(indices, kv_length):
 class FlashMLADecode:
     """Fixed-shape decode; the runner's untimed check initializes scheduler metadata."""
 
-    def __init__(self, q, kv, lengths, scale=None):
+    def __init__(self, q, cache, block_table, lengths, scale=None):
         require_hopper(q)
         self.call, get_mla_metadata = load_decode(q.device)
-        if q.shape[-1] != 576 or kv.shape[-1] != 576 or q.shape[1] != 1:
+        if q.shape[-1] != 576 or cache.shape[-1] != 576 or q.shape[1] != 1:
             raise ValueError("dense decode requires Q=1 and packed C512/R64 Q/KV")
-        if kv.dtype != q.dtype or kv.device != q.device or kv.shape[0] != q.shape[0]:
-            raise ValueError("Q/KV must share batch size, device and BF16 dtype")
+        if cache.dtype != q.dtype or cache.device != q.device:
+            raise ValueError("Q/KV must share device and BF16 dtype")
+        if block_table.shape[0] != q.shape[0]:
+            raise ValueError("block table and Q must share batch size")
+        capacity = block_table.shape[1] * cache.shape[1]
         if lengths.shape != (q.shape[0],) or not bool(
-            ((lengths > 0) & (lengths <= kv.shape[1])).all()
+            ((lengths > 0) & (lengths <= capacity)).all()
         ):
             raise ValueError(
                 "cache lengths must be positive and within each packed sequence"
             )
-        self.q, self.cache = q.contiguous(), pack_cache(kv)
+        self.q = q.contiguous()
+        self.cache = (
+            cache.contiguous(),
+            block_table.to(device=q.device, dtype=torch.int32).contiguous(),
+        )
         self.lengths = lengths.to(device=q.device, dtype=torch.int32).contiguous()
         self.metadata, self.splits = get_mla_metadata()
         self.scale = scale

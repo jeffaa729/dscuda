@@ -16,11 +16,16 @@ enable_testing()
 
 add_library(dscuda_kernels STATIC
     kernels/common/cuda_common.cu
-    kernels/attention/flash_attention.cu
-    kernels/attention/mla.cu
-    kernels/gemm/matmul.cu
-    kernels/gemm/grouped_gemm.cu
-    kernels/moe/expert_dispatch.cu
+    kernels/attention/flash_attention/dispatch.cu
+    kernels/attention/flash_attention/sm89.cu
+    kernels/attention/mla/dispatch.cu
+    kernels/attention/mla/sm89.cu
+    kernels/gemm/matmul/dispatch.cu
+    kernels/gemm/matmul/sm89.cu
+    kernels/moe/expert_dispatch/dispatch.cu
+    kernels/moe/expert_dispatch/sm89.cu
+    kernels/moe/grouped_gemm/dispatch.cu
+    kernels/moe/grouped_gemm/sm89.cu
 )
 target_include_directories(dscuda_kernels PUBLIC include)
 target_link_libraries(dscuda_kernels PUBLIC CUDA::cudart)

@@ -1,7 +1,7 @@
 // Implements row-major C[M,N] = A[M,K] * B[K,N] with FP32 CUDA Core and BF16 Tensor Core kernels.
 
 #include "cuda_common.h"
-#include "matmul.h"
+#include "common.cuh"
 
 #include <cuda_bf16.h>
 #include <mma.h>
@@ -933,7 +933,7 @@ void launch_tensor_core_matmul(
 
 }  // namespace
 
-void gemm_fp32_cuda(
+void gemm_fp32_sm89_cuda(
     float* output,
     const float* left,
     const float* right,
@@ -944,7 +944,7 @@ void gemm_fp32_cuda(
     launch_matmul(output, left, right, M, N, K, stream);
 }
 
-void gemm_bf16_cuda(
+void gemm_bf16_sm89_cuda(
     float* output,
     const __nv_bfloat16* left,
     const __nv_bfloat16* right,

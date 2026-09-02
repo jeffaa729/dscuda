@@ -1,21 +1,10 @@
 #pragma once
 
-#include <cuda_bf16.h>
-#include <cuda_runtime.h>
-
-#include <cstddef>
+#include "mla.h"
 
 namespace dscuda {
 
-constexpr int MLA_KV_RANK = 512;
-constexpr int MLA_ROPE_SIZE = 64;
-
-// Implements the absorbed-query form of MLA. Query latents use [B,T,H,C],
-// query RoPE uses [B,T,H,R], shared KV latents use [B,T,C], shared key RoPE
-// uses [B,T,R], output uses [B,T,H,C], and logsumexp uses [B,H,T] (natural log).
-// One supported CUDA shape: C=512, R=64; B, T and H may vary. Forward uses
-// BF16 Tensor Cores with FP32 accumulation, including incomplete sequence tiles.
-void mla_compressed_attention_forward_cuda(
+void mla_compressed_attention_forward_sm89_cuda(
     __nv_bfloat16* output,
     float* logsumexp,
     const __nv_bfloat16* query_latent,
@@ -28,11 +17,9 @@ void mla_compressed_attention_forward_cuda(
     int kv_rank,
     int rope_size,
     float scale,
-    cudaStream_t stream = nullptr);
+    cudaStream_t stream);
 
-// Recomputes causal probabilities from the saved FP32 logsumexp. dO and all
-// four overwritten gradient buffers use BF16.
-void mla_compressed_attention_backward_cuda(
+void mla_compressed_attention_backward_sm89_cuda(
     __nv_bfloat16* query_latent_gradient,
     __nv_bfloat16* query_rope_gradient,
     __nv_bfloat16* kv_latent_gradient,
@@ -50,19 +37,15 @@ void mla_compressed_attention_backward_cuda(
     int kv_rank,
     int rope_size,
     float scale,
-    cudaStream_t stream = nullptr);
+    cudaStream_t stream);
 
-// Returns the FP32 workspace for split maxima, normalizers, and unnormalized
-// latent outputs stored as [B,H,S,2+C].
-std::size_t mla_decode_workspace_elements(
+std::size_t mla_decode_workspace_elements_sm89(
     int batch_size,
     int heads,
     int splits,
     int kv_rank);
 
-// Decodes one packed BF16 query [B,1,H,C+R] from FlashMLA-compatible paged KV
-// [blocks,page,1,C+R]. The block table is [B,pages_per_sequence].
-void mla_decode_forward_cuda(
+void mla_decode_forward_sm89_cuda(
     __nv_bfloat16* output,
     float* logsumexp,
     const __nv_bfloat16* query,
@@ -78,6 +61,6 @@ void mla_decode_forward_cuda(
     int pages_per_sequence,
     int splits,
     float scale,
-    cudaStream_t stream = nullptr);
+    cudaStream_t stream);
 
 }  // namespace dscuda
