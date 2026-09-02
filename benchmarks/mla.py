@@ -1,10 +1,10 @@
 """Dense C512/R64 BF16 MLA with PyTorch and official FlashMLA references."""
 
 import ctypes
+import importlib
 
 from common import F, I, P, Operation, bind, checked, library, pointers, stream, torch
-from reference.python.flashmla import pack_cache
-from reference.python.mla import mla_forward, mla_backward
+from reference.python.mla import mla_forward, mla_backward, pack_cache
 
 
 def cases(args, family):
@@ -15,13 +15,14 @@ def cases(args, family):
     if reference not in ("pytorch", "flashmla", "both"):
         raise ValueError("MLA references: pytorch, flashmla, or both (alias: all)")
     use_flashmla = reference != "pytorch"
+    flashmla = None
     if use_flashmla:
         if args.operation not in (None, "decode"):
             raise ValueError(
                 "FlashMLA matches C512/R64 dense decode only; "
                 "use --reference pytorch for forward/backward.")
-        from reference.python.flashmla import FlashMLADecode, load_decode
-        load_decode()
+        flashmla = importlib.import_module("reference.python.flashmla")
+        flashmla.load_decode()
 
     lib = library("mla")
     forward = bind(lib, "dscuda_mla_forward", [P] * 6 + [I] * 5 + [F, P])
@@ -90,7 +91,7 @@ def cases(args, family):
 
         functions = {"custom": custom_forward, "PyTorch": pytorch_forward}
         if use_flashmla:
-            official = FlashMLADecode(
+            official = flashmla.FlashMLADecode(
                 packed_query, paged_cache, block_table, length_tensor, scale)
             if reference == "flashmla":
                 functions.pop("PyTorch")

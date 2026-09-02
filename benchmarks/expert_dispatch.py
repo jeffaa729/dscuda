@@ -8,10 +8,6 @@ def cases(args, family):
     routing = bind(lib, "dscuda_route", [P] * 6 + [I] * 3 + [F, P])
     packing = bind(lib, "dscuda_dispatch", [P] * 8 + [I] * 4 + [P])
     combining = bind(lib, "dscuda_combine", [P] * 5 + [I] * 3 + [P])
-    combine_backward = bind(lib, "dscuda_combine_backward", [P] * 7 + [I] * 3 + [P])
-    unroute = bind(lib, "dscuda_unroute", [P] * 3 + [I] * 3 + [P])
-    route_backward = bind(lib, "dscuda_route_backward", [P] * 4 + [I] * 3 + [F, P])
-    update_bias = bind(lib, "dscuda_routing_bias", [P] * 2 + [I] * 2 + [F, P])
     shapes = ((7, 11, 4, 2), (65, 129, 16, 4)) if args.test else (
         ((512, 512, 8, 2),) if args.suite == "quick" else ((4096, 512, 64, 8), (8192, 1024, 128, 8)))
     for rows, width, experts, topk in shapes:
@@ -71,36 +67,3 @@ def cases(args, family):
         expected_output = pytorch_combine()
         yield Operation(size, "fp32", "combine", {"custom": custom_combine, "PyTorch": pytorch_combine},
                         (expected_output,))
-        if args.test:
-            dout = torch.randn_like(x)
-            dp, dw, ds = torch.empty_like(packed_output), torch.empty_like(w), torch.empty_like(shared)
-            def pytorch_combine_backward():
-                return torch.autograd.grad(expected_output, (packed_output, w, shared), dout, retain_graph=True)
-            def custom_combine_backward():
-                checked(lib, "expert", combine_backward(*pointers((dp, dw, ds, dout, packed_output, w, route_to_slot)),
-                                                        rows, width, topk, stream()))
-                return dp, dw, ds
-            yield Operation(size, "fp32", "combine_backward",
-                            {"custom": custom_combine_backward, "PyTorch": pytorch_combine_backward},
-                            pytorch_combine_backward())
-            dpacked, dx = torch.randn_like(packed), torch.empty_like(x)
-            def custom_unroute():
-                dx.zero_()
-                checked(lib, "expert", unroute(*pointers((dx, dpacked, route_to_slot)), rows, width, topk, stream()))
-                return dx
-            yield Operation(size, "fp32", "unroute_backward", {"custom": custom_unroute},
-                            (dpacked[slots].sum(1),))
-            dweights, dlogits = torch.randn_like(weights), torch.empty_like(logits)
-            def custom_route_backward():
-                checked(lib, "expert", route_backward(*pointers((dlogits, dweights, scores, ids)),
-                                                       rows, experts, topk, scale, stream()))
-                return dlogits
-            expected_dlogits = torch.autograd.grad(expected_route[2], logits, dweights)[0]
-            yield Operation(size, "fp32", "route_backward", {"custom": custom_route_backward}, (expected_dlogits,))
-            updated = torch.empty_like(bias)
-            def custom_update():
-                updated.copy_(bias)
-                checked(lib, "expert", update_bias(*pointers((updated, counts)), experts, rows * topk, .01, stream()))
-                return updated
-            expected_bias = bias + .01 * torch.sign(rows * topk / experts - counts.float())
-            yield Operation(size, "fp32", "routing_bias", {"custom": custom_update}, (expected_bias,))

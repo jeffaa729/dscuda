@@ -8,10 +8,6 @@
     "scope": "Current MLA remains dense absorbed C512/R64 (QK=576,V=512). Study split-KV, BF16 MMA, asynchronous staging, warp specialization and shared-memory budgeting; adapt tile sizes for SM89 rather than copying A100 assumptions. The fork's sparse V4 D512 V=K and quantized caches are different contracts, not replacements for current MLA. No fork kernel has been ported by this source-registration change.",
     "benchmark_references": ["reference/python/mla.py", "https://github.com/deepseek-ai/FlashMLA"]
   },
-  "hca_csa": {
-    "source": "https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/blob/60d8d70770c6776ff598c94bb586a859a38244f1/inference/model.py",
-    "contract": "Compressor, Indexer and Attention equations; independent implementation. HCA ratio128, CSA ratio4 overlap, sink, partial RoPE/inverse output RoPE. Supplied angle table supports the model's YaRN policy. Index keys are separate from attention KV. Orthogonal index rotation may be omitted only with quantization disabled."
-  },
   "dsa": {
     "source": "https://github.com/deepseek-ai/DeepSeek-V3.2-Exp",
     "contract": "Prepared lightning-indexer inputs, weighted ReLU score, causal topk, sparse absorbed-query MLA. No gradient through discrete topk; indexer scores are differentiable separately."

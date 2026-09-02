@@ -1,4 +1,4 @@
-// Profiles the BF16 grouped expert GEMM with uniform, skewed, or hot-expert row distributions.
+// Profiles the BF16 grouped expert GEMM with uniform, hot, or empty-expert row distributions.
 // The custom Tensor Core result is checked against the same per-expert cuBLAS operations before profiling starts.
 
 #include "cuda_common.h"
@@ -32,14 +32,16 @@ std::vector<int> make_offsets(
         for (int expert = 0; expert < experts; ++expert) {
             counts[expert] = rows / experts + (expert < rows % experts);
         }
-    } else if (std::strcmp(distribution, "skewed") == 0) {
-        int weight_sum = experts * (experts + 1) / 2;
-        int assigned = 0;
-        for (int expert = 0; expert < experts; ++expert) {
-            counts[expert] = rows * (experts - expert) / weight_sum;
-            assigned += counts[expert];
+    } else if (std::strcmp(distribution, "empty") == 0) {
+        if (experts < 4) {
+            throw std::runtime_error("empty distribution requires at least four experts");
         }
-        counts[0] += rows - assigned;
+        counts[1] = rows / 3;
+        const int remaining = rows - counts[1];
+        for (int expert = 3; expert < experts; ++expert) {
+            counts[expert] = remaining / (experts - 3);
+        }
+        counts.back() += remaining % (experts - 3);
     } else if (std::strcmp(distribution, "hot") == 0) {
         counts[0] = rows * 4 / 5;
         const int remaining = rows - counts[0];
@@ -49,7 +51,7 @@ std::vector<int> make_offsets(
         }
     } else {
         throw std::runtime_error(
-            "distribution must be uniform, skewed, or hot");
+            "distribution must be uniform, hot, or empty");
     }
 
     std::vector<int> offsets(experts + 1);

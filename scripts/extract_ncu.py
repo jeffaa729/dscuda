@@ -105,23 +105,9 @@ def short_kernel_name(full_name):
         if re.search(pattern, full_name, re.IGNORECASE):
             return name
 
-    matmul = re.search(
-        r"matmul(?:_tensor_core(?:_mma|_edge)?)?_kernel<([^>]*)>",
-        full_name,
-    )
-    if matmul:
-        template_arguments = (
-            matmul.group(1).replace("(bool)", "").replace(" ", "").split(",")
-        )
-        flags = ",".join(template_arguments[-3:])
-        return {
-            "0,0,0": "matmul_fwd",
-            "false,false,false": "matmul_fwd",
-            "0,1,1": "matmul_dinput",
-            "false,true,true": "matmul_dinput",
-            "1,0,1": "matmul_dweight",
-            "true,false,true": "matmul_dweight",
-        }.get(flags, "matmul")
+    if re.search(
+            r"matmul(?:_tensor_core(?:_mma|_edge)?)?_kernel", full_name):
+        return "matmul_NN"
 
     match = re.search(r"([a-z0-9_]+)_(forward|backward)_kernel", full_name)
     if match:

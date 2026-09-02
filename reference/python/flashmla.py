@@ -5,18 +5,16 @@ the upstream BF16 MQA interface on SM90/SM100. Both return BF16 output.
 """
 
 import torch
+from flash_mla import (
+    flash_mla_sparse_fwd,
+    flash_mla_with_kvcache,
+    get_mla_metadata,
+)
 
 
 def load_decode(device=None):
     if torch.cuda.get_device_capability(device)[0] != 9:
         raise RuntimeError("FlashMLA dense BF16 decode requires SM90 (H100/H800); use --reference pytorch here.")
-    try:
-        from flash_mla import flash_mla_with_kvcache, get_mla_metadata
-    except ImportError as error:
-        raise RuntimeError(
-            "Install FlashMLA in this uv environment: uv pip install --no-build-isolation "
-            "git+https://github.com/deepseek-ai/FlashMLA.git@15f13e5030374295491c5ce31b02d7e63a7772c6"
-        ) from error
     return flash_mla_with_kvcache, get_mla_metadata
 
 
@@ -27,21 +25,6 @@ def require_hopper(x):
         )
     if x.dtype != torch.bfloat16:
         raise ValueError("this adapter requires BF16 inputs")
-
-
-def pack_cache(kv, page_size=64):
-    """[B,N,576] -> [B*ceil(N/P),P,1,576] plus a disjoint int32 page table.
-
-    Run outside timing; original sequence lengths exclude the zero padding.
-    No cache is shared between batches.
-    """
-    b, n, d = kv.shape
-    pages = (n + page_size - 1) // page_size
-    padded = torch.nn.functional.pad(kv, (0, 0, 0, pages * page_size - n))
-    table = torch.arange(b * pages, device=kv.device, dtype=torch.int32).reshape(
-        b, pages
-    )
-    return padded.reshape(b * pages, page_size, 1, d).contiguous(), table
 
 
 def flatten_sparse_indices(indices, kv_length):
@@ -122,8 +105,6 @@ class FlashMLASparse:
             raise ValueError(
                 "this adapter targets upstream H=64/128 and topk multiples of 128"
             )
-        from flash_mla import flash_mla_sparse_fwd
-
         self.call = flash_mla_sparse_fwd
         self.shape = q.shape[:3]
         self.q = q.flatten(0, 1).contiguous()
