@@ -1,14 +1,15 @@
 # Benchmark Matrix
 
 Target hardware: a local RTX 4060 (SM89) and a rented H100 (SM90). Tables are transposed so that experiment properties are rows and the two GPUs are the only result columns.
+
 ## Repository scope
 
 Only the following six experiment families belong in this repository. Training code, standalone transformer operators, optimizers, HCA, and CSA are out of scope.
 
 | Family | Retained operations | Current implementation |
 | :-- | :-- | :-- |
-| GEMM | FP32/BF16 row-major NN | SM89 CUDA + cuBLAS reference |
-| MoE | route, dispatch, combine, BF16 grouped NN GEMM | SM89 CUDA + PyTorch/cuBLAS references |
+| GEMM | FP32/BF16 row-major NN | SM89 CUDA + cuBLAS; DeepGEMM BF16 adapter for SM90 |
+| MoE | route, dispatch, combine, BF16 grouped NN GEMM | SM89 CUDA + PyTorch/cuBLAS; DeepGEMM grouped adapter for SM90 |
 | FlashAttention | causal BF16 forward/backward, D=128 | SM89 CUDA + official FlashAttention reference |
 | MLA | dense C512/R64 prefill forward/backward and paged decode | SM89 CUDA + PyTorch; FlashMLA decode adapter for SM90 |
 | KDA | BF16 forward/backward | FLA reference + recurrent PyTorch oracle; custom CUDA pending |
@@ -36,11 +37,11 @@ Correctness checks run before timing. The same common shape must be used for cro
 | :-- | :-- | :-- |
 | Custom kernel | `kernels/gemm/matmul/sm89.cu` | SM89 fallback; `kernels/gemm/matmul/sm90.cu` is currently empty |
 | Operation | Row-major NN GEMM | Row-major NN GEMM |
-| Dtypes | FP32 and BF16; BF16 is primary | FP32 and BF16; BF16 is primary |
+| Dtypes | FP32 input/output; BF16 input/output with FP32 accumulation | Same |
 | Quick shape | `M=N=K=2048` | `M=N=K=2048` |
 | Full shapes | `M=N=K=2048,4096,8192` | `M=N=K=2048,4096,8192` |
-| Performance reference | cuBLAS `cublasGemmEx` | cuBLAS `cublasGemmEx`; planned DeepGEMM `deep_gemm.bf16_gemm_nn` after BF16-output parity |
-| Correctness oracle | PyTorch FP32 matmul | PyTorch FP32 matmul |
+| Performance reference | cuBLAS `cublasGemmEx` | cuBLAS `cublasGemmEx` and DeepGEMM `deep_gemm.bf16_gemm_nn` |
+| Correctness oracle | PyTorch FP32 matmul cast to the output dtype | Same |
 
 ## 2. MoE
 
@@ -54,9 +55,10 @@ Correctness checks run before timing. The same common shape must be used for cro
 | Grouped GEMM quick shape | `M=512,N=512,K=256,E=8` | Same |
 | Grouped GEMM full shapes | `M=4096,N=1536,K=512,E=8`; `M=8192,N=1536,K=512,E=16` | Same |
 | Expert distributions | uniform, hot, empty | uniform, hot, empty |
-| Grouped GEMM dtype | BF16 | BF16 |
-| Grouped GEMM reference | Per-expert cuBLAS loop | Per-expert cuBLAS loop; planned DeepGEMM `deep_gemm.m_grouped_bf16_gemm_nn_contiguous` after BF16-output parity |
-| Correctness oracle | PyTorch grouped GEMM and routing | PyTorch grouped GEMM and routing |
+| Grouped GEMM dtype | BF16 input/output with FP32 accumulation | Same |
+| DeepGEMM row alignment | N/A | Each expert row count is aligned to 128 before all compared backends are timed |
+| Grouped GEMM reference | Per-expert cuBLAS loop | Per-expert cuBLAS loop and DeepGEMM `deep_gemm.m_grouped_bf16_gemm_nn_contiguous` |
+| Correctness oracle | PyTorch grouped GEMM cast to BF16; PyTorch routing | Same |
 
 ## 3. Dense attention / FlashAttention
 
@@ -132,6 +134,7 @@ FP8 DSA does not mean every tensor is FP8. The official sparse decode stores the
 3. Compare custom DSA sparse attention with FlashMLA sparse attention using identical prepared top-k indices.
 4. Compare complete custom DSA with the complete official-component pipeline; include indexer and top-k time on both sides.
 5. Use dense MLA versus DSA only as a separate algorithm-level scaling experiment, not as the primary kernel-quality percentage.
+
 ## Canonical commands
 
 RTX 4060 correctness and quick runtime:
@@ -153,7 +156,14 @@ DSCUDA_CUDA_ARCH=89 bash scripts/benchmark.sh mla full --reference pytorch
 DSCUDA_CUDA_ARCH=89 bash scripts/benchmark.sh kda full --reference fla
 ```
 
-The H100 suite uses `DSCUDA_CUDA_ARCH=90`. FlashMLA is selected only for MLA decode with `bash scripts/benchmark.sh mla h100 --reference both`. DSA is intentionally absent from the launcher until its FP8 custom and official backends implement the exact contract above.
+Install official DeepGEMM into the same uv environment, then run the H100 GEMM comparisons:
+
+```bash
+DSCUDA_CUDA_ARCH=90 bash scripts/benchmark.sh matmul h100 --reference both
+DSCUDA_CUDA_ARCH=90 bash scripts/benchmark.sh grouped_gemm h100 --reference both
+```
+
+The H100 suite defaults these two families to both cuBLAS and DeepGEMM. FlashMLA is selected only for MLA decode with `bash scripts/benchmark.sh mla h100 --reference both`. DSA is intentionally absent from the launcher until its FP8 custom and official backends implement the exact contract above.
 
 Runtime tables overwrite `profiles/runtime/<family>.md` and `.csv`; raw trial samples overwrite `profiles/runtime/<family>_samples.json`. Nsight Compute is optional and uses `scripts/profile.sh` for GEMM, grouped GEMM, FlashAttention, and MLA.
 
@@ -163,8 +173,8 @@ Runtime tables overwrite `profiles/runtime/<family>.md` and `.csv`; raw trial sa
 - [x] SM89 GEMM, grouped GEMM, routing, FlashAttention, and dense MLA kernels.
 - [x] cuBLAS, PyTorch, official FlashAttention, FLA, and FlashMLA adapter boundaries.
 - [x] HCA, CSA, training, optimizer, and unrelated transformer references removed.
-- [ ] Make BF16 GEMM and grouped-GEMM output storage match DeepGEMM before enabling that reference.
-- [ ] Add DeepGEMM BF16 NN and grouped-NN H100 adapters.
+- [x] Make BF16 GEMM and grouped-GEMM output storage match DeepGEMM.
+- [x] Add DeepGEMM BF16 NN and grouped-NN H100 adapters.
 - [ ] Implement and benchmark dedicated SM90 kernels rather than compiling the SM89 sources for H100.
 - [ ] Implement KDA CUDA forward/backward and compare with FLA.
 - [ ] Implement the FP8 DSA indexer, sparse prefill/decode, PyTorch FP8 oracle, and official-component pipeline.

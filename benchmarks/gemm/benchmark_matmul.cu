@@ -40,9 +40,10 @@ int main(int argc, char** argv) {
         const size_t right_elements = static_cast<size_t>(K) * N;
         const size_t output_elements = static_cast<size_t>(M) * N;
         const size_t element_bytes = bf16 ? sizeof(__nv_bfloat16) : sizeof(float);
+        const size_t output_bytes = output_elements * element_bytes;
         void* left = dscuda::device_malloc(left_elements * element_bytes);
         void* right = dscuda::device_malloc(right_elements * element_bytes);
-        auto* output = static_cast<float*>(dscuda::device_malloc(output_elements * sizeof(float)));
+        void* output = dscuda::device_malloc(output_bytes);
         if (bf16) {
             const std::vector<__nv_bfloat16> a(left_elements, __float2bfloat16(0.5F));
             const std::vector<__nv_bfloat16> b(right_elements, __float2bfloat16(0.25F));
@@ -53,7 +54,7 @@ int main(int argc, char** argv) {
             CUDA_CHECK(cudaMemcpy(left, a.data(), left_elements * element_bytes, cudaMemcpyHostToDevice));
             CUDA_CHECK(cudaMemcpy(right, b.data(), right_elements * element_bytes, cudaMemcpyHostToDevice));
         }
-        CUDA_CHECK(cudaMemset(output, 0, output_elements * sizeof(float)));
+        CUDA_CHECK(cudaMemset(output, 0, output_bytes));
         cublasHandle_t handle = nullptr;
         if (reference) {
             cublas_check(cublasCreate(&handle));
@@ -72,23 +73,25 @@ int main(int argc, char** argv) {
                     N, M, K, &alpha,
                     right, type, N,
                     left, type, K,
-                    &beta, output, CUDA_R_32F, N,
+                    &beta, output, type, N,
                     bf16 ? CUBLAS_COMPUTE_32F : CUBLAS_COMPUTE_32F_PEDANTIC,
                     bf16 ? CUBLAS_GEMM_DEFAULT_TENSOR_OP : CUBLAS_GEMM_DEFAULT));
             } else if (bf16) {
                 dscuda::gemm_bf16_cuda(
-                    output, static_cast<const __nv_bfloat16*>(left),
+                    static_cast<__nv_bfloat16*>(output),
+                    static_cast<const __nv_bfloat16*>(left),
                     static_cast<const __nv_bfloat16*>(right), M, N, K);
             } else {
                 dscuda::gemm_fp32_cuda(
-                    output, static_cast<const float*>(left),
+                    static_cast<float*>(output),
+                    static_cast<const float*>(left),
                     static_cast<const float*>(right), M, N, K);
             }
         };
 
         run();
         dscuda::synchronize();
-        CUDA_CHECK(cudaMemset(output, 0, output_elements * sizeof(float)));
+        CUDA_CHECK(cudaMemset(output, 0, output_bytes));
         dscuda::synchronize();
         CUDA_CHECK(cudaProfilerStart());
         run();

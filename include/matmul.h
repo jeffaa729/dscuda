@@ -15,10 +15,10 @@ void gemm_fp32_cuda(
     int K,
     cudaStream_t stream = nullptr);
 
-// Same NN layout with BF16 inputs and FP32 accumulation/output.
+// Same NN layout with BF16 inputs/output and FP32 accumulation.
 // Uses Tensor Cores; M, N, and K must be positive multiples of 16.
 void gemm_bf16_cuda(
-    float* output,
+    __nv_bfloat16* output,
     const __nv_bfloat16* left,
     const __nv_bfloat16* right,
     int M,

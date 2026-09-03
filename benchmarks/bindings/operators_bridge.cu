@@ -43,18 +43,21 @@ extern "C" int dscuda_cublas_version() {
 }
 
 extern "C" int dscuda_gemm(
-    float* output, const void* left, const void* right,
+    void* output, const void* left, const void* right,
     int M, int N, int K, int bf16, int reference, cudaStream_t stream) {
     try {
         if (!reference) {
             if (bf16) {
                 dscuda::gemm_bf16_cuda(
-                    output, static_cast<const __nv_bfloat16*>(left),
+                    static_cast<__nv_bfloat16*>(output),
+                    static_cast<const __nv_bfloat16*>(left),
                     static_cast<const __nv_bfloat16*>(right),
                     M, N, K, stream);
             } else {
                 dscuda::gemm_fp32_cuda(
-                    output, static_cast<const float*>(left), static_cast<const float*>(right),
+                    static_cast<float*>(output),
+                    static_cast<const float*>(left),
+                    static_cast<const float*>(right),
                     M, N, K, stream);
             }
         } else {
@@ -71,7 +74,7 @@ extern "C" int dscuda_gemm(
                 N, M, K, &alpha,
                 right, type, N,
                 left, type, K,
-                &beta, output, CUDA_R_32F, N,
+                &beta, output, type, N,
                 bf16 ? CUBLAS_COMPUTE_32F : CUBLAS_COMPUTE_32F_PEDANTIC,
                 bf16 ? CUBLAS_GEMM_DEFAULT_TENSOR_OP : CUBLAS_GEMM_DEFAULT));
         }
@@ -85,7 +88,7 @@ extern "C" int dscuda_gemm(
 // Uses the same packed expert rows for custom CUDA and the cuBLAS-per-expert reference.
 // Host offsets are prepared before graph capture, so no device-to-host copy is timed.
 extern "C" int dscuda_grouped_gemm(
-    float* output, const __nv_bfloat16* input, const __nv_bfloat16* weights,
+    __nv_bfloat16* output, const __nv_bfloat16* input, const __nv_bfloat16* weights,
     const int* device_offsets, const int* host_offsets,
     int rows, int experts, int N, int K, int reference, cudaStream_t stream) {
     try {

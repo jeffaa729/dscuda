@@ -63,7 +63,7 @@ std::vector<int> make_offsets(
 
 void cublas_grouped_linear(
     cublasHandle_t handle,
-    float* output,
+    __nv_bfloat16* output,
     const __nv_bfloat16* input,
     const __nv_bfloat16* weight,
     const std::vector<int>& offsets,
@@ -94,7 +94,7 @@ void cublas_grouped_linear(
             input_size,
             &beta,
             output + static_cast<std::size_t>(first_row) * output_size,
-            CUDA_R_32F,
+            CUDA_R_16BF,
             output_size,
             CUBLAS_COMPUTE_32F,
             CUBLAS_GEMM_DEFAULT_TENSOR_OP));
@@ -142,10 +142,10 @@ int main(int argc, char** argv) {
             dscuda::device_malloc(weight_elements * sizeof(__nv_bfloat16)));
         auto* gpu_offsets = static_cast<int*>(
             dscuda::device_malloc(offsets.size() * sizeof(int)));
-        auto* gpu_custom = static_cast<float*>(
-            dscuda::device_malloc(output_elements * sizeof(float)));
-        auto* gpu_reference = static_cast<float*>(
-            dscuda::device_malloc(output_elements * sizeof(float)));
+        auto* gpu_custom = static_cast<__nv_bfloat16*>(
+            dscuda::device_malloc(output_elements * sizeof(__nv_bfloat16)));
+        auto* gpu_reference = static_cast<__nv_bfloat16*>(
+            dscuda::device_malloc(output_elements * sizeof(__nv_bfloat16)));
         CUDA_CHECK(cudaMemcpy(
             gpu_input,
             input.data(),
@@ -186,24 +186,27 @@ int main(int argc, char** argv) {
             input_size);
         CUDA_CHECK(cudaDeviceSynchronize());
 
-        std::vector<float> custom(output_elements);
-        std::vector<float> reference(output_elements);
+        std::vector<__nv_bfloat16> custom(output_elements);
+        std::vector<__nv_bfloat16> reference(output_elements);
         CUDA_CHECK(cudaMemcpy(
             custom.data(),
             gpu_custom,
-            output_elements * sizeof(float),
+            output_elements * sizeof(__nv_bfloat16),
             cudaMemcpyDeviceToHost));
         CUDA_CHECK(cudaMemcpy(
             reference.data(),
             gpu_reference,
-            output_elements * sizeof(float),
+            output_elements * sizeof(__nv_bfloat16),
             cudaMemcpyDeviceToHost));
         float max_error = 0.0F;
         for (std::size_t index = 0; index < output_elements; ++index) {
             max_error = std::max(
-                max_error, std::abs(custom[index] - reference[index]));
+                max_error,
+                std::abs(
+                    __bfloat162float(custom[index]) -
+                    __bfloat162float(reference[index])));
         }
-        if (max_error > 3.0e-3F) {
+        if (max_error > 3.0e-2F) {
             throw std::runtime_error("custom/cuBLAS correctness check failed");
         }
 

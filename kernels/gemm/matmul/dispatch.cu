@@ -14,7 +14,7 @@ void gemm_fp32_cuda(
 }
 
 void gemm_bf16_cuda(
-    float* output,
+    __nv_bfloat16* output,
     const __nv_bfloat16* left,
     const __nv_bfloat16* right,
     int M,

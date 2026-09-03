@@ -19,9 +19,9 @@ void grouped_linear_forward_cuda(
 
 // Runs one variable-M BF16 Tensor Core GEMM per expert over the contiguous
 // ranges described by expert_offsets. Inputs and weights use BF16, output and
-// accumulation use FP32, and weights have layout [E,K,N].
+// output use BF16, accumulation uses FP32, and weights have layout [E,K,N].
 void grouped_linear_bf16_forward_cuda(
-    float* output,
+    __nv_bfloat16* output,
     const __nv_bfloat16* input,
     const __nv_bfloat16* weight,
     const int* expert_offsets,

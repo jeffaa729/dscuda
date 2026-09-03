@@ -14,7 +14,7 @@ def main():
                         type=lambda x: {"gemm": "matmul", "moe": "grouped_gemm"}.get(x, x))
     parser.add_argument("--suite", choices=("quick", "full", "h100"), default="quick")
     parser.add_argument("--test", action="store_true", help="check native results against PyTorch; no timing")
-    parser.add_argument("--reference", help="pytorch, cublas, flash_attention, flashmla, both, or fla; GEMM families use cuBLAS")
+    parser.add_argument("--reference", help="pytorch, cublas, deepgemm, flash_attention, flashmla, both, or fla")
     parser.add_argument("--operation", help="run only this operation, such as forward, backward, or decode")
     parser.add_argument("--profile", action="store_true", help="one uncaptured call inside cudaProfilerStart/Stop")
     parser.add_argument("--backend", choices=("custom", "reference", "all"), default="all",

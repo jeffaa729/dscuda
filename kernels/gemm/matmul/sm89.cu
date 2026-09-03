@@ -371,7 +371,7 @@ __global__ void matmul_kernel(
 }
 
 __global__ void matmul_tensor_core_edge_kernel(
-    float* output,
+    __nv_bfloat16* output,
     const __nv_bfloat16* left,
     const __nv_bfloat16* right,
     int output_rows,
@@ -379,8 +379,11 @@ __global__ void matmul_tensor_core_edge_kernel(
     int inner_size) {
     __shared__ __nv_bfloat16 shared_left[tc::BK][tc::BM + tc::SKEW];
     __shared__ __nv_bfloat16 shared_right[tc::BK][tc::BN + tc::SKEW];
+    __shared__ float shared_output[tc::NUM_THREADS / 32]
+                                  [tc::MMA_M * tc::MMA_N];
 
     const int tid = threadIdx.x;
+    const int lane_id = tid % 32;
     const int warp_id = tid / 32;
     const int warp_row = warp_id / tc::WARPS_N;
     const int warp_column = warp_id % tc::WARPS_N;
@@ -488,14 +491,26 @@ __global__ void matmul_tensor_core_edge_kernel(
                 block_row + warp_row * tc::WM + tile_row * tc::MMA_M;
             const int output_column =
                 block_column + warp_column * tc::WN + tile_column * tc::MMA_N;
-            if (output_row + tc::MMA_M <= output_rows &&
-                output_column + tc::MMA_N <= output_columns) {
-                nvcuda::wmma::store_matrix_sync(
-                    output + output_row * output_columns + output_column,
-                    accumulators[tile_row][tile_column],
-                    output_columns,
-                    nvcuda::wmma::mem_row_major);
+            float* warp_output = shared_output[warp_id];
+            nvcuda::wmma::store_matrix_sync(
+                warp_output,
+                accumulators[tile_row][tile_column],
+                tc::MMA_N,
+                nvcuda::wmma::mem_row_major);
+            __syncwarp();
+            for (int element = lane_id;
+                 element < tc::MMA_M * tc::MMA_N;
+                 element += 32) {
+                const int row = element / tc::MMA_N;
+                const int column = element % tc::MMA_N;
+                if (output_row + row < output_rows &&
+                    output_column + column < output_columns) {
+                    output[(output_row + row) * output_columns +
+                           output_column + column] =
+                        __float2bfloat16(warp_output[element]);
+                }
             }
+            __syncwarp();
         }
     }
 }
@@ -584,7 +599,7 @@ template <
     int kWarpTilesM,
     int kWarpTilesN>
 __global__ __launch_bounds__(256, 2) void matmul_tensor_core_mma_kernel(
-    float* __restrict__ output,
+    __nv_bfloat16* __restrict__ output,
     const __nv_bfloat16* __restrict__ left,
     const __nv_bfloat16* __restrict__ right,
     int output_columns,
@@ -752,15 +767,15 @@ __global__ __launch_bounds__(256, 2) void matmul_tensor_core_mma_kernel(
             const int output_column =
                 block_column + warp_column * kWN +
                 tile_column * tc_mma::MMA_N + (lane % 4) * 2;
-            const float2 top = make_float2(
+            const __nv_bfloat162 top = __floats2bfloat162_rn(
                 accumulators[tile_row][tile_column][0],
                 accumulators[tile_row][tile_column][1]);
-            const float2 bottom = make_float2(
+            const __nv_bfloat162 bottom = __floats2bfloat162_rn(
                 accumulators[tile_row][tile_column][2],
                 accumulators[tile_row][tile_column][3]);
-            *reinterpret_cast<float2*>(
+            *reinterpret_cast<__nv_bfloat162*>(
                 output + output_row * output_columns + output_column) = top;
-            *reinterpret_cast<float2*>(
+            *reinterpret_cast<__nv_bfloat162*>(
                 output + (output_row + 8) * output_columns + output_column) =
                 bottom;
         }
@@ -773,7 +788,7 @@ template <
     int kWarpTilesM,
     int kWarpTilesN>
 void launch_tensor_core_mma_config(
-    float* output,
+    __nv_bfloat16* output,
     const __nv_bfloat16* left,
     const __nv_bfloat16* right,
     int output_rows,
@@ -879,7 +894,7 @@ void launch_matmul(
 }
 
 void launch_tensor_core_matmul(
-    float* output,
+    __nv_bfloat16* output,
     const __nv_bfloat16* left,
     const __nv_bfloat16* right,
     int output_rows,
@@ -945,7 +960,7 @@ void gemm_fp32_sm89_cuda(
 }
 
 void gemm_bf16_sm89_cuda(
-    float* output,
+    __nv_bfloat16* output,
     const __nv_bfloat16* left,
     const __nv_bfloat16* right,
     int M,

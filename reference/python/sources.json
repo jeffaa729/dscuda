@@ -1,5 +1,11 @@
 {
   "precision": "Unquantized BF16/FP32 mathematical references. No FP4, FP8 QAT, distributed collectives or model projections.",
+  "deepgemm": {
+    "source": "https://github.com/deepseek-ai/DeepGEMM/tree/559d79fb6994a58b8a15b4b93bf13ccc16edf247",
+    "version": "2.6.1",
+    "role": "Official H100 BF16 performance reference for dense NN GEMM and M-grouped contiguous NN GEMM.",
+    "contract": "BF16 row-major inputs and BF16 output with FP32 accumulation. Grouped rows are prepared with DeepGEMM's SM90 alignment before timing."
+  },
   "mla_implementation": {
     "source": "https://github.com/AppMana/forks-flash-mla-int/tree/7f41a5baa5cf57bfbce06458794b4b05737a162a",
     "role": "Implementation guidance for custom MLA kernels.",
