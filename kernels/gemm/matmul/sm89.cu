@@ -9,6 +9,8 @@
 namespace dscuda {
 namespace {
 
+// FP32 hierarchical tiling: block 128x128, warp 64x32, thread 8x8.
+// Each level reuses inputs to reduce traffic from the preceding memory level.
 constexpr int BM = 128;
 constexpr int BN = 128;
 // Small GEMMs use more blocks and half-sized thread microtiles to expose
@@ -58,6 +60,8 @@ static_assert(WN == 4 * TN);
 static_assert(BK % VECTOR_WIDTH == 0);
 static_assert(BK % 2 == 0);
 
+// FP32 vectorized loading: read four adjacent floats with one aligned access.
+// Scalar loads handle partial or unaligned vectors without reading out of bounds.
 __device__ __forceinline__ float4 load_float4(
     const float* input,
     int index,
@@ -103,6 +107,8 @@ __global__ void matmul_kernel(
     int output_rows,
     int output_columns,
     int inner_size) {
+    // Compile-time specialization lets the compiler fold tile indexing and
+    // unroll fixed-size loops; __restrict__ also rules out pointer aliasing.
     constexpr int kWarpsPerRow = kBN / kWN;
     constexpr int kNumThreads = (kBM / kWM) * (kBN / kWN) * 32;
     constexpr int kLeftLoads = (kBM * BK / VECTOR_WIDTH) / kNumThreads;
@@ -116,14 +122,17 @@ __global__ void matmul_kernel(
     static_assert((kBM * BK / VECTOR_WIDTH) % kNumThreads == 0);
     static_assert((BK * kBN / VECTOR_WIDTH) % kNumThreads == 0);
 
-    // Logical layouts are shared_left[stage][inner][row] and
-    // shared_right[stage][inner][column].
+    // FP32 shared-memory double buffering: alternate tiles to overlap global
+    // prefetch with computation. A is transposed to [K][M] for float4 reads;
+    // B stays [K][N]. Logical layouts include an outer [stage] dimension.
     __shared__ float shared_left[2 * BK * kBM];
     __shared__ float shared_right[2 * BK * kBN];
 
     const int tid = threadIdx.x;
     const int warp_id = tid / 32;
     const int lane_id = tid % 32;
+    // Warp tiling: 8x4 lanes cover one warp tile. Lanes sharing a row or
+    // column reuse the same A or B fragments through shared-memory reads.
     const int warp_row = warp_id / kWarpsPerRow;
     const int warp_column = warp_id % kWarpsPerRow;
     const int lane_row = lane_id / 4;
@@ -139,7 +148,11 @@ __global__ void matmul_kernel(
         inner_size % BK == 0 &&
         output_columns % VECTOR_WIDTH == 0;
 
+    // Register tiling: retain every partial output across all K tiles.
+    // Independent accumulators expose instruction-level parallelism (ILP).
     float accumulator[kTM][kTN] = {};
+    // Register double buffering: prefetch the next K-step fragments while
+    // computing with the current ones, at the cost of more live registers.
     float left_fragment[2][kTM];
     float right_fragment[2][kTN];
     int write_stage = 0;
@@ -155,6 +168,8 @@ __global__ void matmul_kernel(
         if (load_tile) {
 #pragma unroll
             for (int load = 0; load < kLeftLoads; ++load) {
+                // Coalesced cooperative loading: neighboring threads own
+                // neighboring float4 segments within each input tile row.
                 const int vector_index = tid + load * kNumThreads;
                 const int vectors_per_row = BK / VECTOR_WIDTH;
                 const int tile_row = vector_index / vectors_per_row;
@@ -201,6 +216,9 @@ __global__ void matmul_kernel(
                 const int read_fragment = inner & 1;
                 const int write_fragment = (inner + 1) & 1;
 
+                // Vectorized shared loads prepare the next register fragments
+                // before the current outer product consumes its operands.
+
 #pragma unroll
                 for (int vector = 0; vector < kTM / VECTOR_WIDTH; ++vector) {
                     const float4 value = *reinterpret_cast<const float4*>(
@@ -237,6 +255,8 @@ __global__ void matmul_kernel(
                 for (int row = 0; row < kTM; ++row) {
 #pragma unroll
                     for (int column = 0; column < kTN; ++column) {
+                        // Register outer product: reuse each A value across
+                        // columns and each B value across rows using FP32 FMA.
                         accumulator[row][column] = __fmaf_rn(
                             left_fragment[read_fragment][row],
                             right_fragment[read_fragment][column],
@@ -254,6 +274,8 @@ __global__ void matmul_kernel(
                 const int tile_row = vector_index / vectors_per_row;
                 const int tile_inner =
                     (vector_index % vectors_per_row) * VECTOR_WIDTH;
+                // Scatter the contiguous global A vector into transposed
+                // shared storage; a single contiguous cp.async cannot do this.
                 shared_left[
                     (write_stage * BK + tile_inner + 0) * kBM +
                     tile_row] = loaded_left[load].x;
@@ -350,6 +372,7 @@ __global__ void matmul_kernel(
                 accumulator[row][thread_column + 2],
                 accumulator[row][thread_column + 3]);
 
+            // Vectorized epilogue: write four FP32 outputs per aligned store.
             if (width == VECTOR_WIDTH && index % VECTOR_WIDTH == 0) {
                 *reinterpret_cast<float4*>(output + index) = value;
             } else {
@@ -370,6 +393,8 @@ __global__ void matmul_kernel(
     }
 }
 
+// BF16 edge fallback: zero-pad partial tiles and use WMMA Tensor Cores with
+// FP32 accumulation. This path uses single-buffered shared storage.
 __global__ void matmul_tensor_core_edge_kernel(
     __nv_bfloat16* output,
     const __nv_bfloat16* left,
@@ -377,6 +402,8 @@ __global__ void matmul_tensor_core_edge_kernel(
     int output_rows,
     int output_columns,
     int inner_size) {
+    // Shared-memory padding changes bank mapping while preserving WMMA
+    // stride alignment; per-warp FP32 scratch supports BF16 output conversion.
     __shared__ __nv_bfloat16 shared_left[tc::BK][tc::BM + tc::SKEW];
     __shared__ __nv_bfloat16 shared_right[tc::BK][tc::BN + tc::SKEW];
     __shared__ float shared_output[tc::NUM_THREADS / 32]
@@ -515,6 +542,9 @@ __global__ void matmul_tensor_core_edge_kernel(
     }
 }
 
+// BF16 asynchronous copy: move 16 bytes (eight BF16 values) directly from
+// global to shared memory, avoiding intermediate data registers.
+// L2::128B is a prefetch hint, not the number of bytes copied per thread.
 __device__ __forceinline__ void cp_async_bf16x8(
     __nv_bfloat16* destination,
     const __nv_bfloat16* source) {
@@ -534,6 +564,8 @@ __device__ __forceinline__ void cp_async_wait() {
     asm volatile("cp.async.wait_group 0;\n" ::);
 }
 
+// XOR swizzle: permute shared addresses to reduce ldmatrix bank conflicts
+// while preserving 16-byte vector alignment. Loads and stores use this mapping.
 template <int kBits>
 __device__ __forceinline__ int swizzle_bf16_offset(int offset) {
     constexpr int kMask = ((1 << kBits) - 1) << 6;
@@ -544,6 +576,8 @@ __device__ __forceinline__ unsigned int shared_address(const void* pointer) {
     return static_cast<unsigned int>(__cvta_generic_to_shared(pointer));
 }
 
+// Warp-cooperative ldmatrix loads distribute BF16 operands into the register
+// layout required by mma.sync; these are not ordinary per-thread float arrays.
 __device__ __forceinline__ void load_matrix_x4(
     unsigned int (&fragment)[4],
     unsigned int address) {
@@ -569,6 +603,8 @@ __device__ __forceinline__ void load_matrix_b_x2(
         : "r"(address));
 }
 
+// Native Tensor Core MMA: the whole warp computes a 16x8 output update over
+// K=16 using BF16 operands and FP32 accumulation (4096 FLOPs per warp).
 __device__ __forceinline__ void mma_bf16_m16n8k16(
     float (&accumulator)[4],
     const unsigned int (&left)[4],
@@ -591,8 +627,9 @@ __device__ __forceinline__ void mma_bf16_m16n8k16(
           "r"(right[1]));
 }
 
-// The native MMA path uses CUTLASS-style XOR swizzles so cp.async writes and
-// ldmatrix reads are both 128-bit aligned and free of shared-memory bank conflicts.
+// BF16 fast path combines block/warp tiling, asynchronous copies and swizzled
+// shared storage. Launch bounds guide register allocation for two-block
+// residency; actual occupancy also depends on shared memory and the GPU.
 template <
     int kBM,
     int kBN,
@@ -612,6 +649,7 @@ __global__ __launch_bounds__(256, 2) void matmul_tensor_core_mma_kernel(
     constexpr int kLeftStageElements = kBM * tc_mma::BK;
     constexpr int kRightStageElements = tc_mma::BK * kBN;
 
+    // Two aligned shared stages overlap copying tile k+1 with MMA on tile k.
     __shared__ __align__(16)
         __nv_bfloat16 shared_left[tc_mma::STAGES][kLeftStageElements];
     __shared__ __align__(16)
@@ -625,6 +663,8 @@ __global__ __launch_bounds__(256, 2) void matmul_tensor_core_mma_kernel(
     const int block_row = blockIdx.y * kBM;
     const int block_column = blockIdx.x * kBN;
 
+    // Register accumulation: reuse A/B fragments across multiple MMA tiles.
+    // The current 4x4 configuration keeps 64 FP32 partial outputs per thread.
     float accumulators[kWarpTilesM][kWarpTilesN][4];
 #pragma unroll
     for (int tile_row = 0; tile_row < kWarpTilesM; ++tile_row) {
@@ -685,6 +725,7 @@ __global__ __launch_bounds__(256, 2) void matmul_tensor_core_mma_kernel(
     };
 
     const int inner_tiles = inner_size / tc_mma::BK;
+    // Pipeline prologue: make the first tile visible to all consuming warps.
     copy_stage(0, 0);
     cp_async_wait();
     __syncthreads();
@@ -693,12 +734,15 @@ __global__ __launch_bounds__(256, 2) void matmul_tensor_core_mma_kernel(
         const int stage = tile % tc_mma::STAGES;
         const int next_tile = tile + 1;
         if (next_tile < inner_tiles) {
+            // Issue future copies before current computation to hide latency.
             copy_stage(next_tile % tc_mma::STAGES, next_tile * tc_mma::BK);
         }
 
 #pragma unroll
         for (int tile_inner = 0; tile_inner < tc_mma::BK;
              tile_inner += tc_mma::MMA_K) {
+            // Load once per MMA K-step and reuse across the warp's output tile.
+            // Unlike FP32, this path has no explicit register ping-pong buffers.
             unsigned int left_fragments[kWarpTilesM][4];
             unsigned int right_fragments[kWarpTilesN][2];
 #pragma unroll
@@ -751,6 +795,8 @@ __global__ __launch_bounds__(256, 2) void matmul_tensor_core_mma_kernel(
         }
 
         if (next_tile < inner_tiles) {
+            // Complete this thread's copies, then synchronize the block before
+            // consuming the next tile or reusing the previous shared stage.
             cp_async_wait();
             __syncthreads();
         }
@@ -767,6 +813,8 @@ __global__ __launch_bounds__(256, 2) void matmul_tensor_core_mma_kernel(
             const int output_column =
                 block_column + warp_column * kWN +
                 tile_column * tc_mma::MMA_N + (lane % 4) * 2;
+            // Fused BF16 epilogue: round FP32 accumulators and store pairs,
+            // avoiding a separate conversion kernel and FP32 output buffer.
             const __nv_bfloat162 top = __floats2bfloat162_rn(
                 accumulators[tile_row][tile_column][0],
                 accumulators[tile_row][tile_column][1]);
@@ -901,6 +949,8 @@ void launch_tensor_core_matmul(
     int output_columns,
     int inner_size,
     cudaStream_t stream) {
+    // Shape specialization: aligned tiles use branch-free PTX loads; partial
+    // shapes use WMMA fallback. A smaller M tile exposes more thread blocks.
     const bool vector_aligned =
         inner_size % tc_mma::BK == 0 &&
         output_columns % tc_mma::VECTOR_ELEMENTS == 0;
