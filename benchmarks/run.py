@@ -5,7 +5,7 @@ import importlib
 from common import measure, record, save_report, torch
 
 NATIVE = ("matmul", "grouped_gemm", "flash_attention", "mla", "expert_dispatch")
-FAMILIES = (*NATIVE, "hca", "dsa", "csa", "kda")
+FAMILIES = (*NATIVE, "kda")
 
 
 def main():
@@ -14,7 +14,7 @@ def main():
                         type=lambda x: {"gemm": "matmul", "moe": "grouped_gemm"}.get(x, x))
     parser.add_argument("--suite", choices=("quick", "full", "h100"), default="quick")
     parser.add_argument("--test", action="store_true", help="check native results against PyTorch; no timing")
-    parser.add_argument("--reference", help="pytorch, cublas, flash_attention, flashmla, both, or fla; GEMM families use cuBLAS")
+    parser.add_argument("--reference", help="pytorch, cublas, deepgemm, flash_attention, flashmla, both, or fla")
     parser.add_argument("--operation", help="run only this operation, such as forward, backward, or decode")
     parser.add_argument("--profile", action="store_true", help="one uncaptured call inside cudaProfilerStart/Stop")
     parser.add_argument("--backend", choices=("custom", "reference", "all"), default="all",
@@ -24,8 +24,6 @@ def main():
     parser.add_argument("--sample-ms", type=int, default=20)
     parser.add_argument("--trials", type=int, default=9)
     args = parser.parse_args()
-    if args.test and args.family in ("hca", "dsa", "csa"):
-        parser.error("This family currently has a PyTorch reference, but no native CUDA kernel to test.")
     torch.manual_seed(2026)
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
@@ -33,9 +31,9 @@ def main():
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
-        families = (*NATIVE, "kda") if args.test else FAMILIES
-        for family in families if args.family == "all" else (args.family,):
-            module = importlib.import_module(family if family in NATIVE else "references")
+        families = FAMILIES if args.family == "all" else (args.family,)
+        for family in families:
+            module = importlib.import_module(family)
             rows, samples, count = [], [], 0
             for operation in module.cases(args, family):
                 if args.operation and operation.name != args.operation:

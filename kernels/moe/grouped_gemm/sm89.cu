@@ -41,7 +41,7 @@ __global__ void grouped_linear_forward_kernel(
 }
 
 __global__ void grouped_linear_bf16_tensor_core_kernel(
-    float* output,
+    __nv_bfloat16* output,
     const __nv_bfloat16* input,
     const __nv_bfloat16* weight,
     const int* expert_offsets,
@@ -178,7 +178,7 @@ __global__ void grouped_linear_bf16_tensor_core_kernel(
                        expert_first_row + first_row + row)
                        * output_size
                    + first_column + warp_column + column] =
-                warp_output[element];
+                __float2bfloat16(warp_output[element]);
         }
     }
 }
@@ -265,7 +265,7 @@ void grouped_linear_forward_sm89_cuda(
 }
 
 void grouped_linear_bf16_forward_sm89_cuda(
-    float* output,
+    __nv_bfloat16* output,
     const __nv_bfloat16* input,
     const __nv_bfloat16* weight,
     const int* expert_offsets,

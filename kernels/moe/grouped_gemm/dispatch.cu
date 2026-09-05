@@ -23,7 +23,7 @@ void grouped_linear_forward_cuda(
 }
 
 void grouped_linear_bf16_forward_cuda(
-    float* output,
+    __nv_bfloat16* output,
     const __nv_bfloat16* input,
     const __nv_bfloat16* weight,
     const int* expert_offsets,

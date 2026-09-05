@@ -31,26 +31,3 @@ extern "C" int dscuda_combine(float* output, const float* shared, const float* p
     return run([&] { dscuda::expert_combine_forward_cuda(output, shared, packed, weights,
         slots, rows, width, topk, stream); });
 }
-
-extern "C" int dscuda_combine_backward(float* dpacked, float* dweights, float* dshared,
-    const float* dout, const float* packed, const float* weights, const int* slots,
-    int rows, int width, int topk, cudaStream_t stream) {
-    return run([&] { dscuda::expert_combine_backward_cuda(dpacked, dweights, dshared, dout,
-        packed, weights, slots, rows, width, topk, stream); });
-}
-
-extern "C" int dscuda_unroute(float* dx, const float* dpacked, const int* slots,
-    int rows, int width, int topk, cudaStream_t stream) {
-    return run([&] { dscuda::expert_unroute_backward_cuda(dx, dpacked, slots, rows, width, topk, stream); });
-}
-
-extern "C" int dscuda_route_backward(float* dlogits, const float* dweights,
-    const float* scores, const int* ids, int rows, int experts, int topk, float scale, cudaStream_t stream) {
-    return run([&] { dscuda::expert_route_backward_cuda(dlogits, dweights, scores, ids,
-        rows, experts, topk, scale, stream); });
-}
-
-extern "C" int dscuda_routing_bias(float* bias, const int* counts, int experts,
-    int routes, float speed, cudaStream_t stream) {
-    return run([&] { dscuda::update_routing_bias_cuda(bias, counts, experts, routes, speed, stream); });
-}

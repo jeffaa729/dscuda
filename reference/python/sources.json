@@ -1,5 +1,11 @@
 {
   "precision": "Unquantized BF16/FP32 mathematical references. No FP4, FP8 QAT, distributed collectives or model projections.",
+  "deepgemm": {
+    "source": "https://github.com/deepseek-ai/DeepGEMM/tree/559d79fb6994a58b8a15b4b93bf13ccc16edf247",
+    "version": "2.6.1",
+    "role": "Official H100 BF16 performance reference for dense NN GEMM and M-grouped contiguous NN GEMM.",
+    "contract": "BF16 row-major inputs and BF16 output with FP32 accumulation. Grouped rows are prepared with DeepGEMM's SM90 alignment before timing."
+  },
   "mla_implementation": {
     "source": "https://github.com/AppMana/forks-flash-mla-int/tree/7f41a5baa5cf57bfbce06458794b4b05737a162a",
     "role": "Implementation guidance for custom MLA kernels.",
@@ -7,10 +13,6 @@
     "sparse_paths": ["csrc/flash_sparse_mla_decode_sm80.cu", "csrc/flash_sparse_mla_prefill_fused_sm80.cu"],
     "scope": "Current MLA remains dense absorbed C512/R64 (QK=576,V=512). Study split-KV, BF16 MMA, asynchronous staging, warp specialization and shared-memory budgeting; adapt tile sizes for SM89 rather than copying A100 assumptions. The fork's sparse V4 D512 V=K and quantized caches are different contracts, not replacements for current MLA. No fork kernel has been ported by this source-registration change.",
     "benchmark_references": ["reference/python/mla.py", "https://github.com/deepseek-ai/FlashMLA"]
-  },
-  "hca_csa": {
-    "source": "https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/blob/60d8d70770c6776ff598c94bb586a859a38244f1/inference/model.py",
-    "contract": "Compressor, Indexer and Attention equations; independent implementation. HCA ratio128, CSA ratio4 overlap, sink, partial RoPE/inverse output RoPE. Supplied angle table supports the model's YaRN policy. Index keys are separate from attention KV. Orthogonal index rotation may be omitted only with quantization disabled."
   },
   "dsa": {
     "source": "https://github.com/deepseek-ai/DeepSeek-V3.2-Exp",

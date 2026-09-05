@@ -1,6 +1,7 @@
 """Causal D128 BF16 attention: PyTorch correctness, FlashAttention runtime."""
 
 from common import F, I, P, Operation, bind, checked, library, pointers, stream, torch
+from flash_attn import flash_attn_func
 
 
 def cases(args, family):
@@ -10,9 +11,6 @@ def cases(args, family):
     reference = args.reference or ("pytorch" if args.test else "flash_attention")
     if reference not in ("pytorch", "flash_attention"):
         raise ValueError("FlashAttention references: pytorch or flash_attention")
-    if reference == "flash_attention":
-        from flash_attn import flash_attn_func
-
     shapes = (
         ((1, 64, 2, 128), (2, 64, 3, 128),
          (1, 128, 4, 128), (1, 256, 2, 128))

@@ -188,22 +188,19 @@ profile_matmul() {
     local sizes=(2048)
     [[ "$suite" != "quick" ]] && sizes=(2048 4096 8192)
     local backends=(fp32 bf16 cublas_fp32 cublas_bf16)
-    local operations=(NN NT TN)
-    local size backend operation pattern label stem
+    local size backend pattern label stem
     for size in "${sizes[@]}"; do
         for backend in "${backends[@]}"; do
-            for operation in "${operations[@]}"; do
-                pattern='regex:.*matmul_kernel.*'
-                [[ "$backend" == "bf16" ]] && \
-                    pattern='regex:.*matmul_tensor_core_.*kernel.*'
-                [[ "$backend" == cublas_* ]] && pattern='regex:.*'
-                label="M=${size},N=${size},K=${size}/${backend}/${operation}"
-                stem="${size}_${backend}_${operation}"
-                profile_case \
-                    "$label" "$stem" "$pattern" \
-                    "$build_dir/benchmark_matmul" \
-                    "$size" "$size" "$size" "$backend" "$operation"
-            done
+            pattern='regex:.*matmul_kernel.*'
+            [[ "$backend" == "bf16" ]] && \
+                pattern='regex:.*matmul_tensor_core_.*kernel.*'
+            [[ "$backend" == cublas_* ]] && pattern='regex:.*'
+            label="M=${size},N=${size},K=${size}/${backend}/NN"
+            stem="${size}_${backend}_NN"
+            profile_case \
+                "$label" "$stem" "$pattern" \
+                "$build_dir/benchmark_matmul" \
+                "$size" "$size" "$size" "$backend"
         done
     done
 }
@@ -299,32 +296,31 @@ profile_mla() {
 }
 
 profile_grouped_gemm() {
-    local rows=4096
-    local experts=8
-    local input_size=512
-    local output_size=1536
-    if [[ "$suite" == "h100" ]]; then
-        rows=16384
-        experts=64
-        input_size=1024
-        output_size=3072
-    fi
+    local cases=("512 8 256 512")
+    [[ "$suite" != "quick" ]] && cases=(
+        "4096 8 512 1536"
+        "8192 16 512 1536"
+    )
+    local case_spec rows experts input_size output_size
     local distribution backend label stem pattern label_backend
-    for distribution in uniform skewed hot; do
-        for backend in custom cublas; do
-            pattern='regex:grouped_linear_bf16_tensor_core_kernel'
-            label_backend=custom_bf16
-            if [[ "$backend" == "cublas" ]]; then
-                pattern='regex:.*'
-                label_backend=cublas_bf16
-            fi
-            label="M=${rows},E=${experts},K=${input_size},N=${output_size},load=${distribution}/${label_backend}/forward"
-            stem="M${rows}_E${experts}_K${input_size}_N${output_size}_${distribution}_${backend}"
-            profile_case \
-                "$label" "$stem" "$pattern" \
-                "$build_dir/benchmark_grouped_gemm" \
-                "$rows" "$experts" "$input_size" "$output_size" \
-                "$distribution" "$backend"
+    for case_spec in "${cases[@]}"; do
+        read -r rows experts input_size output_size <<<"$case_spec"
+        for distribution in uniform hot empty; do
+            for backend in custom cublas; do
+                pattern='regex:grouped_linear_bf16_tensor_core_kernel'
+                label_backend=custom_bf16
+                if [[ "$backend" == "cublas" ]]; then
+                    pattern='regex:.*'
+                    label_backend=cublas_bf16
+                fi
+                label="M=${rows},E=${experts},K=${input_size},N=${output_size},load=${distribution}/${label_backend}/NN"
+                stem="M${rows}_E${experts}_K${input_size}_N${output_size}_${distribution}_${backend}"
+                profile_case \
+                    "$label" "$stem" "$pattern" \
+                    "$build_dir/benchmark_grouped_gemm" \
+                    "$rows" "$experts" "$input_size" "$output_size" \
+                    "$distribution" "$backend"
+            done
         done
     done
 }

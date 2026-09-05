@@ -1,7 +1,6 @@
-"""Attention primitives for kernel validation, not optimized implementations.
+"""Sparse-attention primitives used by the DSA mathematical reference.
 
 BF16 inputs are upcast for FP32 arithmetic; FP64 stays FP64 for gradcheck.
-Outputs and natural-log LSE use the compute dtype. No dropout or quantization.
 """
 
 import torch
@@ -53,31 +52,3 @@ def sparse_attention(q, k, v, indices, scale=None, sink=None):
     scores = scores.masked_fill(~valid[:, :, None], -torch.inf)
     p, lse = probabilities(scores, sink)
     return torch.einsum("bqhl,bqlv->bqhv", p, values), lse.transpose(1, 2)
-
-
-def dense_attention(q, k, v, mask=None, scale=None, sink=None):
-    """Independent materialized shared-KV oracle; mask broadcasts to [B,Q,N]."""
-    q, k, v = map(compute, (q, k, v))
-    scale = q.shape[-1] ** -0.5 if scale is None else scale
-    scores = torch.einsum("bqhd,bnd->bqhn", q, k) * scale
-    if mask is not None:
-        scores = scores.masked_fill(~mask.unsqueeze(-2), -torch.inf)
-    p, lse = probabilities(scores, sink)
-    return torch.einsum("bqhn,bnv->bqhv", p, v), lse.transpose(1, 2)
-
-
-def rotary(x, angles, inverse=False):
-    """Interleaved RoPE on the final 2*angles.shape[-1] channels.
-
-    x is [B,T,D] or [B,T,H,D], angles is [T,R/2] in radians. The caller
-    supplies ordinary RoPE or YaRN angles; model-specific frequency policy is external.
-    """
-    dtype = x.dtype
-    x = compute(x)
-    width = 2 * angles.shape[-1]
-    prefix, pairs = x[..., :-width], x[..., -width:].unflatten(-1, (-1, 2))
-    angles = angles.to(x.dtype).reshape(1, x.shape[1], *([1] * (x.ndim - 3)), -1)
-    c, s = angles.cos(), angles.sin() * (-1 if inverse else 1)
-    a, b = pairs.unbind(-1)
-    rotated = torch.stack((a * c - b * s, a * s + b * c), -1).flatten(-2)
-    return torch.cat((prefix, rotated), -1).to(dtype)

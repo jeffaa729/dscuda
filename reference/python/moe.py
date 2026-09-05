@@ -76,17 +76,3 @@ def grouped_gemm(x, weights, offsets):
 def combine(packed, route_to_slot, weights, shared=None):
     out = (compute(packed)[route_to_slot] * compute(weights)[..., None]).sum(1)
     return out if shared is None else out + compute(shared)
-
-
-def moe_forward(x, logits, bias, up, gate, down, topk, scale=1.0, shared=None):
-    """Functional routed SwiGLU FFN oracle; routing/packing and GEMMs are included.
-
-    This eager composition copies offsets to the host; benchmark the graph-safe
-    grouped_gemm core separately with a precomputed routing plan.
-    """
-    ids, weights = route(logits, bias, topk, scale)
-    packed, offsets, slots = dispatch(x, ids, up.shape[0])
-    offsets = tuple(offsets.cpu().tolist())
-    hidden = torch.nn.functional.silu(grouped_gemm(packed, gate, offsets))
-    hidden = hidden * grouped_gemm(packed, up, offsets)
-    return combine(grouped_gemm(hidden, down, offsets), slots, weights, shared)

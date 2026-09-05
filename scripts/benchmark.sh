@@ -5,9 +5,9 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 python_bin="${DSCUDA_PYTHON:-$repo_root/.venv/bin/python}"
 if [[ $# == 0 || "$1" == "--help" || "$1" == "-h" ]]; then
     echo "usage: bash scripts/benchmark.sh FAMILY [quick|full|h100] [options]"
-    echo "families: matmul, grouped_gemm, flash_attention, mla, expert_dispatch, hca, dsa, csa, kda, all"
-    echo "options: --reference pytorch|cublas|flash_attention|flashmla|both|fla, --operation NAME"
-    echo "matmul/grouped_gemm: the benchmark reference is always cuBLAS"
+    echo "families: matmul, grouped_gemm, flash_attention, mla, expert_dispatch, kda, all"
+    echo "options: --reference pytorch|cublas|deepgemm|flash_attention|flashmla|both|fla, --operation NAME"
+    echo "matmul/grouped_gemm: quick/full default to cuBLAS; h100 defaults to cuBLAS and DeepGEMM"
     echo "mla: --reference both (or all) compares PyTorch and FlashMLA dense decode (SM90); h100 defaults to both"
     exit 0
 fi
@@ -20,7 +20,7 @@ if [[ ! -x "$python_bin" ]]; then
     exit 1
 fi
 mkdir -p "$repo_root/build"
-if [[ ! "$family" =~ ^(hca|dsa|csa|kda)$ ]]; then
+if [[ "$family" != "kda" ]]; then
     if ! bash "$repo_root/scripts/build.sh" >"$repo_root/build/benchmark_build.log" 2>&1; then
         cat "$repo_root/build/benchmark_build.log" >&2
         exit 1

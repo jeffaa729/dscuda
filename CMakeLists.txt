@@ -22,13 +22,14 @@ add_library(dscuda_kernels STATIC
     kernels/attention/mla/sm89.cu
     kernels/gemm/matmul/dispatch.cu
     kernels/gemm/matmul/sm89.cu
+    kernels/gemm/matmul/sm90.cu
     kernels/moe/expert_dispatch/dispatch.cu
     kernels/moe/expert_dispatch/sm89.cu
     kernels/moe/grouped_gemm/dispatch.cu
     kernels/moe/grouped_gemm/sm89.cu
 )
 target_include_directories(dscuda_kernels PUBLIC include)
-target_link_libraries(dscuda_kernels PUBLIC CUDA::cudart)
+target_link_libraries(dscuda_kernels PUBLIC CUDA::cudart CUDA::cuda_driver)
 set_target_properties(dscuda_kernels PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
     POSITION_INDEPENDENT_CODE ON
