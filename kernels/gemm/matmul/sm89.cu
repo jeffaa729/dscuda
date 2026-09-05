@@ -13,12 +13,6 @@ namespace {
 // Each level reuses inputs to reduce traffic from the preceding memory level.
 constexpr int BM = 128;
 constexpr int BN = 128;
-// Small GEMMs use more blocks and half-sized thread microtiles to expose
-// enough warps while reducing accumulator register pressure.
-constexpr int SMALL_BM = 64;
-constexpr int SMALL_BN = 64;
-constexpr int SMALL_WN = 16;
-constexpr int SMALL_TN = 4;
 constexpr int BK = 8;
 constexpr int WM = 64;
 constexpr int WN = 32;
@@ -906,39 +900,20 @@ void launch_matmul(
     int output_columns,
     int inner_size,
     cudaStream_t stream) {
-    // A 512x512 GEMM has only sixteen 128x128 blocks, so use the smaller
-    // configuration to keep every SM supplied with multiple warps.
-    if (output_rows <= 512 && output_columns <= 512) {
-        launch_matmul_config<
-            SMALL_BM,
-            SMALL_BN,
-            WM,
-            SMALL_WN,
-            TM,
-            SMALL_TN>(
-            output,
-            left,
-            right,
-            output_rows,
-            output_columns,
-            inner_size,
-            stream);
-    } else {
-        launch_matmul_config<
-            BM,
-            BN,
-            WM,
-            WN,
-            TM,
-            TN>(
-            output,
-            left,
-            right,
-            output_rows,
-            output_columns,
-            inner_size,
-            stream);
-    }
+    launch_matmul_config<
+        BM,
+        BN,
+        WM,
+        WN,
+        TM,
+        TN>(
+        output,
+        left,
+        right,
+        output_rows,
+        output_columns,
+        inner_size,
+        stream);
 }
 
 void launch_tensor_core_matmul(
