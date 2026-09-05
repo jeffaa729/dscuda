@@ -6,6 +6,9 @@ from common import I, P, Operation, bind, checked, library, pointers, stream, to
 
 
 def cases(args, family):
+    is_sm90 = torch.cuda.get_device_capability() == (9, 0)
+    if args.suite == "h100" and not is_sm90:
+        raise ValueError("The H100 GEMM suite requires an SM90 GPU.")
     reference = args.reference or ("both" if args.suite == "h100" else "cublas")
     if reference not in ("cublas", "deepgemm", "both"):
         raise ValueError("GEMM references: cublas, deepgemm, or both")
@@ -17,7 +20,7 @@ def cases(args, family):
     if use_cublas:
         checked(lib, "operator", bind(lib, "dscuda_cublas_init", [])())
     gemm = bind(lib, "dscuda_gemm", [P] * 3 + [I] * 5 + [P])
-    dtypes = (torch.bfloat16,) if reference == "deepgemm" else (
+    dtypes = (torch.bfloat16,) if is_sm90 or reference == "deepgemm" else (
         torch.float32, torch.bfloat16)
 
     try:
@@ -35,7 +38,8 @@ def cases(args, family):
                 left = torch.randn((m, k), device="cuda", dtype=dtype) * .1
                 right = torch.randn((k, n), device="cuda", dtype=dtype) * .1
                 expected = (left.float() @ right.float()).to(dtype)
-                custom_output = torch.empty((m, n), device="cuda", dtype=dtype)
+                # An empty/incomplete SM90 kernel must fail correctness before timing.
+                custom_output = torch.full((m, n), float("nan"), device="cuda", dtype=dtype)
 
                 def native(output, use_reference):
                     checked(lib, "operator", gemm(

@@ -14,6 +14,8 @@ cuda_arch="${DSCUDA_CUDA_ARCH:-}"
 if [[ -z "$cuda_arch" ]] && command -v nvidia-smi >/dev/null; then
     cuda_arch="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -n 1 | tr -d '. ' || true)"
 fi
+# Hopper WGMMA requires the architecture-specific sm_90a target.
+[[ "$cuda_arch" != 90 ]] || cuda_arch=90a
 cmake -S "$repo_root" -B "$repo_root/build" \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_CUDA_ARCHITECTURES="${cuda_arch:-89}" \
