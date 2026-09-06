@@ -4,7 +4,6 @@
 #include "common.cuh"
 
 #include <cuda_bf16.h>
-#include <mma.h>
 
 namespace dscuda {
 namespace {
@@ -19,24 +18,6 @@ constexpr int WN = 32;
 constexpr int TM = 8;
 constexpr int TN = 8;
 constexpr int VECTOR_WIDTH = 4;
-
-namespace tc {
-
-constexpr int BM = 128;
-constexpr int BN = 128;
-constexpr int BK = 16;
-constexpr int WM = 64;
-constexpr int WN = 32;
-constexpr int MMA_M = 16;
-constexpr int MMA_N = 16;
-constexpr int MMA_K = 16;
-constexpr int WARP_TILES_M = WM / MMA_M;
-constexpr int WARP_TILES_N = WN / MMA_N;
-constexpr int WARPS_N = BN / WN;
-constexpr int NUM_THREADS = (BM / WM) * (BN / WN) * 32;
-constexpr int SKEW = 16;
-
-}  // namespace tc
 
 namespace tc_mma {
 
@@ -351,160 +332,18 @@ __global__ void matmul_kernel(float* __restrict__ C, const float* __restrict__ A
     }
 }
 
-// BF16 edge fallback: zero-pad partial tiles and use WMMA Tensor Cores with
-// FP32 accumulation. This path uses single-buffered shared storage.
-__global__ void matmul_tensor_core_edge_kernel(__nv_bfloat16* C, const __nv_bfloat16* A, const __nv_bfloat16* B, int M, int N, int K) {
-    // Shared-memory padding changes bank mapping while preserving WMMA
-    // stride alignment; per-warp FP32 scratch supports BF16 output conversion.
-    __shared__ __nv_bfloat16 shared_A[tc::BK][tc::BM + tc::SKEW];
-    __shared__ __nv_bfloat16 shared_B[tc::BK][tc::BN + tc::SKEW];
-    __shared__ float shared_output[tc::NUM_THREADS / 32][tc::MMA_M * tc::MMA_N];
-
-    const int tid = threadIdx.x;
-    const int lane_id = tid % 32;
-    const int warp_id = tid / 32;
-    const int warp_row = warp_id / tc::WARPS_N;
-    const int warp_column = warp_id % tc::WARPS_N;
-    const int block_row = blockIdx.y * tc::BM;
-    const int block_column = blockIdx.x * tc::BN;
-
-    nvcuda::wmma::fragment<
-        nvcuda::wmma::matrix_a,
-        tc::MMA_M,
-        tc::MMA_N,
-        tc::MMA_K,
-        __nv_bfloat16,
-        nvcuda::wmma::col_major>
-        A_fragments[tc::WARP_TILES_M];
-    nvcuda::wmma::fragment<
-        nvcuda::wmma::matrix_b,
-        tc::MMA_M,
-        tc::MMA_N,
-        tc::MMA_K,
-        __nv_bfloat16,
-        nvcuda::wmma::row_major>
-        B_fragments[tc::WARP_TILES_N];
-    nvcuda::wmma::fragment<
-        nvcuda::wmma::accumulator,
-        tc::MMA_M,
-        tc::MMA_N,
-        tc::MMA_K,
-        float>
-        accumulators[tc::WARP_TILES_M][tc::WARP_TILES_N];
-
-#pragma unroll
-    for (int tile_row = 0; tile_row < tc::WARP_TILES_M; ++tile_row) {
-#pragma unroll
-        for (int tile_column = 0; tile_column < tc::WARP_TILES_N; ++tile_column) {
-            nvcuda::wmma::fill_fragment(
-                accumulators[tile_row][tile_column], 0.0F);
-        }
-    }
-
-    for (int tile_inner = 0; tile_inner < K; tile_inner += tc::BK) {
-        for (int index = tid; index < tc::BM * tc::BK; index += tc::NUM_THREADS) {
-            const int local_row = index / tc::BK;
-            const int local_inner = index % tc::BK;
-            const int global_row = block_row + local_row;
-            const int global_inner = tile_inner + local_inner;
-            __nv_bfloat16 value = __float2bfloat16(0.0F);
-            if (global_row < M && global_inner < K) {
-                value = A[global_row * K + global_inner];
-            }
-            shared_A[local_inner][local_row] = value;
-        }
-
-        for (int index = tid; index < tc::BK * tc::BN; index += tc::NUM_THREADS) {
-            const int local_inner = index / tc::BN;
-            const int local_column = index % tc::BN;
-            const int global_inner = tile_inner + local_inner;
-            const int global_column = block_column + local_column;
-            __nv_bfloat16 value = __float2bfloat16(0.0F);
-            if (global_inner < K && global_column < N) {
-                value = B[global_inner * N + global_column];
-            }
-            shared_B[local_inner][local_column] = value;
-        }
-        __syncthreads();
-
-#pragma unroll
-        for (int tile_row = 0; tile_row < tc::WARP_TILES_M; ++tile_row) {
-            const int shared_row =
-                warp_row * tc::WM + tile_row * tc::MMA_M;
-            nvcuda::wmma::load_matrix_sync(
-                A_fragments[tile_row],
-                &shared_A[0][shared_row],
-                tc::BM + tc::SKEW);
-        }
-#pragma unroll
-        for (int tile_column = 0; tile_column < tc::WARP_TILES_N; ++tile_column) {
-            const int shared_column =
-                warp_column * tc::WN + tile_column * tc::MMA_N;
-            nvcuda::wmma::load_matrix_sync(
-                B_fragments[tile_column],
-                &shared_B[0][shared_column],
-                tc::BN + tc::SKEW);
-        }
-
-#pragma unroll
-        for (int tile_row = 0; tile_row < tc::WARP_TILES_M; ++tile_row) {
-#pragma unroll
-            for (int tile_column = 0; tile_column < tc::WARP_TILES_N;
-                 ++tile_column) {
-                nvcuda::wmma::mma_sync(
-                    accumulators[tile_row][tile_column],
-                    A_fragments[tile_row],
-                    B_fragments[tile_column],
-                    accumulators[tile_row][tile_column]);
-            }
-        }
-        __syncthreads();
-    }
-
-#pragma unroll
-    for (int tile_row = 0; tile_row < tc::WARP_TILES_M; ++tile_row) {
-#pragma unroll
-        for (int tile_column = 0; tile_column < tc::WARP_TILES_N; ++tile_column) {
-            const int output_row =
-                block_row + warp_row * tc::WM + tile_row * tc::MMA_M;
-            const int output_column =
-                block_column + warp_column * tc::WN + tile_column * tc::MMA_N;
-            float* warp_output = shared_output[warp_id];
-            nvcuda::wmma::store_matrix_sync(
-                warp_output,
-                accumulators[tile_row][tile_column],
-                tc::MMA_N,
-                nvcuda::wmma::mem_row_major);
-            __syncwarp();
-            for (int element = lane_id;
-                 element < tc::MMA_M * tc::MMA_N;
-                 element += 32) {
-                const int row = element / tc::MMA_N;
-                const int column = element % tc::MMA_N;
-                if (output_row + row < M &&
-                    output_column + column < N) {
-                    C[(output_row + row) * N +
-                           output_column + column] =
-                        __float2bfloat16(warp_output[element]);
-                }
-            }
-            __syncwarp();
-        }
-    }
-}
-
 // BF16 asynchronous copy: move 16 bytes (eight BF16 values) directly from
 // global to shared memory, avoiding intermediate data registers.
 // L2::128B is a prefetch hint, not the number of bytes copied per thread.
 __device__ __forceinline__ void cp_async_bf16x8(
     __nv_bfloat16* destination,
     const __nv_bfloat16* source) {
-    const unsigned int shared_address =
-        static_cast<unsigned int>(__cvta_generic_to_shared(destination));
+    const unsigned int shared_address = static_cast<unsigned int>(__cvta_generic_to_shared(destination));
     asm volatile(
         "cp.async.cg.shared.global.L2::128B [%0], [%1], 16;\n" ::
             "r"(shared_address),
-            "l"(source));
+            "l"(source)
+        );
 }
 
 __device__ __forceinline__ void cp_async_commit() {
@@ -808,29 +647,7 @@ void launch_matmul(
 void launch_tensor_core_matmul(
     __nv_bfloat16* C, const __nv_bfloat16* A, const __nv_bfloat16* B,
     int M, int N, int K, cudaStream_t stream) {
-    // Shape specialization: aligned tiles use branch-free PTX loads; partial
-    // shapes use WMMA fallback. A smaller M tile exposes more thread blocks.
-    const bool vector_aligned =
-        K % tc_mma::BK == 0 &&
-        N % tc_mma::VECTOR_ELEMENTS == 0;
-    const bool use_small_tile =
-        M <= 1024 &&
-        M % 64 == 0 &&
-        N % 128 == 0 &&
-        vector_aligned;
-    const bool use_large_tile =
-        M % 128 == 0 &&
-        N % 128 == 0 &&
-        vector_aligned;
-    if (use_small_tile) {
-        launch_tensor_core_mma_config<64, 128, 4, 4>(C, A, B, M, N, K, stream);
-    } else if (use_large_tile) {
-        launch_tensor_core_mma_config<128, 128, 4, 4>(C, A, B, M, N, K, stream);
-    } else {
-        const dim3 blocks((N + tc::BN - 1) / tc::BN, (M + tc::BM - 1) / tc::BM);
-        matmul_tensor_core_edge_kernel<<<blocks, tc::NUM_THREADS, 0, stream>>>(
-            C, A, B, M, N, K);
-    }
+    launch_tensor_core_mma_config<128, 128, 4, 4>(C, A, B, M, N, K, stream);
     CUDA_CHECK(cudaGetLastError());
 }
 
