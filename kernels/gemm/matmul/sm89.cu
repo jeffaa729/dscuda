@@ -336,21 +336,26 @@ __global__ void matmul_kernel(float* __restrict__ C, const float* __restrict__ A
 // BF16 asynchronous copy: move 16 bytes (eight BF16 values) directly from
 // global to shared memory, avoiding intermediate data registers.
 // L2::128B is a prefetch hint, not the number of bytes copied per thread.
-__device__ __forceinline__ void cp_async_bf16x8(
-    __nv_bfloat16* destination,
-    const __nv_bfloat16* source) {
+__device__ __forceinline__ void cp_async_bf16x8(__nv_bfloat16* destination, const __nv_bfloat16* source) {
     const unsigned int shared_address = static_cast<unsigned int>(__cvta_generic_to_shared(destination));
+    // asynchronous memory copy 
+    /*
+    .cg : cache-global policy. Operation uses L2 cache and avoids allocate the copied data in L1
+    .shared.global : specifies that source and destination is shared -> global
+    .L2::128B : L2 prefetch size hint. GPU fetch a 128 byte region into L2 around the requested address
+    [%0]， [%1] : shared_address and source
+    */
     asm volatile(
         "cp.async.cg.shared.global.L2::128B [%0], [%1], 16;\n" ::
             "r"(shared_address),
             "l"(source)
         );
 }
-
+//places all uncommitted copies issued by that thread into one asynchronous group
 __device__ __forceinline__ void cp_async_commit() {
     asm volatile("cp.async.commit_group;\n" ::);
 }
-
+//Wait until zero previously committed groups remain incomplete
 __device__ __forceinline__ void cp_async_wait() {
     asm volatile("cp.async.wait_group 0;\n" ::);
 }
@@ -369,9 +374,16 @@ __device__ __forceinline__ unsigned int shared_address(const void* pointer) {
 
 // Warp-cooperative ldmatrix loads distribute BF16 operands into the register
 // layout required by mma.sync; these are not ordinary per-thread float arrays.
-__device__ __forceinline__ void load_matrix_x4(
-    unsigned int (&fragment)[4],
-    unsigned int address) {
+/*
+ldmatrix: load matrix data into registers
+sync    : all warp lanes participate together
+aligned : warp execution must be uniform
+m8n8    : each component matrix is 8×8
+x4      : load four 8×8 matrices
+shared  : source is shared memory
+b16     : each element contains 16 bits
+*/
+__device__ __forceinline__ void load_matrix_x4(unsigned int (&fragment)[4], unsigned int address) {
     asm volatile(
         "ldmatrix.sync.aligned.m8n8.x4.shared.b16 "
         "{%0, %1, %2, %3}, [%4];\n"
@@ -384,9 +396,8 @@ __device__ __forceinline__ void load_matrix_x4(
 
 // The PTX transpose arranges a row-major B tile into the column operand
 // registers expected by mma.sync; the logical input remains B[K,N].
-__device__ __forceinline__ void load_matrix_b_x2(
-    unsigned int (&fragment)[2],
-    unsigned int address) {
+// why trans : 
+__device__ __forceinline__ void load_matrix_b_x2(unsigned int (&fragment)[2], unsigned int address) {
     asm volatile(
         "ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 "
         "{%0, %1}, [%2];\n"
@@ -396,17 +407,20 @@ __device__ __forceinline__ void load_matrix_b_x2(
 
 // Native Tensor Core MMA: the whole warp computes a 16x8 C update over
 // K=16 using BF16 operands and FP32 accumulation (4096 FLOPs per warp).
-__device__ __forceinline__ void mma_bf16_m16n8k16(
-    float (&accumulator)[4],
-    const unsigned int (&A)[4],
-    const unsigned int (&B)[2]) {
+/*
+mma.sync.aligned : warp-cooperative synchronous matrix multiply-accumulate
+m16n8k16 : D[16,8] = A[16,16] × B[16,8] + C[16,8]
+row.col : A is row-major, B is column-major
+f32.bf16.bf16.f32 : destination D: FP32, operand A: BF16, operand B: BF16, accumulator C: FP32
+*/
+__device__ __forceinline__ void mma_bf16_m16n8k16(float (&accumulator)[4], const unsigned int (&A)[4], const unsigned int (&B)[2]) {
     asm volatile(
         "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
-        "{%0, %1, %2, %3}, "
-        "{%4, %5, %6, %7}, "
-        "{%8, %9}, "
-        "{%0, %1, %2, %3};\n"
-        : "+f"(accumulator[0]),
+        "{%0, %1, %2, %3}, " // destination D
+        "{%4, %5, %6, %7}, " // operand A
+        "{%8, %9}, "        // operand B
+        "{%0, %1, %2, %3};\n" // accumulator C, accumulator register appear twice, accumulator += A * B
+        : "+f"(accumulator[0]), // +f, register is both input and output, FP32 register
           "+f"(accumulator[1]),
           "+f"(accumulator[2]),
           "+f"(accumulator[3])
@@ -424,7 +438,8 @@ __device__ __forceinline__ void mma_bf16_m16n8k16(
 template <int kBM, int kBN, int kWarpTilesM, int kWarpTilesN>
 __global__ __launch_bounds__(256, 2) void matmul_tensor_core_mma_kernel(
     __nv_bfloat16* __restrict__ C, const __nv_bfloat16* __restrict__ A,
-    const __nv_bfloat16* __restrict__ B, int M, int N, int K) {
+    const __nv_bfloat16* __restrict__ B, int M, int N, int K
+) {
     (void)M;
     constexpr int kWM = kWarpTilesM * tc_mma::MMA_M;
     constexpr int kWN = kWarpTilesN * tc_mma::MMA_N;
@@ -626,8 +641,7 @@ void launch_tensor_core_mma_config(
     int M, int N, int K, cudaStream_t stream) {
     constexpr int kWM = kWarpTilesM * tc_mma::MMA_M;
     constexpr int kWN = kWarpTilesN * tc_mma::MMA_N;
-    constexpr int kNumThreads =
-        (kBM / kWM) * (kBN / kWN) * 32;
+    constexpr int kNumThreads = (kBM / kWM) * (kBN / kWN) * 32;
     const dim3 blocks(N / kBN, M / kBM);
     matmul_tensor_core_mma_kernel<kBM, kBN, kWarpTilesM, kWarpTilesN>
         <<<blocks, kNumThreads, 0, stream>>>(C, A, B, M, N, K);
@@ -653,10 +667,6 @@ void launch_matmul(
 void launch_tensor_core_matmul(
     __nv_bfloat16* C, const __nv_bfloat16* A, const __nv_bfloat16* B,
     int M, int N, int K, cudaStream_t stream) {
-    if (M <= 0 || N <= 0 || K <= 0 || M % 128 || N % 128 || K % tc_mma::BK) {
-        throw std::invalid_argument(
-            "SM89 BF16 GEMM requires M,N multiples of 128 and K a multiple of 32");
-    }
     launch_tensor_core_mma_config<128, 128, 4, 4>(C, A, B, M, N, K, stream);
     CUDA_CHECK(cudaGetLastError());
 }
