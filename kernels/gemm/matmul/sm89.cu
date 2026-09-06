@@ -4,6 +4,7 @@
 #include "common.cuh"
 
 #include <cuda_bf16.h>
+#include <stdexcept>
 
 namespace dscuda {
 namespace {
@@ -432,6 +433,11 @@ __global__ __launch_bounds__(256, 2) void matmul_tensor_core_mma_kernel(
         (kBM / kWM) * kWarpsN * 32;
     constexpr int kAStageElements = kBM * tc_mma::BK;
     constexpr int kBStageElements = tc_mma::BK * kBN;
+    static_assert(kBM % kWM == 0);
+    static_assert(kBN % kWN == 0);
+    static_assert(tc_mma::BK % tc_mma::MMA_K == 0);
+    static_assert(kAStageElements % tc_mma::VECTOR_ELEMENTS == 0);
+    static_assert(kBStageElements % tc_mma::VECTOR_ELEMENTS == 0);
 
     // Two aligned shared stages overlap copying tile k+1 with MMA on tile k.
     __shared__ __align__(16)
@@ -647,6 +653,10 @@ void launch_matmul(
 void launch_tensor_core_matmul(
     __nv_bfloat16* C, const __nv_bfloat16* A, const __nv_bfloat16* B,
     int M, int N, int K, cudaStream_t stream) {
+    if (M <= 0 || N <= 0 || K <= 0 || M % 128 || N % 128 || K % tc_mma::BK) {
+        throw std::invalid_argument(
+            "SM89 BF16 GEMM requires M,N multiples of 128 and K a multiple of 32");
+    }
     launch_tensor_core_mma_config<128, 128, 4, 4>(C, A, B, M, N, K, stream);
     CUDA_CHECK(cudaGetLastError());
 }
