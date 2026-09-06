@@ -86,7 +86,17 @@ __device__ __forceinline__ float4 load_float4(
     }
     return value;
 }
+/*
+as the problem size increase, this config dont change while just increase the no of block launch?
+what problem may occur if we dont check the divisibility
 
+kBM : Rows of C computed by a block    (128)
+kBN : Col of C computed by a block     (128)
+kWM : Row of C computed by a wrap     (64)
+kWN : Col of C computed by a wrap     (32)
+kTM : Row of C computed by a thread     (8)
+kTN : Col of C computed by a thread     (8)
+*/
 template <int kBM, int kBN, int kWM, int kWN, int kTM, int kTN>
 __global__ void matmul_kernel(
     float* __restrict__ C,
@@ -97,10 +107,16 @@ __global__ void matmul_kernel(
     int K) {
     // Compile-time specialization lets the compiler fold tile indexing and
     // unroll fixed-size loops; __restrict__ also rules out pointer aliasing.
+    
+    // no of warp tiles are needed in 1 block column (128 / 32)
     constexpr int kWarpsPerRow = kBN / kWN;
+    // no of threads in 1 block  (128/64) * (128/32) * 32 = 256 threads
     constexpr int kNumThreads = (kBM / kWM) * (kBN / kWN) * 32;
-    constexpr int kLeftLoads = (kBM * BK / VECTOR_WIDTH) / kNumThreads;
-    constexpr int kRightLoads = (BK * kBN / VECTOR_WIDTH) / kNumThreads;
+    // no of loads of A per thread (128 * 8) / 4 / 256 , each block load 128*8 element with 128*8 / 4 vectorized times , each thread thus loads 128*8/4/256 = 1 times
+    constexpr int kALoads = (kBM * BK / VECTOR_WIDTH) / kNumThreads;
+    // same as A , thus each thread loads 1 float4 from A and 1 float4 from B
+    constexpr int kBLoads = (BK * kBN / VECTOR_WIDTH) / kNumThreads;
+    // check the divisibility 
     static_assert(kBM % kWM == 0);
     static_assert(kBN % kWN == 0);
     static_assert(kWM == 8 * kTM);
@@ -110,43 +126,44 @@ __global__ void matmul_kernel(
     static_assert((kBM * BK / VECTOR_WIDTH) % kNumThreads == 0);
     static_assert((BK * kBN / VECTOR_WIDTH) % kNumThreads == 0);
 
-    // FP32 shared-memory double buffering: alternate tiles to overlap global
-    // prefetch with computation. A is transposed to [K][M] for float4 reads;
+    // FP32 shared-memory double buffering: alternate tiles to overlap global prefetch with computation.
+    // stage 0 : cur/next A and B tile, stage 1: next/cur A and B tile
+    // A is transposed to [K][M] for float4 reads;
+    __shared__ float shared_A[2 * BK * kBM];
     // B stays [K][N]. Logical layouts include an outer [stage] dimension.
-    __shared__ float shared_left[2 * BK * kBM];
-    __shared__ float shared_right[2 * BK * kBN];
+    __shared__ float shared_B[2 * BK * kBN];
 
     const int tid = threadIdx.x;
-    const int warp_id = tid / 32;
-    const int lane_id = tid % 32;
-    // Warp tiling: 8x4 lanes cover one warp tile. Lanes sharing a row or
-    // column reuse the same A or B fragments through shared-memory reads.
+    const int warp_id = threadIdx.x / 32;
+    const int lane_id = threadIdx.x % 32;
+    // Warp tiling: 8x4 lanes cover one warp tile. Lanes sharing a row or column reuse the same A or B fragments through shared-memory reads.
+    // e.g. warp id = 0 -> warp_row = 0 , warp_col = 0, warp id = 5 -> warp_row = 1 , warp_col = 1, 
     const int warp_row = warp_id / kWarpsPerRow;
     const int warp_column = warp_id % kWarpsPerRow;
+    // lane position inside a warp, since lanes are treated as 8 x 4 grid so /4 or %4
     const int lane_row = lane_id / 4;
     const int lane_column = lane_id % 4;
+    // the beginning of a thread 8x8 output relative to the whole block output 128x128
+    // e.g. warp 0 : local row = 0, local col = 0, warp 31 : local row = 56, local col = 24
     const int local_row = warp_row * kWM + lane_row * kTM;
     const int local_column = warp_column * kWN + lane_column * kTN;
+    // block output matrix 128x128 relative to the whole matrix
     const int block_row = blockIdx.y * kBM;
     const int block_column = blockIdx.x * kBN;
-    // Aligned interior blocks bypass all scalar edge handling.
-    const bool full_tile =
-        block_row + kBM <= M &&
-        block_column + kBN <= N &&
-        K % BK == 0 &&
-        N % VECTOR_WIDTH == 0;
+    // Aligned interior blocks bypass all scalar edge handling. determines if the kernel use full float4 loads
+    const bool full_tile = block_row + kBM <= M && block_column + kBN <= N && K % BK == 0 && N % VECTOR_WIDTH == 0;
 
     // Register tiling: retain every partial C across all K tiles.
     // Independent accumulators expose instruction-level parallelism (ILP).
+    // init as zero, these value stay in registers throughout the complete K loop. so only written to global memory only once after the whole K tiles hv been computed.
     float accumulator[kTM][kTN] = {};
     // Register double buffering: prefetch the next K-step fragments while
     // computing with the current ones, at the cost of more live registers.
-    float left_fragment[2][kTM];
-    float right_fragment[2][kTN];
+    float A_fragment[2][kTM];
+    float B_fragment[2][kTN];
     int write_stage = 0;
 
-    // Each iteration first issues the global loads for the next tile, computes
-    // the preceding tile, and then publishes the loaded values to shared memory.
+    // Each iteration first issues the global loads for the next tile, computes the preceding tile, and then publishes the loaded values to shared memory.
     for (int tile_to_load = 0;; tile_to_load += BK) {
         const bool load_tile = tile_to_load < K;
         const bool compute_tile = tile_to_load > 0;
