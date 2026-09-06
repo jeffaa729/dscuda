@@ -87,9 +87,6 @@ __device__ __forceinline__ float4 load_float4(
     return value;
 }
 /*
-as the problem size increase, this config dont change while just increase the no of block launch?
-what problem may occur if we dont check the divisibility
-
 kBM : Rows of C computed by a block    (128)
 kBN : Col of C computed by a block     (128)
 kWM : Row of C computed by a wrap     (64)
@@ -98,9 +95,7 @@ kTM : Row of C computed by a thread     (8)
 kTN : Col of C computed by a thread     (8)
 */
 template <int kBM, int kBN, int kWM, int kWN, int kTM, int kTN>
-__global__ void matmul_kernel(
-    float* __restrict__ C, const float* __restrict__ A,
-    const float* __restrict__ B, int M, int N, int K) {
+__global__ void matmul_kernel(float* __restrict__ C, const float* __restrict__ A, const float* __restrict__ B, int M, int N, int K) {
     // Compile-time specialization lets the compiler fold tile indexing and
     // unroll fixed-size loops; __restrict__ also rules out pointer aliasing.
     
@@ -358,15 +353,12 @@ __global__ void matmul_kernel(
 
 // BF16 edge fallback: zero-pad partial tiles and use WMMA Tensor Cores with
 // FP32 accumulation. This path uses single-buffered shared storage.
-__global__ void matmul_tensor_core_edge_kernel(
-    __nv_bfloat16* C, const __nv_bfloat16* A, const __nv_bfloat16* B,
-    int M, int N, int K) {
+__global__ void matmul_tensor_core_edge_kernel(__nv_bfloat16* C, const __nv_bfloat16* A, const __nv_bfloat16* B, int M, int N, int K) {
     // Shared-memory padding changes bank mapping while preserving WMMA
     // stride alignment; per-warp FP32 scratch supports BF16 output conversion.
     __shared__ __nv_bfloat16 shared_A[tc::BK][tc::BM + tc::SKEW];
     __shared__ __nv_bfloat16 shared_B[tc::BK][tc::BN + tc::SKEW];
-    __shared__ float shared_output[tc::NUM_THREADS / 32]
-                                  [tc::MMA_M * tc::MMA_N];
+    __shared__ float shared_output[tc::NUM_THREADS / 32][tc::MMA_M * tc::MMA_N];
 
     const int tid = threadIdx.x;
     const int lane_id = tid % 32;
