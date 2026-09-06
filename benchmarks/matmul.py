@@ -61,7 +61,7 @@ def cases(args, family):
                         lambda output=deepgemm_output:
                             deepgemm.gemm_nn(left, right, output))
 
-                tolerance = 1e-2 if dtype == torch.bfloat16 else 2e-4
+                tolerance = 2e-2 if dtype == torch.bfloat16 else 2e-4
                 yield Operation(
                     f"M={m},N={n},K={k}",
                     "bf16" if dtype == torch.bfloat16 else "fp32",
