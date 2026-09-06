@@ -171,22 +171,19 @@ __global__ void matmul_kernel(
             for (int load = 0; load < kALoads; ++load) {
                 // Coalesced cooperative loading: neighboring threads own
                 // neighboring float4 segments within each input tile row.
+                
+                //which float4 inside the complete A tile belongs to this thread 
                 const int vector_index = tid + load * kNumThreads;
+                // no of vectors per A row
                 const int vectors_per_row = BK / VECTOR_WIDTH;
                 const int tile_row = vector_index / vectors_per_row;
-                const int tile_inner =
-                    (vector_index % vectors_per_row) * VECTOR_WIDTH;
+                const int tile_inner = (vector_index % vectors_per_row) * VECTOR_WIDTH;
                 const int global_row = block_row + tile_row;
                 const int global_inner = tile_to_load + tile_inner;
                 const int index = global_row * K + global_inner;
-                loaded_A[load] = full_tile
-                    ? *reinterpret_cast<const float4*>(A + index)
-                    : load_float4(
-                          A,
-                          index,
-                          global_row < M,
-                          global_inner,
-                          K);
+                loaded_A[load] = full_tile ? 
+                    *reinterpret_cast<const float4*>(A + index) : 
+                    load_float4(A, index, global_row < M, global_inner, K);
             }
 
 #pragma unroll
@@ -194,19 +191,13 @@ __global__ void matmul_kernel(
                 const int vector_index = tid + load * kNumThreads;
                 const int vectors_per_inner = kBN / VECTOR_WIDTH;
                 const int tile_inner = vector_index / vectors_per_inner;
-                const int tile_column =
-                    (vector_index % vectors_per_inner) * VECTOR_WIDTH;
+                const int tile_column = (vector_index % vectors_per_inner) * VECTOR_WIDTH;
                 const int global_inner = tile_to_load + tile_inner;
                 const int global_column = block_column + tile_column;
                 const int index = global_inner * N + global_column;
-                loaded_B[load] = full_tile
-                    ? *reinterpret_cast<const float4*>(B + index)
-                    : load_float4(
-                          B,
-                          index,
-                          global_inner < K,
-                          global_column,
-                          N);
+                loaded_B[load] = full_tile ? 
+                    *reinterpret_cast<const float4*>(B + index) : 
+                    load_float4(B, index, global_inner < K, global_column, N);
             }
         }
 
@@ -223,33 +214,23 @@ __global__ void matmul_kernel(
 #pragma unroll
                 for (int vector = 0; vector < kTM / VECTOR_WIDTH; ++vector) {
                     const float4 value = *reinterpret_cast<const float4*>(
-                        &shared_A[
-                            (read_stage * BK + inner + 1) * kBM +
-                            local_row + vector * VECTOR_WIDTH]);
-                    A_fragment[write_fragment][vector * VECTOR_WIDTH + 0] =
-                        value.x;
-                    A_fragment[write_fragment][vector * VECTOR_WIDTH + 1] =
-                        value.y;
-                    A_fragment[write_fragment][vector * VECTOR_WIDTH + 2] =
-                        value.z;
-                    A_fragment[write_fragment][vector * VECTOR_WIDTH + 3] =
-                        value.w;
+                        &shared_A[(read_stage * BK + inner + 1) * kBM + local_row + vector * VECTOR_WIDTH]
+                    );
+                    A_fragment[write_fragment][vector * VECTOR_WIDTH + 0] = value.x;
+                    A_fragment[write_fragment][vector * VECTOR_WIDTH + 1] = value.y;
+                    A_fragment[write_fragment][vector * VECTOR_WIDTH + 2] = value.z;
+                    A_fragment[write_fragment][vector * VECTOR_WIDTH + 3] = value.w;
                 }
 
 #pragma unroll
                 for (int vector = 0; vector < kTN / VECTOR_WIDTH; ++vector) {
                     const float4 value = *reinterpret_cast<const float4*>(
-                        &shared_B[
-                            (read_stage * BK + inner + 1) * kBN +
-                            local_column + vector * VECTOR_WIDTH]);
-                    B_fragment[write_fragment][vector * VECTOR_WIDTH + 0] =
-                        value.x;
-                    B_fragment[write_fragment][vector * VECTOR_WIDTH + 1] =
-                        value.y;
-                    B_fragment[write_fragment][vector * VECTOR_WIDTH + 2] =
-                        value.z;
-                    B_fragment[write_fragment][vector * VECTOR_WIDTH + 3] =
-                        value.w;
+                        &shared_B[(read_stage * BK + inner + 1) * kBN + local_column + vector * VECTOR_WIDTH]
+                    );
+                    B_fragment[write_fragment][vector * VECTOR_WIDTH + 0] = value.x;
+                    B_fragment[write_fragment][vector * VECTOR_WIDTH + 1] = value.y;
+                    B_fragment[write_fragment][vector * VECTOR_WIDTH + 2] = value.z;
+                    B_fragment[write_fragment][vector * VECTOR_WIDTH + 3] = value.w;
                 }
 
 #pragma unroll
@@ -258,10 +239,7 @@ __global__ void matmul_kernel(
                     for (int column = 0; column < kTN; ++column) {
                         // Register outer product: reuse each A value across
                         // columns and each B value across rows using FP32 FMA.
-                        accumulator[row][column] = __fmaf_rn(
-                            A_fragment[read_fragment][row],
-                            B_fragment[read_fragment][column],
-                            accumulator[row][column]);
+                        accumulator[row][column] = __fmaf_rn(A_fragment[read_fragment][row], B_fragment[read_fragment][column], accumulator[row][column]);
                     }
                 }
             }
@@ -273,22 +251,13 @@ __global__ void matmul_kernel(
                 const int vector_index = tid + load * kNumThreads;
                 const int vectors_per_row = BK / VECTOR_WIDTH;
                 const int tile_row = vector_index / vectors_per_row;
-                const int tile_inner =
-                    (vector_index % vectors_per_row) * VECTOR_WIDTH;
+                const int tile_inner = (vector_index % vectors_per_row) * VECTOR_WIDTH;
                 // Scatter the contiguous global A vector into transposed
                 // shared storage; a single contiguous cp.async cannot do this.
-                shared_A[
-                    (write_stage * BK + tile_inner + 0) * kBM +
-                    tile_row] = loaded_A[load].x;
-                shared_A[
-                    (write_stage * BK + tile_inner + 1) * kBM +
-                    tile_row] = loaded_A[load].y;
-                shared_A[
-                    (write_stage * BK + tile_inner + 2) * kBM +
-                    tile_row] = loaded_A[load].z;
-                shared_A[
-                    (write_stage * BK + tile_inner + 3) * kBM +
-                    tile_row] = loaded_A[load].w;
+                shared_A[(write_stage * BK + tile_inner + 0) * kBM + tile_row] = loaded_A[load].x;
+                shared_A[(write_stage * BK + tile_inner + 1) * kBM + tile_row] = loaded_A[load].y;
+                shared_A[(write_stage * BK + tile_inner + 2) * kBM + tile_row] = loaded_A[load].z;
+                shared_A[(write_stage * BK + tile_inner + 3) * kBM + tile_row] = loaded_A[load].w;
             }
 
 #pragma unroll
@@ -296,10 +265,8 @@ __global__ void matmul_kernel(
                 const int vector_index = tid + load * kNumThreads;
                 const int vectors_per_inner = kBN / VECTOR_WIDTH;
                 const int tile_inner = vector_index / vectors_per_inner;
-                const int tile_column =
-                    (vector_index % vectors_per_inner) * VECTOR_WIDTH;
-                const int index =
-                    (write_stage * BK + tile_inner) * kBN + tile_column;
+                const int tile_column = (vector_index % vectors_per_inner) * VECTOR_WIDTH;
+                const int index = (write_stage * BK + tile_inner) * kBN + tile_column;
                 shared_B[index + 0] = loaded_B[load].x;
                 shared_B[index + 1] = loaded_B[load].y;
                 shared_B[index + 2] = loaded_B[load].z;
@@ -313,9 +280,8 @@ __global__ void matmul_kernel(
 #pragma unroll
             for (int vector = 0; vector < kTM / VECTOR_WIDTH; ++vector) {
                 const float4 value = *reinterpret_cast<const float4*>(
-                    &shared_A[
-                        loaded_stage * BK * kBM + local_row +
-                        vector * VECTOR_WIDTH]);
+                    &shared_A[loaded_stage * BK * kBM + local_row + vector * VECTOR_WIDTH]
+                );
                 A_fragment[0][vector * VECTOR_WIDTH + 0] = value.x;
                 A_fragment[0][vector * VECTOR_WIDTH + 1] = value.y;
                 A_fragment[0][vector * VECTOR_WIDTH + 2] = value.z;
@@ -325,9 +291,8 @@ __global__ void matmul_kernel(
 #pragma unroll
             for (int vector = 0; vector < kTN / VECTOR_WIDTH; ++vector) {
                 const float4 value = *reinterpret_cast<const float4*>(
-                    &shared_B[
-                        loaded_stage * BK * kBN + local_column +
-                        vector * VECTOR_WIDTH]);
+                    &shared_B[loaded_stage * BK * kBN + local_column + vector * VECTOR_WIDTH]
+                );
                 B_fragment[0][vector * VECTOR_WIDTH + 0] = value.x;
                 B_fragment[0][vector * VECTOR_WIDTH + 1] = value.y;
                 B_fragment[0][vector * VECTOR_WIDTH + 2] = value.z;
@@ -340,10 +305,7 @@ __global__ void matmul_kernel(
             for (int row = 0; row < kTM; ++row) {
 #pragma unroll
                 for (int column = 0; column < kTN; ++column) {
-                    accumulator[row][column] = __fmaf_rn(
-                        A_fragment[1][row],
-                        B_fragment[1][column],
-                        accumulator[row][column]);
+                    accumulator[row][column] = __fmaf_rn(A_fragment[1][row], B_fragment[1][column], accumulator[row][column]);
                 }
             }
         }
@@ -359,8 +321,7 @@ __global__ void matmul_kernel(
 #pragma unroll
         for (int vector = 0; vector < kTN / VECTOR_WIDTH; ++vector) {
             const int thread_column = vector * VECTOR_WIDTH;
-            const int global_column =
-                block_column + local_column + thread_column;
+            const int global_column = block_column + local_column + thread_column;
             int width = 0;
             if (global_row < M && global_column < N) {
                 const int remaining = N - global_column;
@@ -371,7 +332,8 @@ __global__ void matmul_kernel(
                 accumulator[row][thread_column + 0],
                 accumulator[row][thread_column + 1],
                 accumulator[row][thread_column + 2],
-                accumulator[row][thread_column + 3]);
+                accumulator[row][thread_column + 3]
+            );
 
             // Vectorized epilogue: write four FP32 outputs per aligned store.
             if (width == VECTOR_WIDTH && index % VECTOR_WIDTH == 0) {
