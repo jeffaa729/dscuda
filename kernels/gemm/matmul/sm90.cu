@@ -6,7 +6,6 @@
 #include <cudaTypedefs.h>
 
 #include <cstdint>
-#include <cstdio>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -38,6 +37,7 @@ constexpr int WG_M = BM / NUM_WARPGROUPS;
 constexpr int M_TILES = WG_M / WGMMA_M;
 constexpr int B_PANEL_N = 64;
 constexpr int B_PANELS = BN / B_PANEL_N;
+constexpr unsigned int SMEM_ALIGNMENT = 1024;
 
 static_assert(NUM_THREADS % 128 == 0);
 static_assert(BM % NUM_WARPGROUPS == 0 && WG_M % WGMMA_M == 0);
@@ -47,9 +47,10 @@ static_assert(BK % WGMMA_K == 0 && BN % B_PANEL_N == 0);
 // Matmul3 reuses B across two 64-row WGMMA tiles in one warpgroup.
 // Each B panel has a 128-byte row, as required by the TMA swizzle mode.
 struct SharedStorage {
-    alignas(1024) bf16 A[BM * BK];
-    alignas(1024) bf16 B[B_PANELS][BK * B_PANEL_N];
+    alignas(SMEM_ALIGNMENT) bf16 A[BM * BK];
+    alignas(SMEM_ALIGNMENT) bf16 B[B_PANELS][BK * B_PANEL_N];
 };
+constexpr size_t SMEM_BYTES = sizeof(SharedStorage) + SMEM_ALIGNMENT - 1;
 
 template <int TileRows, int TileColumns>
 CUtensorMap make_tensor_map(const bf16* pointer, int rows, int columns) {
@@ -139,8 +140,12 @@ __device__ __forceinline__ void wgmma_m64n128k16(float (&accumulator)[8][8], bf1
 __global__ __launch_bounds__(NUM_THREADS) void gemm_bf16_kernel(
     bf16* __restrict__ C, const __grid_constant__ CUtensorMap A_map, const __grid_constant__ CUtensorMap B_map, int M, int N, int K) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
-    extern __shared__ __align__(1024) unsigned char storage[];
-    auto& shared = *reinterpret_cast<SharedStorage*>(storage);
+    extern __shared__ __align__(16) unsigned char storage[];
+    // Align the actual shared address: static barriers can shift the dynamic base.
+    // The launch reserves padding so rounding up keeps both TMA tiles in bounds.
+    const unsigned int storage_address = static_cast<unsigned int>(__cvta_generic_to_shared(storage));
+    const unsigned int aligned_address = (storage_address + SMEM_ALIGNMENT - 1) & ~(SMEM_ALIGNMENT - 1);
+    auto& shared = *reinterpret_cast<SharedStorage*>(__cvta_shared_to_generic(aligned_address));
     __shared__ barrier A_barrier;
     __shared__ barrier B_barrier;
 
@@ -164,13 +169,6 @@ __global__ __launch_bounds__(NUM_THREADS) void gemm_bf16_kernel(
 
         // Optimization: a single thread issues asynchronous 2D TMA tile loads.
         if (threadIdx.x == 0) {
-            // Temporary TMA alignment diagnostic: print only the first block/tile.
-            if (tile_m == 0 && tile_n == 0 && tile_k == 0) {
-                printf("A shared=%u, A mod1024=%u, barrier mod8=%u\n",
-                       unsigned(__cvta_generic_to_shared(shared.A)),
-                       unsigned(__cvta_generic_to_shared(shared.A)) % 1024,
-                       unsigned(__cvta_generic_to_shared(&A_barrier)) % 8);
-            }
             cde::cp_async_bulk_tensor_2d_global_to_shared(shared.A, &A_map, tile_k * BK, tile_m * BM, A_barrier);
             A_token = cuda::device::barrier_arrive_tx(A_barrier, 1, sizeof(shared.A));
 #pragma unroll
@@ -236,9 +234,9 @@ void gemm_bf16_sm90_cuda(bf16* C, const bf16* A, const bf16* B, int M, int N, in
     }
     const CUtensorMap A_map = make_tensor_map<BM, BK>(A, M, K);
     const CUtensorMap B_map = make_tensor_map<BK, B_PANEL_N>(B, K, N);
-    CUDA_CHECK(cudaFuncSetAttribute(gemm_bf16_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, sizeof(SharedStorage)));
+    CUDA_CHECK(cudaFuncSetAttribute(gemm_bf16_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_BYTES));
     const dim3 grid(N / BN, M / BM);
-    gemm_bf16_kernel<<<grid, NUM_THREADS, sizeof(SharedStorage), stream>>>(C, A_map, B_map, M, N, K);
+    gemm_bf16_kernel<<<grid, NUM_THREADS, SMEM_BYTES, stream>>>(C, A_map, B_map, M, N, K);
     CUDA_CHECK(cudaGetLastError());
 }
 
