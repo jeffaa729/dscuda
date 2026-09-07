@@ -29,6 +29,8 @@ add_library(dscuda_kernels STATIC
     kernels/moe/grouped_gemm/sm89.cu
 )
 target_include_directories(dscuda_kernels PUBLIC include)
+# Attribute Hopper memory faults to source lines without disabling optimization.
+set_source_files_properties(kernels/gemm/matmul/sm90.cu PROPERTIES COMPILE_OPTIONS "-lineinfo")
 target_link_libraries(dscuda_kernels PUBLIC CUDA::cudart CUDA::cuda_driver)
 set_target_properties(dscuda_kernels PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
