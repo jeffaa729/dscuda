@@ -16,7 +16,8 @@ void gemm_fp32_cuda(
     cudaStream_t stream = nullptr);
 
 // Same NN layout with BF16 inputs/output and FP32 accumulation.
-// Uses Tensor Cores; M, N, and K must be positive multiples of 16.
+// SM89 requires M and N multiples of 128 and K a multiple of 32.
+// SM90 requires M, N, and K multiples of 64.
 void gemm_bf16_cuda(
     __nv_bfloat16* output,
     const __nv_bfloat16* left,

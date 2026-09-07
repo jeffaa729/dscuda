@@ -43,9 +43,7 @@ __device__ __forceinline__ float block_reduce_sum(float value) {
     }
     __syncthreads();
 
-    value = threadIdx.x < BLOCK_SIZE / WARP_SIZE
-        ? warp_sums[threadIdx.x]
-        : 0.0F;
+    value = threadIdx.x < BLOCK_SIZE / WARP_SIZE ? warp_sums[threadIdx.x] : 0.0F;
     if (warp == 0) {
         value = warp_reduce_sum<BLOCK_SIZE / WARP_SIZE>(value);
     }
@@ -54,52 +52,26 @@ __device__ __forceinline__ float block_reduce_sum(float value) {
     return value;
 }
 
-__device__ __forceinline__ int query_offset(
-    int batch,
-    int token,
-    int head,
-    int sequence_length,
-    int heads,
-    int width) {
+__device__ __forceinline__ int query_offset(int batch, int token, int head, int sequence_length, int heads, int width) {
     return ((batch * sequence_length + token) * heads + head) * width;
 }
 
-__device__ __forceinline__ int shared_offset(
-    int batch,
-    int token,
-    int sequence_length,
-    int width) {
+__device__ __forceinline__ int shared_offset(int batch, int token, int sequence_length, int width) {
     return (batch * sequence_length + token) * width;
 }
 
-__device__ __forceinline__ int lse_offset(
-    int batch,
-    int head,
-    int token,
-    int heads,
-    int sequence_length) {
+__device__ __forceinline__ int lse_offset(int batch, int head, int token, int heads, int sequence_length) {
     return (batch * heads + head) * sequence_length + token;
 }
 
-__device__ float dot_query_key(
-    const __nv_bfloat16* query_latent,
-    const __nv_bfloat16* query_rope,
-    const __nv_bfloat16* kv_latent,
-    const __nv_bfloat16* key_rope,
-    int query_base,
-    int query_rope_base,
-    int kv_base,
-    int key_rope_base,
-    int kv_rank,
-    int rope_size) {
+__device__ float dot_query_key(const __nv_bfloat16* query_latent, const __nv_bfloat16* query_rope, const __nv_bfloat16* kv_latent,
+                               const __nv_bfloat16* key_rope, int query_base, int query_rope_base, int kv_base, int key_rope_base, int kv_rank, int rope_size) {
     float partial = 0.0F;
     for (int column = threadIdx.x; column < kv_rank; column += BLOCK_SIZE) {
-        partial += __bfloat162float(query_latent[query_base + column]) *
-                   __bfloat162float(kv_latent[kv_base + column]);
+        partial += __bfloat162float(query_latent[query_base + column]) * __bfloat162float(kv_latent[kv_base + column]);
     }
     for (int column = threadIdx.x; column < rope_size; column += BLOCK_SIZE) {
-        partial += __bfloat162float(query_rope[query_rope_base + column]) *
-                   __bfloat162float(key_rope[key_rope_base + column]);
+        partial += __bfloat162float(query_rope[query_rope_base + column]) * __bfloat162float(key_rope[key_rope_base + column]);
     }
     return block_reduce_sum(partial);
 }
@@ -128,49 +100,37 @@ __device__ __forceinline__ unsigned int shared_address(const void* pointer) {
 }
 
 __device__ __forceinline__ void load_x4(unsigned int (&fragment)[4], unsigned int address) {
-    asm volatile(
-        "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
-        : "=r"(fragment[0]), "=r"(fragment[1]), "=r"(fragment[2]), "=r"(fragment[3])
-        : "r"(address));
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
+                 : "=r"(fragment[0]), "=r"(fragment[1]), "=r"(fragment[2]), "=r"(fragment[3])
+                 : "r"(address));
 }
 
 __device__ __forceinline__ void load_x2(unsigned int (&fragment)[2], unsigned int address) {
-    asm volatile(
-        "ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];"
-        : "=r"(fragment[0]), "=r"(fragment[1]) : "r"(address));
+    asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];" : "=r"(fragment[0]), "=r"(fragment[1]) : "r"(address));
 }
 
-__device__ __forceinline__ void load_x2_transpose(
-    unsigned int (&fragment)[2], unsigned int address) {
-    asm volatile(
-        "ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0,%1}, [%2];"
-        : "=r"(fragment[0]), "=r"(fragment[1]) : "r"(address));
+__device__ __forceinline__ void load_x2_transpose(unsigned int (&fragment)[2], unsigned int address) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0,%1}, [%2];" : "=r"(fragment[0]), "=r"(fragment[1]) : "r"(address));
 }
 
-__device__ __forceinline__ void mma(
-    float (&accumulator)[4], const unsigned int (&left)[4], const unsigned int (&right)[2]) {
+__device__ __forceinline__ void mma(float (&accumulator)[4], const unsigned int (&left)[4], const unsigned int (&right)[2]) {
     asm volatile(
         "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
         "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
-        : "+f"(accumulator[0]), "+f"(accumulator[1]),
-          "+f"(accumulator[2]), "+f"(accumulator[3])
-        : "r"(left[0]), "r"(left[1]), "r"(left[2]), "r"(left[3]),
-          "r"(right[0]), "r"(right[1]));
+        : "+f"(accumulator[0]), "+f"(accumulator[1]), "+f"(accumulator[2]), "+f"(accumulator[3])
+        : "r"(left[0]), "r"(left[1]), "r"(left[2]), "r"(left[3]), "r"(right[0]), "r"(right[1]));
 }
 
 // The same tile loader handles strided queries and head-shared KV. Each thread
 // copies eight BF16 elements, with zero padding for incomplete sequence tiles.
-__device__ __forceinline__ void copy_tile(
-    __nv_bfloat16* shared, const __nv_bfloat16* latent, const __nv_bfloat16* rope,
-    int first, int sequence_length, int latent_stride, int rope_stride) {
+__device__ __forceinline__ void copy_tile(__nv_bfloat16* shared, const __nv_bfloat16* latent, const __nv_bfloat16* rope, int first, int sequence_length,
+                                          int latent_stride, int rope_stride) {
     for (int vector = threadIdx.x; vector < BM * K / 8; vector += THREADS) {
         const int row = vector / (K / 8);
         const int column = vector % (K / 8) * 8;
         uint4 values = make_uint4(0, 0, 0, 0);
         if (first + row < sequence_length) {
-            const __nv_bfloat16* source = column < C
-                ? latent + (first + row) * latent_stride + column
-                : rope + (first + row) * rope_stride + column - C;
+            const __nv_bfloat16* source = column < C ? latent + (first + row) * latent_stride + column : rope + (first + row) * rope_stride + column - C;
             values = *reinterpret_cast<const uint4*>(source);
         }
         *reinterpret_cast<uint4*>(shared + swizzle(row * K + column)) = values;
@@ -179,8 +139,7 @@ __device__ __forceinline__ void copy_tile(
 
 // P stays FP32 for softmax statistics. Two BF16 parts approximate each weight
 // for PV before the final BF16 output store.
-__device__ __forceinline__ void split_probability(
-    float x, float y, unsigned int& high, unsigned int& low) {
+__device__ __forceinline__ void split_probability(float x, float y, unsigned int& high, unsigned int& low) {
     union Packed {
         __nv_bfloat162 value;
         unsigned int bits;
@@ -194,15 +153,10 @@ __device__ __forceinline__ void split_probability(
 
 // One CTA owns 16 query rows. Its four warps split the 576-wide QK reduction,
 // then each warp owns 128 output columns; KV is shared across all query heads.
-__global__ __launch_bounds__(THREADS, 2)
-void mla_forward_kernel(
-    __nv_bfloat16* __restrict__ output,
-    float* __restrict__ logsumexp,
-    const __nv_bfloat16* __restrict__ query_latent,
-    const __nv_bfloat16* __restrict__ query_rope,
-    const __nv_bfloat16* __restrict__ kv_latent,
-    const __nv_bfloat16* __restrict__ key_rope,
-    int sequence_length, int heads, float scale) {
+__global__ __launch_bounds__(THREADS, 2) void mla_forward_kernel(__nv_bfloat16* __restrict__ output, float* __restrict__ logsumexp,
+                                                                 const __nv_bfloat16* __restrict__ query_latent, const __nv_bfloat16* __restrict__ query_rope,
+                                                                 const __nv_bfloat16* __restrict__ kv_latent, const __nv_bfloat16* __restrict__ key_rope,
+                                                                 int sequence_length, int heads, float scale) {
     __shared__ __align__(16) __nv_bfloat16 shared_query[BM * K];
     __shared__ __align__(16) __nv_bfloat16 shared_kv[BN * K];
     __shared__ float partial[WARPS][SCORE_TILES][WARP_SIZE][4];
@@ -215,10 +169,8 @@ void mla_forward_kernel(
     const int top_query = first_query + lane / 4;
     const int bottom_query = top_query + 8;
 
-    copy_tile(shared_query,
-              query_latent + (batch * sequence_length * heads + head) * C,
-              query_rope + (batch * sequence_length * heads + head) * R,
-              first_query, sequence_length, heads * C, heads * R);
+    copy_tile(shared_query, query_latent + (batch * sequence_length * heads + head) * C, query_rope + (batch * sequence_length * heads + head) * R, first_query,
+              sequence_length, heads * C, heads * R);
     __syncthreads();
     unsigned int query[QUERY_TILES][4];
 #pragma unroll
@@ -231,9 +183,7 @@ void mla_forward_kernel(
     float row_max[2] = {-FLT_MAX, -FLT_MAX};
     float row_sum[2] = {};
     for (int first_key = 0; first_key <= first_query; first_key += BN) {
-        copy_tile(shared_kv, kv_latent + batch * sequence_length * C,
-                  key_rope + batch * sequence_length * R,
-                  first_key, sequence_length, C, R);
+        copy_tile(shared_kv, kv_latent + batch * sequence_length * C, key_rope + batch * sequence_length * R, first_key, sequence_length, C, R);
         __syncthreads();
 
         float scores[SCORE_TILES][4] = {};
@@ -269,8 +219,7 @@ void mla_forward_kernel(
                 }
                 const int q = i < 2 ? top_query : bottom_query;
                 const int k = first_key + tile * 8 + lane % 4 * 2 + i % 2;
-                scores[tile][i] = q < sequence_length && k < sequence_length && k <= q
-                    ? value * scale : -CUDART_INF_F;
+                scores[tile][i] = q < sequence_length && k < sequence_length && k <= q ? value * scale : -CUDART_INF_F;
                 next_max[i / 2] = fmaxf(next_max[i / 2], scores[tile][i]);
             }
         }
@@ -297,8 +246,7 @@ void mla_forward_kernel(
                 const float p0 = expf(scores[tile][2 * row] - next_max[row]);
                 const float p1 = expf(scores[tile][2 * row + 1] - next_max[row]);
                 local_sum[row] += p0 + p1;
-                split_probability(p0, p1, probability_high[2 * tile + row],
-                                  probability_low[2 * tile + row]);
+                split_probability(p0, p1, probability_high[2 * tile + row], probability_low[2 * tile + row]);
             }
         }
 #pragma unroll
@@ -324,65 +272,42 @@ void mla_forward_kernel(
     for (int tile = 0; tile < OUTPUT_TILES; ++tile) {
         const int column = (warp * OUTPUT_TILES + tile) * 8 + lane % 4 * 2;
         if (top_query < sequence_length) {
-            *reinterpret_cast<__nv_bfloat162*>(output + query_offset(
-                batch, top_query, head, sequence_length, heads, C) + column) =
-                __floats2bfloat162_rn(
-                    numerator[tile][0] / row_sum[0],
-                    numerator[tile][1] / row_sum[0]);
+            *reinterpret_cast<__nv_bfloat162*>(output + query_offset(batch, top_query, head, sequence_length, heads, C) + column) =
+                __floats2bfloat162_rn(numerator[tile][0] / row_sum[0], numerator[tile][1] / row_sum[0]);
         }
         if (bottom_query < sequence_length) {
-            *reinterpret_cast<__nv_bfloat162*>(output + query_offset(
-                batch, bottom_query, head, sequence_length, heads, C) + column) =
-                __floats2bfloat162_rn(
-                    numerator[tile][2] / row_sum[1],
-                    numerator[tile][3] / row_sum[1]);
+            *reinterpret_cast<__nv_bfloat162*>(output + query_offset(batch, bottom_query, head, sequence_length, heads, C) + column) =
+                __floats2bfloat162_rn(numerator[tile][2] / row_sum[1], numerator[tile][3] / row_sum[1]);
         }
     }
     if (warp == 0 && lane % 4 == 0) {
         if (top_query < sequence_length) {
-            logsumexp[lse_offset(batch, head, top_query, heads, sequence_length)] =
-                row_max[0] + logf(row_sum[0]);
+            logsumexp[lse_offset(batch, head, top_query, heads, sequence_length)] = row_max[0] + logf(row_sum[0]);
         }
         if (bottom_query < sequence_length) {
-            logsumexp[lse_offset(batch, head, bottom_query, heads, sequence_length)] =
-                row_max[1] + logf(row_sum[1]);
+            logsumexp[lse_offset(batch, head, bottom_query, heads, sequence_length)] = row_max[1] + logf(row_sum[1]);
         }
     }
 }
 
 }  // namespace mla_forward
 
-__global__ void mla_query_backward_kernel(
-    __nv_bfloat16* query_latent_gradient,
-    __nv_bfloat16* query_rope_gradient,
-    const __nv_bfloat16* output_gradient,
-    const __nv_bfloat16* output,
-    const float* logsumexp,
-    const __nv_bfloat16* query_latent,
-    const __nv_bfloat16* query_rope,
-    const __nv_bfloat16* kv_latent,
-    const __nv_bfloat16* key_rope,
-    int sequence_length,
-    int heads,
-    int kv_rank,
-    int rope_size,
-    float scale) {
+__global__ void mla_query_backward_kernel(__nv_bfloat16* query_latent_gradient, __nv_bfloat16* query_rope_gradient, const __nv_bfloat16* output_gradient,
+                                          const __nv_bfloat16* output, const float* logsumexp, const __nv_bfloat16* query_latent,
+                                          const __nv_bfloat16* query_rope, const __nv_bfloat16* kv_latent, const __nv_bfloat16* key_rope, int sequence_length,
+                                          int heads, int kv_rank, int rope_size, float scale) {
     __shared__ float delta;
     __shared__ float score_gradient;
 
     const int query_token = blockIdx.x;
     const int head = blockIdx.y;
     const int batch = blockIdx.z;
-    const int query_base = query_offset(
-        batch, query_token, head, sequence_length, heads, kv_rank);
-    const int query_rope_base = query_offset(
-        batch, query_token, head, sequence_length, heads, rope_size);
+    const int query_base = query_offset(batch, query_token, head, sequence_length, heads, kv_rank);
+    const int query_rope_base = query_offset(batch, query_token, head, sequence_length, heads, rope_size);
 
     float local_delta = 0.0F;
     for (int column = threadIdx.x; column < kv_rank; column += BLOCK_SIZE) {
-        local_delta +=
-            __bfloat162float(output_gradient[query_base + column]) *
-            __bfloat162float(output[query_base + column]);
+        local_delta += __bfloat162float(output_gradient[query_base + column]) * __bfloat162float(output[query_base + column]);
     }
     local_delta = block_reduce_sum(local_delta);
     if (threadIdx.x == 0) {
@@ -392,185 +317,102 @@ __global__ void mla_query_backward_kernel(
 
     float latent_update[2] = {0.0F, 0.0F};
     float rope_update = 0.0F;
-    const float lse = logsumexp[lse_offset(
-        batch, head, query_token, heads, sequence_length)];
+    const float lse = logsumexp[lse_offset(batch, head, query_token, heads, sequence_length)];
 
     for (int key_token = 0; key_token <= query_token; ++key_token) {
-        const int kv_base = shared_offset(
-            batch, key_token, sequence_length, kv_rank);
-        const int key_rope_base = shared_offset(
-            batch, key_token, sequence_length, rope_size);
-        const float score = dot_query_key(
-            query_latent,
-            query_rope,
-            kv_latent,
-            key_rope,
-            query_base,
-            query_rope_base,
-            kv_base,
-            key_rope_base,
-            kv_rank,
-            rope_size) *
-            scale;
+        const int kv_base = shared_offset(batch, key_token, sequence_length, kv_rank);
+        const int key_rope_base = shared_offset(batch, key_token, sequence_length, rope_size);
+        const float score =
+            dot_query_key(query_latent, query_rope, kv_latent, key_rope, query_base, query_rope_base, kv_base, key_rope_base, kv_rank, rope_size) * scale;
 
         float probability_gradient = 0.0F;
         for (int column = threadIdx.x; column < kv_rank; column += BLOCK_SIZE) {
-            probability_gradient +=
-                __bfloat162float(output_gradient[query_base + column]) *
-                __bfloat162float(kv_latent[kv_base + column]);
+            probability_gradient += __bfloat162float(output_gradient[query_base + column]) * __bfloat162float(kv_latent[kv_base + column]);
         }
         probability_gradient = block_reduce_sum(probability_gradient);
         if (threadIdx.x == 0) {
             const float probability = expf(score - lse);
-            score_gradient =
-                probability * (probability_gradient - delta) * scale;
+            score_gradient = probability * (probability_gradient - delta) * scale;
         }
         __syncthreads();
 
-        for (int column = threadIdx.x, slot = 0;
-             column < kv_rank;
-             column += BLOCK_SIZE, ++slot) {
-            latent_update[slot] +=
-                score_gradient * __bfloat162float(kv_latent[kv_base + column]);
+        for (int column = threadIdx.x, slot = 0; column < kv_rank; column += BLOCK_SIZE, ++slot) {
+            latent_update[slot] += score_gradient * __bfloat162float(kv_latent[kv_base + column]);
         }
         if (threadIdx.x < rope_size) {
-            rope_update += score_gradient *
-                           __bfloat162float(key_rope[key_rope_base + threadIdx.x]);
+            rope_update += score_gradient * __bfloat162float(key_rope[key_rope_base + threadIdx.x]);
         }
         __syncthreads();
     }
 
-    for (int column = threadIdx.x, slot = 0;
-         column < kv_rank;
-         column += BLOCK_SIZE, ++slot) {
-        query_latent_gradient[query_base + column] =
-            __float2bfloat16(latent_update[slot]);
+    for (int column = threadIdx.x, slot = 0; column < kv_rank; column += BLOCK_SIZE, ++slot) {
+        query_latent_gradient[query_base + column] = __float2bfloat16(latent_update[slot]);
     }
     if (threadIdx.x < rope_size) {
-        query_rope_gradient[query_rope_base + threadIdx.x] =
-            __float2bfloat16(rope_update);
+        query_rope_gradient[query_rope_base + threadIdx.x] = __float2bfloat16(rope_update);
     }
 }
 
-__global__ void mla_kv_backward_kernel(
-    __nv_bfloat16* kv_latent_gradient,
-    __nv_bfloat16* key_rope_gradient,
-    const __nv_bfloat16* output_gradient,
-    const __nv_bfloat16* output,
-    const float* logsumexp,
-    const __nv_bfloat16* query_latent,
-    const __nv_bfloat16* query_rope,
-    const __nv_bfloat16* kv_latent,
-    const __nv_bfloat16* key_rope,
-    int sequence_length,
-    int heads,
-    int kv_rank,
-    int rope_size,
-    float scale) {
+__global__ void mla_kv_backward_kernel(__nv_bfloat16* kv_latent_gradient, __nv_bfloat16* key_rope_gradient, const __nv_bfloat16* output_gradient,
+                                       const __nv_bfloat16* output, const float* logsumexp, const __nv_bfloat16* query_latent, const __nv_bfloat16* query_rope,
+                                       const __nv_bfloat16* kv_latent, const __nv_bfloat16* key_rope, int sequence_length, int heads, int kv_rank,
+                                       int rope_size, float scale) {
     __shared__ float delta;
     __shared__ float score_gradient;
     __shared__ float probability;
 
     const int key_token = blockIdx.x;
     const int batch = blockIdx.y;
-    const int kv_base = shared_offset(
-        batch, key_token, sequence_length, kv_rank);
-    const int key_rope_base = shared_offset(
-        batch, key_token, sequence_length, rope_size);
+    const int kv_base = shared_offset(batch, key_token, sequence_length, kv_rank);
+    const int key_rope_base = shared_offset(batch, key_token, sequence_length, rope_size);
     float latent_update[2] = {0.0F, 0.0F};
     float rope_update = 0.0F;
 
     for (int head = 0; head < heads; ++head) {
-        for (int query_token = key_token;
-             query_token < sequence_length;
-             ++query_token) {
-            const int query_base = query_offset(
-                batch, query_token, head, sequence_length, heads, kv_rank);
-            const int query_rope_base = query_offset(
-                batch, query_token, head, sequence_length, heads, rope_size);
-            const float score = dot_query_key(
-                query_latent,
-                query_rope,
-                kv_latent,
-                key_rope,
-                query_base,
-                query_rope_base,
-                kv_base,
-                key_rope_base,
-                kv_rank,
-                rope_size) *
-                scale;
+        for (int query_token = key_token; query_token < sequence_length; ++query_token) {
+            const int query_base = query_offset(batch, query_token, head, sequence_length, heads, kv_rank);
+            const int query_rope_base = query_offset(batch, query_token, head, sequence_length, heads, rope_size);
+            const float score =
+                dot_query_key(query_latent, query_rope, kv_latent, key_rope, query_base, query_rope_base, kv_base, key_rope_base, kv_rank, rope_size) * scale;
 
             float local_probability_gradient = 0.0F;
             float local_delta = 0.0F;
-            for (int column = threadIdx.x;
-                 column < kv_rank;
-                 column += BLOCK_SIZE) {
-                const float gradient =
-                    __bfloat162float(output_gradient[query_base + column]);
-                local_probability_gradient +=
-                    gradient * __bfloat162float(kv_latent[kv_base + column]);
-                local_delta +=
-                    gradient * __bfloat162float(output[query_base + column]);
+            for (int column = threadIdx.x; column < kv_rank; column += BLOCK_SIZE) {
+                const float gradient = __bfloat162float(output_gradient[query_base + column]);
+                local_probability_gradient += gradient * __bfloat162float(kv_latent[kv_base + column]);
+                local_delta += gradient * __bfloat162float(output[query_base + column]);
             }
             local_probability_gradient = block_reduce_sum(local_probability_gradient);
             local_delta = block_reduce_sum(local_delta);
             if (threadIdx.x == 0) {
                 delta = local_delta;
-                probability = expf(
-                    score - logsumexp[lse_offset(
-                                batch,
-                                head,
-                                query_token,
-                                heads,
-                                sequence_length)]);
-                score_gradient =
-                    probability * (local_probability_gradient - delta) * scale;
+                probability = expf(score - logsumexp[lse_offset(batch, head, query_token, heads, sequence_length)]);
+                score_gradient = probability * (local_probability_gradient - delta) * scale;
             }
             __syncthreads();
 
-            for (int column = threadIdx.x, slot = 0;
-                 column < kv_rank;
-                 column += BLOCK_SIZE, ++slot) {
+            for (int column = threadIdx.x, slot = 0; column < kv_rank; column += BLOCK_SIZE, ++slot) {
                 latent_update[slot] +=
-                    probability * __bfloat162float(
-                        output_gradient[query_base + column]) +
-                    score_gradient *
-                        __bfloat162float(query_latent[query_base + column]);
+                    probability * __bfloat162float(output_gradient[query_base + column]) + score_gradient * __bfloat162float(query_latent[query_base + column]);
             }
             if (threadIdx.x < rope_size) {
-                rope_update += score_gradient * __bfloat162float(
-                    query_rope[query_rope_base + threadIdx.x]);
+                rope_update += score_gradient * __bfloat162float(query_rope[query_rope_base + threadIdx.x]);
             }
             __syncthreads();
         }
     }
 
-    for (int column = threadIdx.x, slot = 0;
-         column < kv_rank;
-         column += BLOCK_SIZE, ++slot) {
-        kv_latent_gradient[kv_base + column] =
-            __float2bfloat16(latent_update[slot]);
+    for (int column = threadIdx.x, slot = 0; column < kv_rank; column += BLOCK_SIZE, ++slot) {
+        kv_latent_gradient[kv_base + column] = __float2bfloat16(latent_update[slot]);
     }
     if (threadIdx.x < rope_size) {
-        key_rope_gradient[key_rope_base + threadIdx.x] =
-            __float2bfloat16(rope_update);
+        key_rope_gradient[key_rope_base + threadIdx.x] = __float2bfloat16(rope_update);
     }
 }
 
-__global__ void mla_decode_split_kernel(
-    const __nv_bfloat16* query,
-    const __nv_bfloat16* paged_kv_cache,
-    const int* block_table,
-    const int* cache_lengths,
-    float* workspace,
-    int heads,
-    int kv_rank,
-    int rope_size,
-    int page_size,
-    int pages_per_sequence,
-    int splits,
-    float scale) {
+__global__ void mla_decode_split_kernel(const __nv_bfloat16* query, const __nv_bfloat16* paged_kv_cache, const int* block_table, const int* cache_lengths,
+                                        float* workspace, int heads, int kv_rank, int rope_size, int page_size, int pages_per_sequence, int splits,
+                                        float scale) {
     __shared__ float output_accumulator[MAX_KV_RANK];
     __shared__ float row_maximum;
     __shared__ float row_normalizer;
@@ -600,44 +442,27 @@ __global__ void mla_decode_split_kernel(
     for (int token = first_token; token < last_token; ++token) {
         const int logical_page = token / page_size;
         const int page_offset = token % page_size;
-        const int physical_page =
-            block_table[batch * pages_per_sequence + logical_page];
-        const int kv_base =
-            (physical_page * page_size + page_offset) * packed_width;
+        const int physical_page = block_table[batch * pages_per_sequence + logical_page];
+        const int kv_base = (physical_page * page_size + page_offset) * packed_width;
         const int key_rope_base = kv_base + kv_rank;
-        const float score = dot_query_key(
-            query,
-            query,
-            paged_kv_cache,
-            paged_kv_cache,
-            query_base,
-            query_rope_base,
-            kv_base,
-            key_rope_base,
-            kv_rank,
-            rope_size) *
-            scale;
+        const float score =
+            dot_query_key(query, query, paged_kv_cache, paged_kv_cache, query_base, query_rope_base, kv_base, key_rope_base, kv_rank, rope_size) * scale;
 
         if (threadIdx.x == 0) {
             const float next_maximum = fmaxf(row_maximum, score);
             previous_scale = expf(row_maximum - next_maximum);
             probability_scale = expf(score - next_maximum);
-            row_normalizer =
-                row_normalizer * previous_scale + probability_scale;
+            row_normalizer = row_normalizer * previous_scale + probability_scale;
             row_maximum = next_maximum;
         }
         __syncthreads();
         for (int column = threadIdx.x; column < kv_rank; column += BLOCK_SIZE) {
-            output_accumulator[column] =
-                output_accumulator[column] * previous_scale +
-                probability_scale *
-                    __bfloat162float(paged_kv_cache[kv_base + column]);
+            output_accumulator[column] = output_accumulator[column] * previous_scale + probability_scale * __bfloat162float(paged_kv_cache[kv_base + column]);
         }
         __syncthreads();
     }
 
-    const int state_base =
-        ((batch * heads + head) * splits + split) * (kv_rank + 2);
+    const int state_base = ((batch * heads + head) * splits + split) * (kv_rank + 2);
     if (threadIdx.x == 0) {
         workspace[state_base] = row_maximum;
         workspace[state_base + 1] = row_normalizer;
@@ -647,13 +472,7 @@ __global__ void mla_decode_split_kernel(
     }
 }
 
-__global__ void mla_decode_combine_kernel(
-    __nv_bfloat16* output,
-    float* logsumexp,
-    const float* workspace,
-    int heads,
-    int kv_rank,
-    int splits) {
+__global__ void mla_decode_combine_kernel(__nv_bfloat16* output, float* logsumexp, const float* workspace, int heads, int kv_rank, int splits) {
     __shared__ float row_maximum;
     __shared__ float row_normalizer;
     const int head = blockIdx.x;
@@ -669,8 +488,7 @@ __global__ void mla_decode_combine_kernel(
         float normalizer = 0.0F;
         for (int split = 0; split < splits; ++split) {
             const int state_base = (row * splits + split) * (kv_rank + 2);
-            normalizer += workspace[state_base + 1] *
-                          expf(workspace[state_base] - maximum);
+            normalizer += workspace[state_base + 1] * expf(workspace[state_base] - maximum);
         }
         row_maximum = maximum;
         row_normalizer = normalizer;
@@ -682,149 +500,57 @@ __global__ void mla_decode_combine_kernel(
         float numerator = 0.0F;
         for (int split = 0; split < splits; ++split) {
             const int state_base = (row * splits + split) * (kv_rank + 2);
-            numerator += workspace[state_base + 2 + column] *
-                         expf(workspace[state_base] - row_maximum);
+            numerator += workspace[state_base + 2 + column] * expf(workspace[state_base] - row_maximum);
         }
-        output[row * kv_rank + column] =
-            __float2bfloat16(numerator / row_normalizer);
+        output[row * kv_rank + column] = __float2bfloat16(numerator / row_normalizer);
     }
 }
 
 }  // namespace
 
-void mla_compressed_attention_forward_sm89_cuda(
-    __nv_bfloat16* output,
-    float* logsumexp,
-    const __nv_bfloat16* query_latent,
-    const __nv_bfloat16* query_rope,
-    const __nv_bfloat16* kv_latent,
-    const __nv_bfloat16* key_rope,
-    int batch_size,
-    int sequence_length,
-    int heads,
-    int kv_rank,
-    int rope_size,
-    float scale,
-    cudaStream_t stream) {
+void mla_compressed_attention_forward_sm89_cuda(__nv_bfloat16* output, float* logsumexp, const __nv_bfloat16* query_latent, const __nv_bfloat16* query_rope,
+                                                const __nv_bfloat16* kv_latent, const __nv_bfloat16* key_rope, int batch_size, int sequence_length, int heads,
+                                                int kv_rank, int rope_size, float scale, cudaStream_t stream) {
     check_shape(kv_rank, rope_size);
-    const dim3 grid((sequence_length + mla_forward::BM - 1) / mla_forward::BM,
-                    batch_size * heads);
-    mla_forward::mla_forward_kernel<<<grid, mla_forward::THREADS, 0, stream>>>(
-        output,
-        logsumexp,
-        query_latent,
-        query_rope,
-        kv_latent,
-        key_rope,
-        sequence_length,
-        heads,
-        scale);
+    const dim3 grid((sequence_length + mla_forward::BM - 1) / mla_forward::BM, batch_size * heads);
+    mla_forward::mla_forward_kernel<<<grid, mla_forward::THREADS, 0, stream>>>(output, logsumexp, query_latent, query_rope, kv_latent, key_rope,
+                                                                               sequence_length, heads, scale);
     CUDA_CHECK(cudaGetLastError());
 }
 
-void mla_compressed_attention_backward_sm89_cuda(
-    __nv_bfloat16* query_latent_gradient,
-    __nv_bfloat16* query_rope_gradient,
-    __nv_bfloat16* kv_latent_gradient,
-    __nv_bfloat16* key_rope_gradient,
-    const __nv_bfloat16* output_gradient,
-    const __nv_bfloat16* output,
-    const float* logsumexp,
-    const __nv_bfloat16* query_latent,
-    const __nv_bfloat16* query_rope,
-    const __nv_bfloat16* kv_latent,
-    const __nv_bfloat16* key_rope,
-    int batch_size,
-    int sequence_length,
-    int heads,
-    int kv_rank,
-    int rope_size,
-    float scale,
-    cudaStream_t stream) {
+void mla_compressed_attention_backward_sm89_cuda(__nv_bfloat16* query_latent_gradient, __nv_bfloat16* query_rope_gradient, __nv_bfloat16* kv_latent_gradient,
+                                                 __nv_bfloat16* key_rope_gradient, const __nv_bfloat16* output_gradient, const __nv_bfloat16* output,
+                                                 const float* logsumexp, const __nv_bfloat16* query_latent, const __nv_bfloat16* query_rope,
+                                                 const __nv_bfloat16* kv_latent, const __nv_bfloat16* key_rope, int batch_size, int sequence_length, int heads,
+                                                 int kv_rank, int rope_size, float scale, cudaStream_t stream) {
     check_shape(kv_rank, rope_size);
     const dim3 query_grid(sequence_length, heads, batch_size);
-    mla_query_backward_kernel<<<query_grid, BLOCK_SIZE, 0, stream>>>(
-        query_latent_gradient,
-        query_rope_gradient,
-        output_gradient,
-        output,
-        logsumexp,
-        query_latent,
-        query_rope,
-        kv_latent,
-        key_rope,
-        sequence_length,
-        heads,
-        kv_rank,
-        rope_size,
-        scale);
+    mla_query_backward_kernel<<<query_grid, BLOCK_SIZE, 0, stream>>>(query_latent_gradient, query_rope_gradient, output_gradient, output, logsumexp,
+                                                                     query_latent, query_rope, kv_latent, key_rope, sequence_length, heads, kv_rank, rope_size,
+                                                                     scale);
     CUDA_CHECK(cudaGetLastError());
 
     const dim3 kv_grid(sequence_length, batch_size);
-    mla_kv_backward_kernel<<<kv_grid, BLOCK_SIZE, 0, stream>>>(
-        kv_latent_gradient,
-        key_rope_gradient,
-        output_gradient,
-        output,
-        logsumexp,
-        query_latent,
-        query_rope,
-        kv_latent,
-        key_rope,
-        sequence_length,
-        heads,
-        kv_rank,
-        rope_size,
-        scale);
+    mla_kv_backward_kernel<<<kv_grid, BLOCK_SIZE, 0, stream>>>(kv_latent_gradient, key_rope_gradient, output_gradient, output, logsumexp, query_latent,
+                                                               query_rope, kv_latent, key_rope, sequence_length, heads, kv_rank, rope_size, scale);
     CUDA_CHECK(cudaGetLastError());
 }
 
-std::size_t mla_decode_workspace_elements_sm89(
-    int batch_size,
-    int heads,
-    int splits,
-    int kv_rank) {
-    return static_cast<std::size_t>(batch_size) * heads * splits *
-           (kv_rank + 2);
+std::size_t mla_decode_workspace_elements_sm89(int batch_size, int heads, int splits, int kv_rank) {
+    return static_cast<std::size_t>(batch_size) * heads * splits * (kv_rank + 2);
 }
 
-void mla_decode_forward_sm89_cuda(
-    __nv_bfloat16* output,
-    float* logsumexp,
-    const __nv_bfloat16* query,
-    const __nv_bfloat16* paged_kv_cache,
-    const int* block_table,
-    const int* cache_lengths,
-    float* workspace,
-    int batch_size,
-    int heads,
-    int kv_rank,
-    int rope_size,
-    int page_size,
-    int pages_per_sequence,
-    int splits,
-    float scale,
-    cudaStream_t stream) {
+void mla_decode_forward_sm89_cuda(__nv_bfloat16* output, float* logsumexp, const __nv_bfloat16* query, const __nv_bfloat16* paged_kv_cache,
+                                  const int* block_table, const int* cache_lengths, float* workspace, int batch_size, int heads, int kv_rank, int rope_size,
+                                  int page_size, int pages_per_sequence, int splits, float scale, cudaStream_t stream) {
     check_shape(kv_rank, rope_size);
     const dim3 split_grid(splits, heads, batch_size);
-    mla_decode_split_kernel<<<split_grid, BLOCK_SIZE, 0, stream>>>(
-        query,
-        paged_kv_cache,
-        block_table,
-        cache_lengths,
-        workspace,
-        heads,
-        kv_rank,
-        rope_size,
-        page_size,
-        pages_per_sequence,
-        splits,
-        scale);
+    mla_decode_split_kernel<<<split_grid, BLOCK_SIZE, 0, stream>>>(query, paged_kv_cache, block_table, cache_lengths, workspace, heads, kv_rank, rope_size,
+                                                                   page_size, pages_per_sequence, splits, scale);
     CUDA_CHECK(cudaGetLastError());
 
     const dim3 combine_grid(heads, batch_size);
-    mla_decode_combine_kernel<<<combine_grid, BLOCK_SIZE, 0, stream>>>(
-        output, logsumexp, workspace, heads, kv_rank, splits);
+    mla_decode_combine_kernel<<<combine_grid, BLOCK_SIZE, 0, stream>>>(output, logsumexp, workspace, heads, kv_rank, splits);
     CUDA_CHECK(cudaGetLastError());
 }
 

@@ -4,7 +4,7 @@
 #include "common.cuh"
 
 #include <cuda_bf16.h>
-#include <mma.h>
+#include <stdexcept>
 
 namespace dscuda {
 namespace {
@@ -19,24 +19,6 @@ constexpr int WN = 32;
 constexpr int TM = 8;
 constexpr int TN = 8;
 constexpr int VECTOR_WIDTH = 4;
-
-namespace tc {
-
-constexpr int BM = 128;
-constexpr int BN = 128;
-constexpr int BK = 16;
-constexpr int WM = 64;
-constexpr int WN = 32;
-constexpr int MMA_M = 16;
-constexpr int MMA_N = 16;
-constexpr int MMA_K = 16;
-constexpr int WARP_TILES_M = WM / MMA_M;
-constexpr int WARP_TILES_N = WN / MMA_N;
-constexpr int WARPS_N = BN / WN;
-constexpr int NUM_THREADS = (BM / WM) * (BN / WN) * 32;
-constexpr int SKEW = 16;
-
-}  // namespace tc
 
 namespace tc_mma {
 
@@ -56,12 +38,7 @@ static_assert(BK % 2 == 0);
 
 // FP32 vectorized loading: read four adjacent floats with one aligned access.
 // Scalar loads handle partial or unaligned vectors without reading out of bounds.
-__device__ __forceinline__ float4 load_float4(
-    const float* input,
-    int index,
-    bool major_valid,
-    int start,
-    int length) {
+__device__ __forceinline__ float4 load_float4(const float* input, int index, bool major_valid, int start, int length) {
     int width = 0;
     if (major_valid && start < length) {
         const int remaining = length - start;
@@ -87,9 +64,6 @@ __device__ __forceinline__ float4 load_float4(
     return value;
 }
 /*
-as the problem size increase, this config dont change while just increase the no of block launch?
-what problem may occur if we dont check the divisibility
-
 kBM : Rows of C computed by a block    (128)
 kBN : Col of C computed by a block     (128)
 kWM : Row of C computed by a wrap     (64)
@@ -98,12 +72,10 @@ kTM : Row of C computed by a thread     (8)
 kTN : Col of C computed by a thread     (8)
 */
 template <int kBM, int kBN, int kWM, int kWN, int kTM, int kTN>
-__global__ void matmul_kernel(
-    float* __restrict__ C, const float* __restrict__ A,
-    const float* __restrict__ B, int M, int N, int K) {
+__global__ void matmul_kernel(float* __restrict__ C, const float* __restrict__ A, const float* __restrict__ B, int M, int N, int K) {
     // Compile-time specialization lets the compiler fold tile indexing and
     // unroll fixed-size loops; __restrict__ also rules out pointer aliasing.
-    
+
     // no of warp tiles are needed in 1 block column (128 / 32)
     constexpr int kWarpsPerRow = kBN / kWN;
     // no of threads in 1 block  (128/64) * (128/32) * 32 = 256 threads
@@ -112,7 +84,7 @@ __global__ void matmul_kernel(
     constexpr int kALoads = (kBM * BK / VECTOR_WIDTH) / kNumThreads;
     // same as A , thus each thread loads 1 float4 from A and 1 float4 from B
     constexpr int kBLoads = (BK * kBN / VECTOR_WIDTH) / kNumThreads;
-    // check the divisibility 
+    // check the divisibility
     static_assert(kBM % kWM == 0);
     static_assert(kBN % kWN == 0);
     static_assert(kWM == 8 * kTM);
@@ -133,7 +105,7 @@ __global__ void matmul_kernel(
     const int warp_id = threadIdx.x / 32;
     const int lane_id = threadIdx.x % 32;
     // Warp tiling: 8x4 lanes cover one warp tile. Lanes sharing a row or column reuse the same A or B fragments through shared-memory reads.
-    // e.g. warp id = 0 -> warp_row = 0 , warp_col = 0, warp id = 5 -> warp_row = 1 , warp_col = 1, 
+    // e.g. warp id = 0 -> warp_row = 0 , warp_col = 0, warp id = 5 -> warp_row = 1 , warp_col = 1,
     const int warp_row = warp_id / kWarpsPerRow;
     const int warp_column = warp_id % kWarpsPerRow;
     // lane position inside a warp, since lanes are treated as 8 x 4 grid so /4 or %4
@@ -171,22 +143,17 @@ __global__ void matmul_kernel(
             for (int load = 0; load < kALoads; ++load) {
                 // Coalesced cooperative loading: neighboring threads own
                 // neighboring float4 segments within each input tile row.
+
+                //which float4 inside the complete A tile belongs to this thread
                 const int vector_index = tid + load * kNumThreads;
+                // no of vectors per A row
                 const int vectors_per_row = BK / VECTOR_WIDTH;
                 const int tile_row = vector_index / vectors_per_row;
-                const int tile_inner =
-                    (vector_index % vectors_per_row) * VECTOR_WIDTH;
+                const int tile_inner = (vector_index % vectors_per_row) * VECTOR_WIDTH;
                 const int global_row = block_row + tile_row;
                 const int global_inner = tile_to_load + tile_inner;
                 const int index = global_row * K + global_inner;
-                loaded_A[load] = full_tile
-                    ? *reinterpret_cast<const float4*>(A + index)
-                    : load_float4(
-                          A,
-                          index,
-                          global_row < M,
-                          global_inner,
-                          K);
+                loaded_A[load] = full_tile ? *reinterpret_cast<const float4*>(A + index) : load_float4(A, index, global_row < M, global_inner, K);
             }
 
 #pragma unroll
@@ -194,19 +161,11 @@ __global__ void matmul_kernel(
                 const int vector_index = tid + load * kNumThreads;
                 const int vectors_per_inner = kBN / VECTOR_WIDTH;
                 const int tile_inner = vector_index / vectors_per_inner;
-                const int tile_column =
-                    (vector_index % vectors_per_inner) * VECTOR_WIDTH;
+                const int tile_column = (vector_index % vectors_per_inner) * VECTOR_WIDTH;
                 const int global_inner = tile_to_load + tile_inner;
                 const int global_column = block_column + tile_column;
                 const int index = global_inner * N + global_column;
-                loaded_B[load] = full_tile
-                    ? *reinterpret_cast<const float4*>(B + index)
-                    : load_float4(
-                          B,
-                          index,
-                          global_inner < K,
-                          global_column,
-                          N);
+                loaded_B[load] = full_tile ? *reinterpret_cast<const float4*>(B + index) : load_float4(B, index, global_inner < K, global_column, N);
             }
         }
 
@@ -222,34 +181,21 @@ __global__ void matmul_kernel(
 
 #pragma unroll
                 for (int vector = 0; vector < kTM / VECTOR_WIDTH; ++vector) {
-                    const float4 value = *reinterpret_cast<const float4*>(
-                        &shared_A[
-                            (read_stage * BK + inner + 1) * kBM +
-                            local_row + vector * VECTOR_WIDTH]);
-                    A_fragment[write_fragment][vector * VECTOR_WIDTH + 0] =
-                        value.x;
-                    A_fragment[write_fragment][vector * VECTOR_WIDTH + 1] =
-                        value.y;
-                    A_fragment[write_fragment][vector * VECTOR_WIDTH + 2] =
-                        value.z;
-                    A_fragment[write_fragment][vector * VECTOR_WIDTH + 3] =
-                        value.w;
+                    const float4 value = *reinterpret_cast<const float4*>(&shared_A[(read_stage * BK + inner + 1) * kBM + local_row + vector * VECTOR_WIDTH]);
+                    A_fragment[write_fragment][vector * VECTOR_WIDTH + 0] = value.x;
+                    A_fragment[write_fragment][vector * VECTOR_WIDTH + 1] = value.y;
+                    A_fragment[write_fragment][vector * VECTOR_WIDTH + 2] = value.z;
+                    A_fragment[write_fragment][vector * VECTOR_WIDTH + 3] = value.w;
                 }
 
 #pragma unroll
                 for (int vector = 0; vector < kTN / VECTOR_WIDTH; ++vector) {
-                    const float4 value = *reinterpret_cast<const float4*>(
-                        &shared_B[
-                            (read_stage * BK + inner + 1) * kBN +
-                            local_column + vector * VECTOR_WIDTH]);
-                    B_fragment[write_fragment][vector * VECTOR_WIDTH + 0] =
-                        value.x;
-                    B_fragment[write_fragment][vector * VECTOR_WIDTH + 1] =
-                        value.y;
-                    B_fragment[write_fragment][vector * VECTOR_WIDTH + 2] =
-                        value.z;
-                    B_fragment[write_fragment][vector * VECTOR_WIDTH + 3] =
-                        value.w;
+                    const float4 value =
+                        *reinterpret_cast<const float4*>(&shared_B[(read_stage * BK + inner + 1) * kBN + local_column + vector * VECTOR_WIDTH]);
+                    B_fragment[write_fragment][vector * VECTOR_WIDTH + 0] = value.x;
+                    B_fragment[write_fragment][vector * VECTOR_WIDTH + 1] = value.y;
+                    B_fragment[write_fragment][vector * VECTOR_WIDTH + 2] = value.z;
+                    B_fragment[write_fragment][vector * VECTOR_WIDTH + 3] = value.w;
                 }
 
 #pragma unroll
@@ -258,10 +204,7 @@ __global__ void matmul_kernel(
                     for (int column = 0; column < kTN; ++column) {
                         // Register outer product: reuse each A value across
                         // columns and each B value across rows using FP32 FMA.
-                        accumulator[row][column] = __fmaf_rn(
-                            A_fragment[read_fragment][row],
-                            B_fragment[read_fragment][column],
-                            accumulator[row][column]);
+                        accumulator[row][column] = __fmaf_rn(A_fragment[read_fragment][row], B_fragment[read_fragment][column], accumulator[row][column]);
                     }
                 }
             }
@@ -273,22 +216,13 @@ __global__ void matmul_kernel(
                 const int vector_index = tid + load * kNumThreads;
                 const int vectors_per_row = BK / VECTOR_WIDTH;
                 const int tile_row = vector_index / vectors_per_row;
-                const int tile_inner =
-                    (vector_index % vectors_per_row) * VECTOR_WIDTH;
+                const int tile_inner = (vector_index % vectors_per_row) * VECTOR_WIDTH;
                 // Scatter the contiguous global A vector into transposed
                 // shared storage; a single contiguous cp.async cannot do this.
-                shared_A[
-                    (write_stage * BK + tile_inner + 0) * kBM +
-                    tile_row] = loaded_A[load].x;
-                shared_A[
-                    (write_stage * BK + tile_inner + 1) * kBM +
-                    tile_row] = loaded_A[load].y;
-                shared_A[
-                    (write_stage * BK + tile_inner + 2) * kBM +
-                    tile_row] = loaded_A[load].z;
-                shared_A[
-                    (write_stage * BK + tile_inner + 3) * kBM +
-                    tile_row] = loaded_A[load].w;
+                shared_A[(write_stage * BK + tile_inner + 0) * kBM + tile_row] = loaded_A[load].x;
+                shared_A[(write_stage * BK + tile_inner + 1) * kBM + tile_row] = loaded_A[load].y;
+                shared_A[(write_stage * BK + tile_inner + 2) * kBM + tile_row] = loaded_A[load].z;
+                shared_A[(write_stage * BK + tile_inner + 3) * kBM + tile_row] = loaded_A[load].w;
             }
 
 #pragma unroll
@@ -296,10 +230,8 @@ __global__ void matmul_kernel(
                 const int vector_index = tid + load * kNumThreads;
                 const int vectors_per_inner = kBN / VECTOR_WIDTH;
                 const int tile_inner = vector_index / vectors_per_inner;
-                const int tile_column =
-                    (vector_index % vectors_per_inner) * VECTOR_WIDTH;
-                const int index =
-                    (write_stage * BK + tile_inner) * kBN + tile_column;
+                const int tile_column = (vector_index % vectors_per_inner) * VECTOR_WIDTH;
+                const int index = (write_stage * BK + tile_inner) * kBN + tile_column;
                 shared_B[index + 0] = loaded_B[load].x;
                 shared_B[index + 1] = loaded_B[load].y;
                 shared_B[index + 2] = loaded_B[load].z;
@@ -312,10 +244,7 @@ __global__ void matmul_kernel(
 
 #pragma unroll
             for (int vector = 0; vector < kTM / VECTOR_WIDTH; ++vector) {
-                const float4 value = *reinterpret_cast<const float4*>(
-                    &shared_A[
-                        loaded_stage * BK * kBM + local_row +
-                        vector * VECTOR_WIDTH]);
+                const float4 value = *reinterpret_cast<const float4*>(&shared_A[loaded_stage * BK * kBM + local_row + vector * VECTOR_WIDTH]);
                 A_fragment[0][vector * VECTOR_WIDTH + 0] = value.x;
                 A_fragment[0][vector * VECTOR_WIDTH + 1] = value.y;
                 A_fragment[0][vector * VECTOR_WIDTH + 2] = value.z;
@@ -324,10 +253,7 @@ __global__ void matmul_kernel(
 
 #pragma unroll
             for (int vector = 0; vector < kTN / VECTOR_WIDTH; ++vector) {
-                const float4 value = *reinterpret_cast<const float4*>(
-                    &shared_B[
-                        loaded_stage * BK * kBN + local_column +
-                        vector * VECTOR_WIDTH]);
+                const float4 value = *reinterpret_cast<const float4*>(&shared_B[loaded_stage * BK * kBN + local_column + vector * VECTOR_WIDTH]);
                 B_fragment[0][vector * VECTOR_WIDTH + 0] = value.x;
                 B_fragment[0][vector * VECTOR_WIDTH + 1] = value.y;
                 B_fragment[0][vector * VECTOR_WIDTH + 2] = value.z;
@@ -340,10 +266,7 @@ __global__ void matmul_kernel(
             for (int row = 0; row < kTM; ++row) {
 #pragma unroll
                 for (int column = 0; column < kTN; ++column) {
-                    accumulator[row][column] = __fmaf_rn(
-                        A_fragment[1][row],
-                        B_fragment[1][column],
-                        accumulator[row][column]);
+                    accumulator[row][column] = __fmaf_rn(A_fragment[1][row], B_fragment[1][column], accumulator[row][column]);
                 }
             }
         }
@@ -359,19 +282,15 @@ __global__ void matmul_kernel(
 #pragma unroll
         for (int vector = 0; vector < kTN / VECTOR_WIDTH; ++vector) {
             const int thread_column = vector * VECTOR_WIDTH;
-            const int global_column =
-                block_column + local_column + thread_column;
+            const int global_column = block_column + local_column + thread_column;
             int width = 0;
             if (global_row < M && global_column < N) {
                 const int remaining = N - global_column;
                 width = remaining < VECTOR_WIDTH ? remaining : VECTOR_WIDTH;
             }
             const int index = global_row * N + global_column;
-            float4 value = make_float4(
-                accumulator[row][thread_column + 0],
-                accumulator[row][thread_column + 1],
-                accumulator[row][thread_column + 2],
-                accumulator[row][thread_column + 3]);
+            float4 value = make_float4(accumulator[row][thread_column + 0], accumulator[row][thread_column + 1], accumulator[row][thread_column + 2],
+                                       accumulator[row][thread_column + 3]);
 
             // Vectorized epilogue: write four FP32 outputs per aligned store.
             if (width == VECTOR_WIDTH && index % VECTOR_WIDTH == 0) {
@@ -394,172 +313,24 @@ __global__ void matmul_kernel(
     }
 }
 
-// BF16 edge fallback: zero-pad partial tiles and use WMMA Tensor Cores with
-// FP32 accumulation. This path uses single-buffered shared storage.
-__global__ void matmul_tensor_core_edge_kernel(
-    __nv_bfloat16* C, const __nv_bfloat16* A, const __nv_bfloat16* B,
-    int M, int N, int K) {
-    // Shared-memory padding changes bank mapping while preserving WMMA
-    // stride alignment; per-warp FP32 scratch supports BF16 output conversion.
-    __shared__ __nv_bfloat16 shared_A[tc::BK][tc::BM + tc::SKEW];
-    __shared__ __nv_bfloat16 shared_B[tc::BK][tc::BN + tc::SKEW];
-    __shared__ float shared_output[tc::NUM_THREADS / 32]
-                                  [tc::MMA_M * tc::MMA_N];
-
-    const int tid = threadIdx.x;
-    const int lane_id = tid % 32;
-    const int warp_id = tid / 32;
-    const int warp_row = warp_id / tc::WARPS_N;
-    const int warp_column = warp_id % tc::WARPS_N;
-    const int block_row = blockIdx.y * tc::BM;
-    const int block_column = blockIdx.x * tc::BN;
-
-    nvcuda::wmma::fragment<
-        nvcuda::wmma::matrix_a,
-        tc::MMA_M,
-        tc::MMA_N,
-        tc::MMA_K,
-        __nv_bfloat16,
-        nvcuda::wmma::col_major>
-        A_fragments[tc::WARP_TILES_M];
-    nvcuda::wmma::fragment<
-        nvcuda::wmma::matrix_b,
-        tc::MMA_M,
-        tc::MMA_N,
-        tc::MMA_K,
-        __nv_bfloat16,
-        nvcuda::wmma::row_major>
-        B_fragments[tc::WARP_TILES_N];
-    nvcuda::wmma::fragment<
-        nvcuda::wmma::accumulator,
-        tc::MMA_M,
-        tc::MMA_N,
-        tc::MMA_K,
-        float>
-        accumulators[tc::WARP_TILES_M][tc::WARP_TILES_N];
-
-#pragma unroll
-    for (int tile_row = 0; tile_row < tc::WARP_TILES_M; ++tile_row) {
-#pragma unroll
-        for (int tile_column = 0; tile_column < tc::WARP_TILES_N; ++tile_column) {
-            nvcuda::wmma::fill_fragment(
-                accumulators[tile_row][tile_column], 0.0F);
-        }
-    }
-
-    for (int tile_inner = 0; tile_inner < K; tile_inner += tc::BK) {
-        for (int index = tid; index < tc::BM * tc::BK; index += tc::NUM_THREADS) {
-            const int local_row = index / tc::BK;
-            const int local_inner = index % tc::BK;
-            const int global_row = block_row + local_row;
-            const int global_inner = tile_inner + local_inner;
-            __nv_bfloat16 value = __float2bfloat16(0.0F);
-            if (global_row < M && global_inner < K) {
-                value = A[global_row * K + global_inner];
-            }
-            shared_A[local_inner][local_row] = value;
-        }
-
-        for (int index = tid; index < tc::BK * tc::BN; index += tc::NUM_THREADS) {
-            const int local_inner = index / tc::BN;
-            const int local_column = index % tc::BN;
-            const int global_inner = tile_inner + local_inner;
-            const int global_column = block_column + local_column;
-            __nv_bfloat16 value = __float2bfloat16(0.0F);
-            if (global_inner < K && global_column < N) {
-                value = B[global_inner * N + global_column];
-            }
-            shared_B[local_inner][local_column] = value;
-        }
-        __syncthreads();
-
-#pragma unroll
-        for (int tile_row = 0; tile_row < tc::WARP_TILES_M; ++tile_row) {
-            const int shared_row =
-                warp_row * tc::WM + tile_row * tc::MMA_M;
-            nvcuda::wmma::load_matrix_sync(
-                A_fragments[tile_row],
-                &shared_A[0][shared_row],
-                tc::BM + tc::SKEW);
-        }
-#pragma unroll
-        for (int tile_column = 0; tile_column < tc::WARP_TILES_N; ++tile_column) {
-            const int shared_column =
-                warp_column * tc::WN + tile_column * tc::MMA_N;
-            nvcuda::wmma::load_matrix_sync(
-                B_fragments[tile_column],
-                &shared_B[0][shared_column],
-                tc::BN + tc::SKEW);
-        }
-
-#pragma unroll
-        for (int tile_row = 0; tile_row < tc::WARP_TILES_M; ++tile_row) {
-#pragma unroll
-            for (int tile_column = 0; tile_column < tc::WARP_TILES_N;
-                 ++tile_column) {
-                nvcuda::wmma::mma_sync(
-                    accumulators[tile_row][tile_column],
-                    A_fragments[tile_row],
-                    B_fragments[tile_column],
-                    accumulators[tile_row][tile_column]);
-            }
-        }
-        __syncthreads();
-    }
-
-#pragma unroll
-    for (int tile_row = 0; tile_row < tc::WARP_TILES_M; ++tile_row) {
-#pragma unroll
-        for (int tile_column = 0; tile_column < tc::WARP_TILES_N; ++tile_column) {
-            const int output_row =
-                block_row + warp_row * tc::WM + tile_row * tc::MMA_M;
-            const int output_column =
-                block_column + warp_column * tc::WN + tile_column * tc::MMA_N;
-            float* warp_output = shared_output[warp_id];
-            nvcuda::wmma::store_matrix_sync(
-                warp_output,
-                accumulators[tile_row][tile_column],
-                tc::MMA_N,
-                nvcuda::wmma::mem_row_major);
-            __syncwarp();
-            for (int element = lane_id;
-                 element < tc::MMA_M * tc::MMA_N;
-                 element += 32) {
-                const int row = element / tc::MMA_N;
-                const int column = element % tc::MMA_N;
-                if (output_row + row < M &&
-                    output_column + column < N) {
-                    C[(output_row + row) * N +
-                           output_column + column] =
-                        __float2bfloat16(warp_output[element]);
-                }
-            }
-            __syncwarp();
-        }
-    }
-}
-
 // BF16 asynchronous copy: move 16 bytes (eight BF16 values) directly from
 // global to shared memory, avoiding intermediate data registers.
 // L2::128B is a prefetch hint, not the number of bytes copied per thread.
-__device__ __forceinline__ void cp_async_bf16x8(
-    __nv_bfloat16* destination,
-    const __nv_bfloat16* source) {
-    const unsigned int shared_address =
-        static_cast<unsigned int>(__cvta_generic_to_shared(destination));
-    asm volatile(
-        "cp.async.cg.shared.global.L2::128B [%0], [%1], 16;\n" ::
-            "r"(shared_address),
-            "l"(source));
+__device__ __forceinline__ void cp_async_bf16x8(__nv_bfloat16* destination, const __nv_bfloat16* source) {
+    const unsigned int shared_address = static_cast<unsigned int>(__cvta_generic_to_shared(destination));
+    // asynchronous memory copy
+    /*
+    .cg : cache-global policy. Operation uses L2 cache and avoids allocate the copied data in L1
+    .shared.global : specifies that source and destination is shared -> global
+    .L2::128B : L2 prefetch size hint. GPU fetch a 128 byte region into L2 around the requested address
+    [%0]， [%1] : shared_address and source
+    */
+    asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], 16;\n" ::"r"(shared_address), "l"(source));
 }
-
-__device__ __forceinline__ void cp_async_commit() {
-    asm volatile("cp.async.commit_group;\n" ::);
-}
-
-__device__ __forceinline__ void cp_async_wait() {
-    asm volatile("cp.async.wait_group 0;\n" ::);
-}
+//places all uncommitted copies issued by that thread into one asynchronous group
+__device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;\n" ::); }
+//Wait until zero previously committed groups remain incomplete
+__device__ __forceinline__ void cp_async_wait() { asm volatile("cp.async.wait_group 0;\n" ::); }
 
 // XOR swizzle: permute shared addresses to reduce ldmatrix bank conflicts
 // while preserving 16-byte vector alignment. Loads and stores use this mapping.
@@ -569,30 +340,31 @@ __device__ __forceinline__ int swizzle_bf16_offset(int offset) {
     return offset ^ ((offset & kMask) >> 3);
 }
 
-__device__ __forceinline__ unsigned int shared_address(const void* pointer) {
-    return static_cast<unsigned int>(__cvta_generic_to_shared(pointer));
-}
+__device__ __forceinline__ unsigned int shared_address(const void* pointer) { return static_cast<unsigned int>(__cvta_generic_to_shared(pointer)); }
 
 // Warp-cooperative ldmatrix loads distribute BF16 operands into the register
 // layout required by mma.sync; these are not ordinary per-thread float arrays.
-__device__ __forceinline__ void load_matrix_x4(
-    unsigned int (&fragment)[4],
-    unsigned int address) {
+/*
+ldmatrix: load matrix data into registers
+sync    : all warp lanes participate together
+aligned : warp execution must be uniform
+m8n8    : each component matrix is 8×8
+x4      : load four 8×8 matrices
+shared  : source is shared memory
+b16     : each element contains 16 bits
+*/
+__device__ __forceinline__ void load_matrix_x4(unsigned int (&fragment)[4], unsigned int address) {
     asm volatile(
         "ldmatrix.sync.aligned.m8n8.x4.shared.b16 "
         "{%0, %1, %2, %3}, [%4];\n"
-        : "=r"(fragment[0]),
-          "=r"(fragment[1]),
-          "=r"(fragment[2]),
-          "=r"(fragment[3])
+        : "=r"(fragment[0]), "=r"(fragment[1]), "=r"(fragment[2]), "=r"(fragment[3])
         : "r"(address));
 }
 
 // The PTX transpose arranges a row-major B tile into the column operand
 // registers expected by mma.sync; the logical input remains B[K,N].
-__device__ __forceinline__ void load_matrix_b_x2(
-    unsigned int (&fragment)[2],
-    unsigned int address) {
+// why trans :
+__device__ __forceinline__ void load_matrix_b_x2(unsigned int (&fragment)[2], unsigned int address) {
     asm volatile(
         "ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 "
         "{%0, %1}, [%2];\n"
@@ -602,49 +374,46 @@ __device__ __forceinline__ void load_matrix_b_x2(
 
 // Native Tensor Core MMA: the whole warp computes a 16x8 C update over
 // K=16 using BF16 operands and FP32 accumulation (4096 FLOPs per warp).
-__device__ __forceinline__ void mma_bf16_m16n8k16(
-    float (&accumulator)[4],
-    const unsigned int (&A)[4],
-    const unsigned int (&B)[2]) {
+/*
+mma.sync.aligned : warp-cooperative synchronous matrix multiply-accumulate
+m16n8k16 : D[16,8] = A[16,16] × B[16,8] + C[16,8]
+row.col : A is row-major, B is column-major
+f32.bf16.bf16.f32 : destination D: FP32, operand A: BF16, operand B: BF16, accumulator C: FP32
+*/
+__device__ __forceinline__ void mma_bf16_m16n8k16(float (&accumulator)[4], const unsigned int (&A)[4], const unsigned int (&B)[2]) {
     asm volatile(
         "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
-        "{%0, %1, %2, %3}, "
-        "{%4, %5, %6, %7}, "
-        "{%8, %9}, "
-        "{%0, %1, %2, %3};\n"
-        : "+f"(accumulator[0]),
-          "+f"(accumulator[1]),
-          "+f"(accumulator[2]),
-          "+f"(accumulator[3])
-        : "r"(A[0]),
-          "r"(A[1]),
-          "r"(A[2]),
-          "r"(A[3]),
-          "r"(B[0]),
-          "r"(B[1]));
+        "{%0, %1, %2, %3}, "     // destination D
+        "{%4, %5, %6, %7}, "     // operand A
+        "{%8, %9}, "             // operand B
+        "{%0, %1, %2, %3};\n"    // accumulator C, accumulator register appear twice, accumulator += A * B
+        : "+f"(accumulator[0]),  // +f, register is both input and output, FP32 register
+          "+f"(accumulator[1]), "+f"(accumulator[2]), "+f"(accumulator[3])
+        : "r"(A[0]), "r"(A[1]), "r"(A[2]), "r"(A[3]), "r"(B[0]), "r"(B[1]));
 }
 
 // BF16 fast path combines block/warp tiling, asynchronous copies and swizzled
 // shared storage. Launch bounds guide register allocation for two-block
 // residency; actual occupancy also depends on shared memory and the GPU.
 template <int kBM, int kBN, int kWarpTilesM, int kWarpTilesN>
-__global__ __launch_bounds__(256, 2) void matmul_tensor_core_mma_kernel(
-    __nv_bfloat16* __restrict__ C, const __nv_bfloat16* __restrict__ A,
-    const __nv_bfloat16* __restrict__ B, int M, int N, int K) {
+__global__ __launch_bounds__(256, 2) void matmul_tensor_core_mma_kernel(__nv_bfloat16* __restrict__ C, const __nv_bfloat16* __restrict__ A,
+                                                                        const __nv_bfloat16* __restrict__ B, int M, int N, int K) {
     (void)M;
     constexpr int kWM = kWarpTilesM * tc_mma::MMA_M;
     constexpr int kWN = kWarpTilesN * tc_mma::MMA_N;
     constexpr int kWarpsN = kBN / kWN;
-    constexpr int kNumThreads =
-        (kBM / kWM) * kWarpsN * 32;
+    constexpr int kNumThreads = (kBM / kWM) * kWarpsN * 32;
     constexpr int kAStageElements = kBM * tc_mma::BK;
     constexpr int kBStageElements = tc_mma::BK * kBN;
+    static_assert(kBM % kWM == 0);
+    static_assert(kBN % kWN == 0);
+    static_assert(tc_mma::BK % tc_mma::MMA_K == 0);
+    static_assert(kAStageElements % tc_mma::VECTOR_ELEMENTS == 0);
+    static_assert(kBStageElements % tc_mma::VECTOR_ELEMENTS == 0);
 
     // Two aligned shared stages overlap copying tile k+1 with MMA on tile k.
-    __shared__ __align__(16)
-        __nv_bfloat16 shared_A[tc_mma::STAGES][kAStageElements];
-    __shared__ __align__(16)
-        __nv_bfloat16 shared_B[tc_mma::STAGES][kBStageElements];
+    __shared__ __align__(16) __nv_bfloat16 shared_A[tc_mma::STAGES][kAStageElements];
+    __shared__ __align__(16) __nv_bfloat16 shared_B[tc_mma::STAGES][kBStageElements];
 
     const int tid = threadIdx.x;
     const int lane = tid % 32;
@@ -660,8 +429,7 @@ __global__ __launch_bounds__(256, 2) void matmul_tensor_core_mma_kernel(
 #pragma unroll
     for (int tile_row = 0; tile_row < kWarpTilesM; ++tile_row) {
 #pragma unroll
-        for (int tile_column = 0; tile_column < kWarpTilesN;
-             ++tile_column) {
+        for (int tile_column = 0; tile_column < kWarpTilesN; ++tile_column) {
 #pragma unroll
             for (int element = 0; element < 4; ++element) {
                 accumulators[tile_row][tile_column][element] = 0.0F;
@@ -670,47 +438,25 @@ __global__ __launch_bounds__(256, 2) void matmul_tensor_core_mma_kernel(
     }
 
     auto copy_stage = [&](int stage, int tile_inner) {
-        constexpr int kAVectors =
-            kAStageElements / tc_mma::VECTOR_ELEMENTS;
-        constexpr int kBVectors =
-            kBStageElements / tc_mma::VECTOR_ELEMENTS;
+        constexpr int kAVectors = kAStageElements / tc_mma::VECTOR_ELEMENTS;
+        constexpr int kBVectors = kBStageElements / tc_mma::VECTOR_ELEMENTS;
 #pragma unroll
-        for (int vector = tid; vector < kAVectors;
-             vector += kNumThreads) {
-            const int local_row =
-                vector / (tc_mma::BK / tc_mma::VECTOR_ELEMENTS);
-            const int local_inner =
-                vector % (tc_mma::BK / tc_mma::VECTOR_ELEMENTS) *
-                tc_mma::VECTOR_ELEMENTS;
-            const int logical_offset =
-                local_row * tc_mma::BK + local_inner;
-            const int shared_offset =
-                swizzle_bf16_offset<2>(logical_offset);
-            const int global_offset =
-                (block_row + local_row) * K +
-                tile_inner + local_inner;
-            cp_async_bf16x8(
-                shared_A[stage] + shared_offset,
-                A + global_offset);
+        for (int vector = tid; vector < kAVectors; vector += kNumThreads) {
+            const int local_row = vector / (tc_mma::BK / tc_mma::VECTOR_ELEMENTS);
+            const int local_inner = vector % (tc_mma::BK / tc_mma::VECTOR_ELEMENTS) * tc_mma::VECTOR_ELEMENTS;
+            const int logical_offset = local_row * tc_mma::BK + local_inner;
+            const int shared_offset = swizzle_bf16_offset<2>(logical_offset);
+            const int global_offset = (block_row + local_row) * K + tile_inner + local_inner;
+            cp_async_bf16x8(shared_A[stage] + shared_offset, A + global_offset);
         }
 #pragma unroll
-        for (int vector = tid; vector < kBVectors;
-             vector += kNumThreads) {
-            const int local_inner =
-                vector / (kBN / tc_mma::VECTOR_ELEMENTS);
-            const int local_column =
-                vector % (kBN / tc_mma::VECTOR_ELEMENTS) *
-                tc_mma::VECTOR_ELEMENTS;
-            const int logical_offset =
-                local_inner * kBN + local_column;
-            const int shared_offset =
-                swizzle_bf16_offset<3>(logical_offset);
-            const int global_offset =
-                (tile_inner + local_inner) * N +
-                block_column + local_column;
-            cp_async_bf16x8(
-                shared_B[stage] + shared_offset,
-                B + global_offset);
+        for (int vector = tid; vector < kBVectors; vector += kNumThreads) {
+            const int local_inner = vector / (kBN / tc_mma::VECTOR_ELEMENTS);
+            const int local_column = vector % (kBN / tc_mma::VECTOR_ELEMENTS) * tc_mma::VECTOR_ELEMENTS;
+            const int logical_offset = local_inner * kBN + local_column;
+            const int shared_offset = swizzle_bf16_offset<3>(logical_offset);
+            const int global_offset = (tile_inner + local_inner) * N + block_column + local_column;
+            cp_async_bf16x8(shared_B[stage] + shared_offset, B + global_offset);
         }
         cp_async_commit();
     };
@@ -730,57 +476,34 @@ __global__ __launch_bounds__(256, 2) void matmul_tensor_core_mma_kernel(
         }
 
 #pragma unroll
-        for (int tile_inner = 0; tile_inner < tc_mma::BK;
-             tile_inner += tc_mma::MMA_K) {
+        for (int tile_inner = 0; tile_inner < tc_mma::BK; tile_inner += tc_mma::MMA_K) {
             // Load once per MMA K-step and reuse across the warp's C tile.
             // Unlike FP32, this path has no explicit register ping-pong buffers.
             unsigned int A_fragments[kWarpTilesM][4];
             unsigned int B_fragments[kWarpTilesN][2];
 #pragma unroll
-            for (int tile_row = 0; tile_row < kWarpTilesM;
-                 ++tile_row) {
-                const int tile_row_base =
-                    warp_row * kWM + tile_row * tc_mma::MMA_M;
+            for (int tile_row = 0; tile_row < kWarpTilesM; ++tile_row) {
+                const int tile_row_base = warp_row * kWM + tile_row * tc_mma::MMA_M;
                 const int fragment_row = tile_row_base + lane % 16;
                 const int fragment_inner = tile_inner + lane / 16 * 8;
-                const int logical_offset =
-                    fragment_row * tc_mma::BK + fragment_inner;
-                const int swizzled_offset =
-                    swizzle_bf16_offset<2>(logical_offset);
-                load_matrix_x4(
-                    A_fragments[tile_row],
-                    shared_address(
-                        shared_A[stage] + swizzled_offset));
+                const int logical_offset = fragment_row * tc_mma::BK + fragment_inner;
+                const int swizzled_offset = swizzle_bf16_offset<2>(logical_offset);
+                load_matrix_x4(A_fragments[tile_row], shared_address(shared_A[stage] + swizzled_offset));
             }
 #pragma unroll
-            for (int tile_column = 0;
-                 tile_column < kWarpTilesN;
-                 ++tile_column) {
-                const int tile_column_base =
-                    warp_column * kWN +
-                    tile_column * tc_mma::MMA_N;
+            for (int tile_column = 0; tile_column < kWarpTilesN; ++tile_column) {
+                const int tile_column_base = warp_column * kWN + tile_column * tc_mma::MMA_N;
                 const int fragment_inner = tile_inner + lane % 16;
                 const int fragment_column = tile_column_base;
-                const int logical_offset =
-                    fragment_inner * kBN + fragment_column;
-                const int swizzled_offset =
-                    swizzle_bf16_offset<3>(logical_offset);
-                load_matrix_b_x2(
-                    B_fragments[tile_column],
-                    shared_address(
-                        shared_B[stage] + swizzled_offset));
+                const int logical_offset = fragment_inner * kBN + fragment_column;
+                const int swizzled_offset = swizzle_bf16_offset<3>(logical_offset);
+                load_matrix_b_x2(B_fragments[tile_column], shared_address(shared_B[stage] + swizzled_offset));
             }
 #pragma unroll
-            for (int tile_row = 0; tile_row < kWarpTilesM;
-                 ++tile_row) {
+            for (int tile_row = 0; tile_row < kWarpTilesM; ++tile_row) {
 #pragma unroll
-                for (int tile_column = 0;
-                     tile_column < kWarpTilesN;
-                     ++tile_column) {
-                    mma_bf16_m16n8k16(
-                        accumulators[tile_row][tile_column],
-                        A_fragments[tile_row],
-                        B_fragments[tile_column]);
+                for (int tile_column = 0; tile_column < kWarpTilesN; ++tile_column) {
+                    mma_bf16_m16n8k16(accumulators[tile_row][tile_column], A_fragments[tile_row], B_fragments[tile_column]);
                 }
             }
         }
@@ -796,101 +519,52 @@ __global__ __launch_bounds__(256, 2) void matmul_tensor_core_mma_kernel(
 #pragma unroll
     for (int tile_row = 0; tile_row < kWarpTilesM; ++tile_row) {
 #pragma unroll
-        for (int tile_column = 0; tile_column < kWarpTilesN;
-             ++tile_column) {
-            const int output_row =
-                block_row + warp_row * kWM +
-                tile_row * tc_mma::MMA_M + lane / 4;
-            const int output_column =
-                block_column + warp_column * kWN +
-                tile_column * tc_mma::MMA_N + (lane % 4) * 2;
+        for (int tile_column = 0; tile_column < kWarpTilesN; ++tile_column) {
+            const int output_row = block_row + warp_row * kWM + tile_row * tc_mma::MMA_M + lane / 4;
+            const int output_column = block_column + warp_column * kWN + tile_column * tc_mma::MMA_N + (lane % 4) * 2;
             // Fused BF16 epilogue: round FP32 accumulators and store pairs,
             // avoiding a separate conversion kernel and FP32 C buffer.
-            const __nv_bfloat162 top = __floats2bfloat162_rn(
-                accumulators[tile_row][tile_column][0],
-                accumulators[tile_row][tile_column][1]);
-            const __nv_bfloat162 bottom = __floats2bfloat162_rn(
-                accumulators[tile_row][tile_column][2],
-                accumulators[tile_row][tile_column][3]);
-            *reinterpret_cast<__nv_bfloat162*>(
-                C + output_row * N + output_column) = top;
-            *reinterpret_cast<__nv_bfloat162*>(
-                C + (output_row + 8) * N + output_column) =
-                bottom;
+            const __nv_bfloat162 top = __floats2bfloat162_rn(accumulators[tile_row][tile_column][0], accumulators[tile_row][tile_column][1]);
+            const __nv_bfloat162 bottom = __floats2bfloat162_rn(accumulators[tile_row][tile_column][2], accumulators[tile_row][tile_column][3]);
+            *reinterpret_cast<__nv_bfloat162*>(C + output_row * N + output_column) = top;
+            *reinterpret_cast<__nv_bfloat162*>(C + (output_row + 8) * N + output_column) = bottom;
         }
     }
 }
 
 template <int kBM, int kBN, int kWarpTilesM, int kWarpTilesN>
-void launch_tensor_core_mma_config(
-    __nv_bfloat16* C, const __nv_bfloat16* A, const __nv_bfloat16* B,
-    int M, int N, int K, cudaStream_t stream) {
+void launch_tensor_core_mma_config(__nv_bfloat16* C, const __nv_bfloat16* A, const __nv_bfloat16* B, int M, int N, int K, cudaStream_t stream) {
     constexpr int kWM = kWarpTilesM * tc_mma::MMA_M;
     constexpr int kWN = kWarpTilesN * tc_mma::MMA_N;
-    constexpr int kNumThreads =
-        (kBM / kWM) * (kBN / kWN) * 32;
+    constexpr int kNumThreads = (kBM / kWM) * (kBN / kWN) * 32;
     const dim3 blocks(N / kBN, M / kBM);
-    matmul_tensor_core_mma_kernel<kBM, kBN, kWarpTilesM, kWarpTilesN>
-        <<<blocks, kNumThreads, 0, stream>>>(C, A, B, M, N, K);
+    matmul_tensor_core_mma_kernel<kBM, kBN, kWarpTilesM, kWarpTilesN><<<blocks, kNumThreads, 0, stream>>>(C, A, B, M, N, K);
 }
 
 template <int kBM, int kBN, int kWM, int kWN, int kTM, int kTN>
-void launch_matmul_config(
-    float* C, const float* A, const float* B,
-    int M, int N, int K, cudaStream_t stream) {
+void launch_matmul_config(float* C, const float* A, const float* B, int M, int N, int K, cudaStream_t stream) {
     constexpr int kNumThreads = (kBM / kWM) * (kBN / kWN) * 32;
     const dim3 blocks((N + kBN - 1) / kBN, (M + kBM - 1) / kBM);
-    matmul_kernel<kBM, kBN, kWM, kWN, kTM, kTN>
-        <<<blocks, kNumThreads, 0, stream>>>(C, A, B, M, N, K);
+    matmul_kernel<kBM, kBN, kWM, kWN, kTM, kTN><<<blocks, kNumThreads, 0, stream>>>(C, A, B, M, N, K);
     CUDA_CHECK(cudaGetLastError());
 }
 
-void launch_matmul(
-    float* C, const float* A, const float* B,
-    int M, int N, int K, cudaStream_t stream) {
+void launch_matmul(float* C, const float* A, const float* B, int M, int N, int K, cudaStream_t stream) {
     launch_matmul_config<BM, BN, WM, WN, TM, TN>(C, A, B, M, N, K, stream);
 }
 
-void launch_tensor_core_matmul(
-    __nv_bfloat16* C, const __nv_bfloat16* A, const __nv_bfloat16* B,
-    int M, int N, int K, cudaStream_t stream) {
-    // Shape specialization: aligned tiles use branch-free PTX loads; partial
-    // shapes use WMMA fallback. A smaller M tile exposes more thread blocks.
-    const bool vector_aligned =
-        K % tc_mma::BK == 0 &&
-        N % tc_mma::VECTOR_ELEMENTS == 0;
-    const bool use_small_tile =
-        M <= 1024 &&
-        M % 64 == 0 &&
-        N % 128 == 0 &&
-        vector_aligned;
-    const bool use_large_tile =
-        M % 128 == 0 &&
-        N % 128 == 0 &&
-        vector_aligned;
-    if (use_small_tile) {
-        launch_tensor_core_mma_config<64, 128, 4, 4>(C, A, B, M, N, K, stream);
-    } else if (use_large_tile) {
-        launch_tensor_core_mma_config<128, 128, 4, 4>(C, A, B, M, N, K, stream);
-    } else {
-        const dim3 blocks((N + tc::BN - 1) / tc::BN, (M + tc::BM - 1) / tc::BM);
-        matmul_tensor_core_edge_kernel<<<blocks, tc::NUM_THREADS, 0, stream>>>(
-            C, A, B, M, N, K);
-    }
+void launch_tensor_core_matmul(__nv_bfloat16* C, const __nv_bfloat16* A, const __nv_bfloat16* B, int M, int N, int K, cudaStream_t stream) {
+    launch_tensor_core_mma_config<128, 128, 4, 4>(C, A, B, M, N, K, stream);
     CUDA_CHECK(cudaGetLastError());
 }
 
 }  // namespace
 
-void gemm_fp32_sm89_cuda(
-    float* C, const float* A, const float* B,
-    int M, int N, int K, cudaStream_t stream) {
+void gemm_fp32_sm89_cuda(float* C, const float* A, const float* B, int M, int N, int K, cudaStream_t stream) {
     launch_matmul(C, A, B, M, N, K, stream);
 }
 
-void gemm_bf16_sm89_cuda(
-    __nv_bfloat16* C, const __nv_bfloat16* A, const __nv_bfloat16* B,
-    int M, int N, int K, cudaStream_t stream) {
+void gemm_bf16_sm89_cuda(__nv_bfloat16* C, const __nv_bfloat16* A, const __nv_bfloat16* B, int M, int N, int K, cudaStream_t stream) {
     launch_tensor_core_matmul(C, A, B, M, N, K, stream);
 }
 

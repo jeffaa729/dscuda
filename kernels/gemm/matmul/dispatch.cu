@@ -14,25 +14,11 @@ bool use_sm90() {
 
 }  // namespace
 
-void gemm_fp32_cuda(
-    float* output,
-    const float* left,
-    const float* right,
-    int M,
-    int N,
-    int K,
-    cudaStream_t stream) {
+void gemm_fp32_cuda(float* output, const float* left, const float* right, int M, int N, int K, cudaStream_t stream) {
     gemm_fp32_sm89_cuda(output, left, right, M, N, K, stream);
 }
 
-void gemm_bf16_cuda(
-    __nv_bfloat16* output,
-    const __nv_bfloat16* left,
-    const __nv_bfloat16* right,
-    int M,
-    int N,
-    int K,
-    cudaStream_t stream) {
+void gemm_bf16_cuda(__nv_bfloat16* output, const __nv_bfloat16* left, const __nv_bfloat16* right, int M, int N, int K, cudaStream_t stream) {
     if (use_sm90() && M % 64 == 0 && N % 64 == 0 && K % 64 == 0) {
         gemm_bf16_sm90_cuda(output, left, right, M, N, K, stream);
     } else {
