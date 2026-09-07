@@ -44,10 +44,17 @@ def main():
                     if args.test and not args.reference and "custom" in operation.functions and backend != "custom":
                         continue
                     try:
-                        operation.check(function())
+                        result = function()
+                        # Surface asynchronous kernel faults before PyTorch formats tensors.
+                        # This correctness pass is outside the timed CUDA Graph replay.
+                        stream.synchronize()
+                        operation.check(result)
                     except AssertionError as error:
                         raise AssertionError(f"{family}: {operation.size}, {operation.dtype}, "
                                              f"{operation.name}, {backend}\n{error}") from error
+                    except RuntimeError as error:
+                        raise RuntimeError(f"{family}: {operation.size}, {operation.dtype}, "
+                                           f"{operation.name}, {backend}\n{error}") from error
                 count += 1
                 if args.profile:
                     for backend, function in operation.functions.items():
