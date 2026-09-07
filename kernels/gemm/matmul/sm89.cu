@@ -437,15 +437,14 @@ __device__ __forceinline__ void mma_bf16_m16n8k16(float (&accumulator)[4], const
 // residency; actual occupancy also depends on shared memory and the GPU.
 template <int kBM, int kBN, int kWarpTilesM, int kWarpTilesN>
 __global__ __launch_bounds__(256, 2) void matmul_tensor_core_mma_kernel(
-    __nv_bfloat16* __restrict__ C, const __nv_bfloat16* __restrict__ A,
-    const __nv_bfloat16* __restrict__ B, int M, int N, int K
+    __nv_bfloat16* __restrict__ C, const __nv_bfloat16* __restrict__ A, const __nv_bfloat16* __restrict__ B, 
+    int M, int N, int K
 ) {
     (void)M;
     constexpr int kWM = kWarpTilesM * tc_mma::MMA_M;
     constexpr int kWN = kWarpTilesN * tc_mma::MMA_N;
     constexpr int kWarpsN = kBN / kWN;
-    constexpr int kNumThreads =
-        (kBM / kWM) * kWarpsN * 32;
+    constexpr int kNumThreads = (kBM / kWM) * kWarpsN * 32;
     constexpr int kAStageElements = kBM * tc_mma::BK;
     constexpr int kBStageElements = tc_mma::BK * kBN;
     static_assert(kBM % kWM == 0);
@@ -455,10 +454,8 @@ __global__ __launch_bounds__(256, 2) void matmul_tensor_core_mma_kernel(
     static_assert(kBStageElements % tc_mma::VECTOR_ELEMENTS == 0);
 
     // Two aligned shared stages overlap copying tile k+1 with MMA on tile k.
-    __shared__ __align__(16)
-        __nv_bfloat16 shared_A[tc_mma::STAGES][kAStageElements];
-    __shared__ __align__(16)
-        __nv_bfloat16 shared_B[tc_mma::STAGES][kBStageElements];
+    __shared__ __align__(16) __nv_bfloat16 shared_A[tc_mma::STAGES][kAStageElements];
+    __shared__ __align__(16) __nv_bfloat16 shared_B[tc_mma::STAGES][kBStageElements];
 
     const int tid = threadIdx.x;
     const int lane = tid % 32;
@@ -474,8 +471,7 @@ __global__ __launch_bounds__(256, 2) void matmul_tensor_core_mma_kernel(
 #pragma unroll
     for (int tile_row = 0; tile_row < kWarpTilesM; ++tile_row) {
 #pragma unroll
-        for (int tile_column = 0; tile_column < kWarpTilesN;
-             ++tile_column) {
+        for (int tile_column = 0; tile_column < kWarpTilesN; ++tile_column) {
 #pragma unroll
             for (int element = 0; element < 4; ++element) {
                 accumulators[tile_row][tile_column][element] = 0.0F;
@@ -484,47 +480,25 @@ __global__ __launch_bounds__(256, 2) void matmul_tensor_core_mma_kernel(
     }
 
     auto copy_stage = [&](int stage, int tile_inner) {
-        constexpr int kAVectors =
-            kAStageElements / tc_mma::VECTOR_ELEMENTS;
-        constexpr int kBVectors =
-            kBStageElements / tc_mma::VECTOR_ELEMENTS;
+        constexpr int kAVectors = kAStageElements / tc_mma::VECTOR_ELEMENTS;
+        constexpr int kBVectors = kBStageElements / tc_mma::VECTOR_ELEMENTS;
 #pragma unroll
-        for (int vector = tid; vector < kAVectors;
-             vector += kNumThreads) {
-            const int local_row =
-                vector / (tc_mma::BK / tc_mma::VECTOR_ELEMENTS);
-            const int local_inner =
-                vector % (tc_mma::BK / tc_mma::VECTOR_ELEMENTS) *
-                tc_mma::VECTOR_ELEMENTS;
-            const int logical_offset =
-                local_row * tc_mma::BK + local_inner;
-            const int shared_offset =
-                swizzle_bf16_offset<2>(logical_offset);
-            const int global_offset =
-                (block_row + local_row) * K +
-                tile_inner + local_inner;
-            cp_async_bf16x8(
-                shared_A[stage] + shared_offset,
-                A + global_offset);
+        for (int vector = tid; vector < kAVectors; vector += kNumThreads) {
+            const int local_row = vector / (tc_mma::BK / tc_mma::VECTOR_ELEMENTS);
+            const int local_inner = vector % (tc_mma::BK / tc_mma::VECTOR_ELEMENTS) * tc_mma::VECTOR_ELEMENTS;
+            const int logical_offset = local_row * tc_mma::BK + local_inner;
+            const int shared_offset = swizzle_bf16_offset<2>(logical_offset);
+            const int global_offset = (block_row + local_row) * K + tile_inner + local_inner;
+            cp_async_bf16x8(shared_A[stage] + shared_offset, A + global_offset);
         }
 #pragma unroll
-        for (int vector = tid; vector < kBVectors;
-             vector += kNumThreads) {
-            const int local_inner =
-                vector / (kBN / tc_mma::VECTOR_ELEMENTS);
-            const int local_column =
-                vector % (kBN / tc_mma::VECTOR_ELEMENTS) *
-                tc_mma::VECTOR_ELEMENTS;
-            const int logical_offset =
-                local_inner * kBN + local_column;
-            const int shared_offset =
-                swizzle_bf16_offset<3>(logical_offset);
-            const int global_offset =
-                (tile_inner + local_inner) * N +
-                block_column + local_column;
-            cp_async_bf16x8(
-                shared_B[stage] + shared_offset,
-                B + global_offset);
+        for (int vector = tid; vector < kBVectors; vector += kNumThreads) {
+            const int local_inner = vector / (kBN / tc_mma::VECTOR_ELEMENTS);
+            const int local_column = vector % (kBN / tc_mma::VECTOR_ELEMENTS) * tc_mma::VECTOR_ELEMENTS;
+            const int logical_offset = local_inner * kBN + local_column;
+            const int shared_offset = swizzle_bf16_offset<3>(logical_offset);
+            const int global_offset = (tile_inner + local_inner) * N + block_column + local_column;
+            cp_async_bf16x8(shared_B[stage] + shared_offset, B + global_offset);
         }
         cp_async_commit();
     };
@@ -553,48 +527,36 @@ __global__ __launch_bounds__(256, 2) void matmul_tensor_core_mma_kernel(
 #pragma unroll
             for (int tile_row = 0; tile_row < kWarpTilesM;
                  ++tile_row) {
-                const int tile_row_base =
-                    warp_row * kWM + tile_row * tc_mma::MMA_M;
+                const int tile_row_base = warp_row * kWM + tile_row * tc_mma::MMA_M;
                 const int fragment_row = tile_row_base + lane % 16;
                 const int fragment_inner = tile_inner + lane / 16 * 8;
-                const int logical_offset =
-                    fragment_row * tc_mma::BK + fragment_inner;
-                const int swizzled_offset =
-                    swizzle_bf16_offset<2>(logical_offset);
+                const int logical_offset = fragment_row * tc_mma::BK + fragment_inner;
+                const int swizzled_offset = swizzle_bf16_offset<2>(logical_offset);
                 load_matrix_x4(
                     A_fragments[tile_row],
-                    shared_address(
-                        shared_A[stage] + swizzled_offset));
+                    shared_address(shared_A[stage] + swizzled_offset));
             }
 #pragma unroll
-            for (int tile_column = 0;
-                 tile_column < kWarpTilesN;
-                 ++tile_column) {
-                const int tile_column_base =
-                    warp_column * kWN +
-                    tile_column * tc_mma::MMA_N;
+            for (int tile_column = 0; tile_column < kWarpTilesN; ++tile_column) {
+                const int tile_column_base = warp_column * kWN + tile_column * tc_mma::MMA_N;
                 const int fragment_inner = tile_inner + lane % 16;
                 const int fragment_column = tile_column_base;
-                const int logical_offset =
-                    fragment_inner * kBN + fragment_column;
-                const int swizzled_offset =
-                    swizzle_bf16_offset<3>(logical_offset);
+                const int logical_offset = fragment_inner * kBN + fragment_column;
+                const int swizzled_offset = swizzle_bf16_offset<3>(logical_offset);
                 load_matrix_b_x2(
                     B_fragments[tile_column],
-                    shared_address(
-                        shared_B[stage] + swizzled_offset));
+                    shared_address(shared_B[stage] + swizzled_offset)
+                );
             }
 #pragma unroll
-            for (int tile_row = 0; tile_row < kWarpTilesM;
-                 ++tile_row) {
+            for (int tile_row = 0; tile_row < kWarpTilesM; ++tile_row) {
 #pragma unroll
-                for (int tile_column = 0;
-                     tile_column < kWarpTilesN;
-                     ++tile_column) {
+                for (int tile_column = 0;tile_column < kWarpTilesN; ++tile_column) {
                     mma_bf16_m16n8k16(
                         accumulators[tile_row][tile_column],
                         A_fragments[tile_row],
-                        B_fragments[tile_column]);
+                        B_fragments[tile_column]
+                    );
                 }
             }
         }
@@ -610,14 +572,9 @@ __global__ __launch_bounds__(256, 2) void matmul_tensor_core_mma_kernel(
 #pragma unroll
     for (int tile_row = 0; tile_row < kWarpTilesM; ++tile_row) {
 #pragma unroll
-        for (int tile_column = 0; tile_column < kWarpTilesN;
-             ++tile_column) {
-            const int output_row =
-                block_row + warp_row * kWM +
-                tile_row * tc_mma::MMA_M + lane / 4;
-            const int output_column =
-                block_column + warp_column * kWN +
-                tile_column * tc_mma::MMA_N + (lane % 4) * 2;
+        for (int tile_column = 0; tile_column < kWarpTilesN; ++tile_column) {
+            const int output_row = block_row + warp_row * kWM + tile_row * tc_mma::MMA_M + lane / 4;
+            const int output_column = block_column + warp_column * kWN + tile_column * tc_mma::MMA_N + (lane % 4) * 2;
             // Fused BF16 epilogue: round FP32 accumulators and store pairs,
             // avoiding a separate conversion kernel and FP32 C buffer.
             const __nv_bfloat162 top = __floats2bfloat162_rn(
