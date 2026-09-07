@@ -6,6 +6,7 @@
 #include <cudaTypedefs.h>
 
 #include <cstdint>
+#include <cstdio>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -163,6 +164,13 @@ __global__ __launch_bounds__(NUM_THREADS) void gemm_bf16_kernel(
 
         // Optimization: a single thread issues asynchronous 2D TMA tile loads.
         if (threadIdx.x == 0) {
+            // Temporary TMA alignment diagnostic: print only the first block/tile.
+            if (tile_m == 0 && tile_n == 0 && tile_k == 0) {
+                printf("A shared=%u, A mod1024=%u, barrier mod8=%u\n",
+                       unsigned(__cvta_generic_to_shared(shared.A)),
+                       unsigned(__cvta_generic_to_shared(shared.A)) % 1024,
+                       unsigned(__cvta_generic_to_shared(&A_barrier)) % 8);
+            }
             cde::cp_async_bulk_tensor_2d_global_to_shared(shared.A, &A_map, tile_k * BK, tile_m * BM, A_barrier);
             A_token = cuda::device::barrier_arrive_tx(A_barrier, 1, sizeof(shared.A));
 #pragma unroll
