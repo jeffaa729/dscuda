@@ -26,7 +26,8 @@ def cases(args, family):
     try:
         for dtype in dtypes:
             shapes = (
-                (128, 256, 64), (640, 128, 128), (1152, 128, 64)
+                (128, 256, 64), (640, 128, 128), (1152, 128, 64),
+                (256, 512, 192)
             ) if args.test else tuple(
                 (n, n, n) for n in (
                     (2048,) if args.suite == "quick" else (2048, 4096, 8192)))
