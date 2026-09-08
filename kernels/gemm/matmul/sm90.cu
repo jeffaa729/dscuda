@@ -31,7 +31,7 @@ constexpr int CONSUMER_THREADS = 128;
 constexpr int PRODUCER_THREADS = 64;
 constexpr int NUM_THREADS = CONSUMER_THREADS + PRODUCER_THREADS;
 // Matmul4 uses a five-entry circular buffer to hide TMA latency.
-constexpr int STAGES = 3;
+constexpr int STAGES = 5;
 
 constexpr int M_TILES = BM / WGMMA_M;
 
