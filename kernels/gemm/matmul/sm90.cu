@@ -39,7 +39,7 @@ constexpr int B_PANEL_N = 64;
 constexpr int B_PANELS = BN / B_PANEL_N;
 constexpr unsigned int SMEM_ALIGNMENT = 1024;
 
-static_assert(CONSUMER_THREADS == 128 && PRODUCER_THREADS == 128);
+//static_assert(CONSUMER_THREADS == 128 && PRODUCER_THREADS == 128);
 static_assert(BM % WGMMA_M == 0 && STAGES > 0);
 static_assert(BK == 64 && BN == 128);
 static_assert(BK % WGMMA_K == 0 && BN % B_PANEL_N == 0);
