@@ -5,7 +5,8 @@
 
 namespace dscuda {
 
-// Row-major C[M,N] = A[M,K] * B[K,N].
+// C = A * B: row-major A[M,K], column-major B[K,N] and C[M,N].
+// B is physically stored as contiguous [N,K], matching fast.cu.
 void gemm_fp32_cuda(
     float* output,
     const float* left,
@@ -15,10 +16,9 @@ void gemm_fp32_cuda(
     int K,
     cudaStream_t stream = nullptr);
 
-// BF16 inputs/output and FP32 accumulation; layout depends on the GPU.
-// SM89: row-major C[M,N] = A[M,K] * B[K,N]; M,N multiples of 128, K of 32.
-// SM90: row-major A[M,K], column-major B[K,N] (physical [N,K]),
-// and column-major C[M,N], matching fast.cu; M,N multiples of 2048, K of 64.
+// Same layout with BF16 inputs/output and FP32 accumulation on both GPUs.
+// SM89 requires M,N multiples of 128 and K of 32.
+// SM90 requires M,N multiples of 2048 and K of 64.
 void gemm_bf16_cuda(
     __nv_bfloat16* output,
     const __nv_bfloat16* left,
