@@ -26,12 +26,12 @@ constexpr int WGMMA_N = BN;
 constexpr int WGMMA_K = 16; // Number of K elements consumed by one WGMMA instruction
 
 // Threads 0-127 form the aligned WGMMA consumer warpgroup.
-// Threads 128-159 form one producer warp; only thread 128 issues TMA.
+// Threads 128-255 form the producer warpgroup; only thread 128 issues TMA.
 constexpr int CONSUMER_THREADS = 128;
-constexpr int PRODUCER_THREADS = 32;
+constexpr int PRODUCER_THREADS = 128;
 constexpr int NUM_THREADS = CONSUMER_THREADS + PRODUCER_THREADS;
-// Three stages use 96 KiB, leaving shared-memory capacity for two H100 CTAs.
-constexpr int STAGES = 3;
+// Matmul4 uses a five-entry circular buffer to hide TMA latency.
+constexpr int STAGES = 5;
 
 constexpr int M_TILES = BM / WGMMA_M;
 
@@ -39,7 +39,7 @@ constexpr int B_PANEL_N = 64;
 constexpr int B_PANELS = BN / B_PANEL_N;
 constexpr unsigned int SMEM_ALIGNMENT = 1024;
 
-static_assert(CONSUMER_THREADS == 128 && PRODUCER_THREADS == 32);
+static_assert(CONSUMER_THREADS == 128 && PRODUCER_THREADS == 128);
 static_assert(BM % WGMMA_M == 0 && STAGES > 0);
 static_assert(BK == 64 && BN == 128);
 static_assert(BK % WGMMA_K == 0 && BN % B_PANEL_N == 0);
