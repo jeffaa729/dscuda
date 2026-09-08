@@ -25,30 +25,28 @@ constexpr int WGMMA_M = 64;
 constexpr int WGMMA_N = BN;
 constexpr int WGMMA_K = 16; // Number of K elements consumed by one WGMMA instruction
 
-/*
-C block: 128×128
+// Threads 0-127 form the producer warpgroup; only thread 0 issues TMA.
+// All threads 128-255 cooperatively execute WGMMA in the consumer warpgroup.
+constexpr int CONSUMER_THREADS = 128;
+constexpr int NUM_THREADS = 256;
+constexpr int STAGES = 5;
 
-rows   0–63: first  WGMMA M tile
-rows 64–127: second WGMMA M tile
-*/
-constexpr int NUM_THREADS = 128; // threads in the block
-constexpr int NUM_WARPGROUPS = NUM_THREADS / 128;
-constexpr int WG_M = BM / NUM_WARPGROUPS;
-constexpr int M_TILES = WG_M / WGMMA_M;
+constexpr int M_TILES = BM / WGMMA_M;
+
 constexpr int B_PANEL_N = 64;
 constexpr int B_PANELS = BN / B_PANEL_N;
 constexpr unsigned int SMEM_ALIGNMENT = 1024;
 
-static_assert(NUM_THREADS % 128 == 0);
-static_assert(BM % NUM_WARPGROUPS == 0 && WG_M % WGMMA_M == 0);
+static_assert(NUM_THREADS == 256 && CONSUMER_THREADS == 128);
+static_assert(BM % WGMMA_M == 0 && STAGES > 0);
 static_assert(BK == 64 && BN == 128);
 static_assert(BK % WGMMA_K == 0 && BN % B_PANEL_N == 0);
 
-// Matmul3 reuses B across two 64-row WGMMA tiles in one warpgroup.
-// Each B panel has a 128-byte row, as required by the TMA swizzle mode.
+// Matmul4 buffers future K tiles while the consumer computes the current tile.
+// Each stage preserves the two-panel B layout and 1024-byte swizzle alignment.
 struct SharedStorage {
-    alignas(SMEM_ALIGNMENT) bf16 A[BM * BK];
-    alignas(SMEM_ALIGNMENT) bf16 B[B_PANELS][BK * B_PANEL_N];
+    alignas(SMEM_ALIGNMENT) bf16 A[STAGES][BM * BK];
+    alignas(SMEM_ALIGNMENT) bf16 B[STAGES][B_PANELS][BK * B_PANEL_N];
 };
 constexpr size_t SMEM_BYTES = sizeof(SharedStorage) + SMEM_ALIGNMENT - 1;
 
@@ -137,8 +135,7 @@ __device__ __forceinline__ void wgmma_m64n128k16(float (&accumulator)[8][8], bf1
 
 #endif
 
-__global__ __launch_bounds__(NUM_THREADS) void gemm_bf16_kernel(
-    bf16* __restrict__ C, const __grid_constant__ CUtensorMap A_map, const __grid_constant__ CUtensorMap B_map, int M, int N, int K) {
+__global__ __launch_bounds__(NUM_THREADS) void gemm_bf16_kernel(bf16* __restrict__ C, const __grid_constant__ CUtensorMap A_map, const __grid_constant__ CUtensorMap B_map, int M, int N, int K) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
     extern __shared__ __align__(16) unsigned char storage[];
     // Align the actual shared address: static barriers can shift the dynamic base.
@@ -146,57 +143,78 @@ __global__ __launch_bounds__(NUM_THREADS) void gemm_bf16_kernel(
     const unsigned int storage_address = static_cast<unsigned int>(__cvta_generic_to_shared(storage));
     const unsigned int aligned_address = (storage_address + SMEM_ALIGNMENT - 1) & ~(SMEM_ALIGNMENT - 1);
     auto& shared = *reinterpret_cast<SharedStorage*>(__cvta_shared_to_generic(aligned_address));
-    __shared__ barrier A_barrier;
-    __shared__ barrier B_barrier;
 
-    // [2][8][8]
-    float accumulator[M_TILES][WGMMA_N / 16][8] = {};
-    static_assert(sizeof(accumulator) * NUM_THREADS == BM * BN * sizeof(float));
-    const int tile_m = blockIdx.y;
-    const int tile_n = blockIdx.x;
-    const int wg_id = threadIdx.x / 128;
+    // Full waits for all A/B transfers; empty waits for all WGMMA readers.
+    __shared__ barrier full[STAGES];
+    __shared__ barrier empty[STAGES];
 
+    // Each phase counts one producer thread and 128 consumer threads.
     if (threadIdx.x == 0) {
-        init(&A_barrier, blockDim.x);
-        init(&B_barrier, blockDim.x);
+        for (int stage = 0; stage < STAGES; ++stage) {
+            init(&full[stage], CONSUMER_THREADS + 1);
+            init(&empty[stage], CONSUMER_THREADS + 1);
+        }
         cde::fence_proxy_async_shared_cta();
     }
     __syncthreads();
 
-    for (int tile_k = 0; tile_k < K / BK; ++tile_k) {
-        barrier::arrival_token A_token;
-        barrier::arrival_token B_token;
+    const int tile_m = blockIdx.y;
+    const int tile_n = blockIdx.x;
+    const int k_tiles = K / BK;
 
-        // Optimization: a single thread issues asynchronous 2D TMA tile loads.
+    // Producer: refill only released slots, then advance without waiting for TMA.
+    if (threadIdx.x < 128) {
         if (threadIdx.x == 0) {
-            cde::cp_async_bulk_tensor_2d_global_to_shared(shared.A, &A_map, tile_k * BK, tile_m * BM, A_barrier);
-            A_token = cuda::device::barrier_arrive_tx(A_barrier, 1, sizeof(shared.A));
+            for (int tile_k = 0; tile_k < k_tiles; ++tile_k) {
+                const int stage = tile_k % STAGES;
+                auto free_token = empty[stage].arrive();
+                empty[stage].wait(std::move(free_token));
+
+                cde::cp_async_bulk_tensor_2d_global_to_shared(shared.A[stage], &A_map, tile_k * BK, tile_m * BM, full[stage]);
 #pragma unroll
-            for (int panel = 0; panel < B_PANELS; ++panel) {
-                cde::cp_async_bulk_tensor_2d_global_to_shared(
-                    shared.B[panel], &B_map, tile_n * BN + panel * B_PANEL_N, tile_k * BK, B_barrier);
+                for (int panel = 0; panel < B_PANELS; ++panel) {
+                    cde::cp_async_bulk_tensor_2d_global_to_shared(
+                        shared.B[stage][panel], &B_map, tile_n * BN + panel * B_PANEL_N, tile_k * BK, full[stage]);
+                }
+
+                auto ready_token = cuda::device::barrier_arrive_tx(
+                    full[stage], 1, sizeof(shared.A[stage]) + sizeof(shared.B[stage]));
+                (void)ready_token;
             }
-            B_token = cuda::device::barrier_arrive_tx(B_barrier, 1, sizeof(shared.B));
-        } else {
-            A_token = A_barrier.arrive();
-            B_token = B_barrier.arrive();
         }
-        A_barrier.wait(std::move(A_token));
-        B_barrier.wait(std::move(B_token));
+        return;
+    }
+
+    // Bootstrap every empty phase so the producer can perform the initial fills.
+    for (int stage = 0; stage < STAGES; ++stage) {
+        auto initial_token = empty[stage].arrive();
+        (void)initial_token;
+    }
+
+    // Only the consumer owns the two 64x128 output fragments.
+    float accumulator[M_TILES][WGMMA_N / 16][8] = {};
+    static_assert(sizeof(accumulator) * CONSUMER_THREADS == BM * BN * sizeof(float));
+
+    for (int tile_k = 0; tile_k < k_tiles; ++tile_k) {
+        const int stage = tile_k % STAGES;
+        auto ready_token = full[stage].arrive();
+        full[stage].wait(std::move(ready_token));
 
         warpgroup_fence();
 #pragma unroll
         for (int m_it = 0; m_it < M_TILES; ++m_it) {
-            bf16* A_tile = shared.A + (wg_id * WG_M + m_it * WGMMA_M) * BK;
+            bf16* A_tile = shared.A[stage] + m_it * WGMMA_M * BK;
 #pragma unroll
             for (int k_it = 0; k_it < BK / WGMMA_K; ++k_it) {
-                wgmma_m64n128k16<1>(accumulator[m_it], A_tile + k_it * WGMMA_K, shared.B[0] + k_it * WGMMA_K * B_PANEL_N);
+                wgmma_m64n128k16<1>(accumulator[m_it], A_tile + k_it * WGMMA_K, shared.B[stage][0] + k_it * WGMMA_K * B_PANEL_N);
             }
         }
         warpgroup_commit();
         warpgroup_wait();
-        // Every warpgroup must finish reading before thread 0 refills the buffers.
-        __syncthreads();
+
+        // Release the slot only after WGMMA finishes reading its shared operands.
+        auto free_token = empty[stage].arrive();
+        (void)free_token;
     }
 
     // Two 64x128 fragments cover the row-major 128x128 output tile.
@@ -207,7 +225,7 @@ __global__ __launch_bounds__(NUM_THREADS) void gemm_bf16_kernel(
 
 #pragma unroll
     for (int m_it = 0; m_it < M_TILES; ++m_it) {
-        const int row = wg_id * WG_M + m_it * WGMMA_M + warp * 16 + lane / 4;
+        const int row = m_it * WGMMA_M + warp * 16 + lane / 4;
 #pragma unroll
         for (int group = 0; group < WGMMA_N / 16; ++group) {
             const int column = group * 16 + 2 * (lane & 3);
