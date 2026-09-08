@@ -6,6 +6,7 @@
 #include <cudaTypedefs.h>
 
 #include <cstdint>
+#include <cstring>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -17,7 +18,7 @@ using bf16 = __nv_bfloat16;
 using barrier = cuda::barrier<cuda::thread_scope_block>;
 namespace cde = cuda::device::experimental;
 
-// Matmul5 widens the CTA tile so A is reused across 256 output columns.
+// Matmul6 keeps 128 CTAs resident and pipelines several output tiles per CTA.
 constexpr int BM = 128;
 constexpr int BN = 256;
 constexpr int BK = 64;
@@ -43,13 +44,12 @@ constexpr int GROUP_M = 16;
 constexpr int GROUP_N = 8;
 
 static_assert(PERSISTENT_BLOCKS == GROUP_M * GROUP_N);
-
-//static_assert(PRODUCER_THREADS == 128 && CONSUMER_THREADS == 256 && NUM_THREADS == 384);
+static_assert(PRODUCER_THREADS == 128 && CONSUMER_THREADS == 256 && NUM_THREADS == 384);
 static_assert(BM / NUM_CONSUMERS == WGMMA_M);
 static_assert(BK == 64 && BN == 256 && STAGES == 3);
 static_assert(BK % WGMMA_K == 0 && BN % B_PANEL_N == 0 && B_PANELS == 4);
 
-// Matmul5 buffers future K tiles while two consumers compute separate row bands.
+// Matmul6 reuses this queue across logical output tiles assigned to one CTA.
 // Four B panels preserve row-major input and 1024-byte swizzle alignment.
 struct SharedStorage {
     alignas(SMEM_ALIGNMENT) bf16 A[STAGES][BM * BK];
@@ -170,8 +170,9 @@ struct TileScheduler {
     int tiles_m;
     int tiles_n;
 
-    __device__ TileScheduler(int M, int N) : iteration(0), tiles_m(M/BM), tiles_n(N/BN) {}
-        __device__ int next() {
+    __device__ TileScheduler(int M, int N) : iteration(0), tiles_m(M / BM), tiles_n(N / BN) {}
+
+    __device__ int next() {
         const int linear = iteration * PERSISTENT_BLOCKS + blockIdx.x;
         ++iteration;
 
@@ -196,7 +197,6 @@ struct TileScheduler {
     }
 };
 
-
 #endif
 
 __global__ __launch_bounds__(NUM_THREADS) void gemm_bf16_kernel(bf16* __restrict__ C, const __grid_constant__ CUtensorMap A_map, const __grid_constant__ CUtensorMap B_map, int M, int N, int K) {
@@ -220,11 +220,9 @@ __global__ __launch_bounds__(NUM_THREADS) void gemm_bf16_kernel(bf16* __restrict
     }
     __syncthreads();
 
-
-    // const int tile_m = blockIdx.y;
-    // const int tile_n = blockIdx.x;
-    // instead each warpgrp get its own scheduler object
+    // Every warpgroup follows the same logical-tile sequence independently.
     TileScheduler scheduler(M, N);
+    const int tiles_n = N / BN;
     const int k_tiles = K / BK;
     const int warpgroup_id = threadIdx.x / 128;
     const int warpgroup_thread = threadIdx.x % 128;
@@ -234,27 +232,29 @@ __global__ __launch_bounds__(NUM_THREADS) void gemm_bf16_kernel(bf16* __restrict
         warpgroup_reg_dealloc<24>();
         if (warpgroup_thread == 0) {
             int queue_index = 0;
-            for (int tile_id = scheduler.next(); tile_id >= 0; tile_id = schedule.next()) {
-                    const int tile_m = tile_id / tiles_n;
-                    const int tile_n = tile_id % tiles_n;
+            for (int tile_id = scheduler.next(); tile_id >= 0; tile_id = scheduler.next()) {
+                const int tile_m = tile_id / tiles_n;
+                const int tile_n = tile_id % tiles_n;
 
-                    for (int tile_k = 0; tile_k < k_tiles; ++tile_k) {
-                        const int stage = queue_index % STAGES;
-                        queue_index++;
-                        auto free_token = empty[stage].arrive();
-                        empty[stage].wait(std::move(free_token));
-        
-                        cde::cp_async_bulk_tensor_2d_global_to_shared(shared.A[stage], &A_map, tile_k * BK, tile_m * BM, full[stage]);
-        #pragma unroll
-                        for (int panel = 0; panel < B_PANELS; ++panel) {
-                            cde::cp_async_bulk_tensor_2d_global_to_shared(
-                                shared.B[stage][panel], &B_map, tile_n * BN + panel * B_PANEL_N, tile_k * BK, full[stage]);
-                        }
-        
-                        auto ready_token = cuda::device::barrier_arrive_tx(
-                            full[stage], 1, sizeof(shared.A[stage]) + sizeof(shared.B[stage]));
-                        (void)ready_token;
+                for (int tile_k = 0; tile_k < k_tiles; ++tile_k) {
+                    const int stage = queue_index % STAGES;
+                    ++queue_index;
+                    auto free_token = empty[stage].arrive();
+                    empty[stage].wait(std::move(free_token));
+
+                    cde::cp_async_bulk_tensor_2d_global_to_shared(
+                        shared.A[stage], &A_map, tile_k * BK, tile_m * BM, full[stage]);
+#pragma unroll
+                    for (int panel = 0; panel < B_PANELS; ++panel) {
+                        cde::cp_async_bulk_tensor_2d_global_to_shared(
+                            shared.B[stage][panel], &B_map,
+                            tile_n * BN + panel * B_PANEL_N, tile_k * BK, full[stage]);
                     }
+
+                    auto ready_token = cuda::device::barrier_arrive_tx(
+                        full[stage], 1, sizeof(shared.A[stage]) + sizeof(shared.B[stage]));
+                    (void)ready_token;
+                }
             }
         }
         return;
@@ -268,71 +268,69 @@ __global__ __launch_bounds__(NUM_THREADS) void gemm_bf16_kernel(bf16* __restrict
         (void)initial_token;
     }
 
-    float accumulator[WGMMA_N / 16][8]};
+    float accumulator[WGMMA_N / 16][8];
     int queue_index = 0;
     static_assert(sizeof(accumulator) * CONSUMER_THREADS == BM * BN * sizeof(float));
-    for (int tile_id = scheduler.next(); tile_id >= 0; tile_id = schedule.next()) {
+    const int lane = warpgroup_thread & 31;
+    const int warp = warpgroup_thread >> 5;
+    const int row = consumer_id * WGMMA_M + warp * 16 + lane / 4;
+
+    for (int tile_id = scheduler.next(); tile_id >= 0; tile_id = scheduler.next()) {
         const int tile_m = tile_id / tiles_n;
         const int tile_n = tile_id % tiles_n;
 
-        memset(accumulator, 0 , sizeof(accumulator));
+        memset(accumulator, 0, sizeof(accumulator));
 
         for (int tile_k = 0; tile_k < k_tiles; ++tile_k) {
             const int stage = queue_index % STAGES;
-            queue_index++;
+            ++queue_index;
             auto ready_token = full[stage].arrive();
             full[stage].wait(std::move(ready_token));
-    
+
             bf16* A_tile = shared.A[stage] + consumer_id * WGMMA_M * BK;
             warpgroup_fence();
-    #pragma unroll
+#pragma unroll
             for (int k_it = 0; k_it < BK / WGMMA_K; ++k_it) {
                 wgmma_m64n256k16<1, 1, 1, 0, 1>(
                     accumulator, A_tile + k_it * WGMMA_K, shared.B[stage][0] + k_it * WGMMA_K * B_PANEL_N);
             }
             warpgroup_commit();
             warpgroup_wait();
-    
+
             auto free_token = empty[stage].arrive();
             (void)free_token;
         }
-    }
 
-
-    // Each consumer stores one row-major 64x256 half of the CTA output tile.
-    const int lane = warpgroup_thread & 31;
-    const int warp = warpgroup_thread >> 5;
-    const int row = consumer_id * WGMMA_M + warp * 16 + lane / 4;
-    bf16* tile_C = C + tile_m * BM * N + tile_n * BN;
-
+        // Store this logical tile while the producer starts filling the next one.
+        bf16* tile_C = C + tile_m * BM * N + tile_n * BN;
 #pragma unroll
-    for (int group = 0; group < WGMMA_N / 16; ++group) {
-        const int column = group * 16 + 2 * (lane & 3);
+        for (int group = 0; group < WGMMA_N / 16; ++group) {
+            const int column = group * 16 + 2 * (lane & 3);
 #define STORE(Row, Column, Value) tile_C[(Row) * N + (Column)] = __float2bfloat16(Value)
-        STORE(row, column, accumulator[group][0]);
-        STORE(row, column + 1, accumulator[group][1]);
-        STORE(row + 8, column, accumulator[group][2]);
-        STORE(row + 8, column + 1, accumulator[group][3]);
-        STORE(row, column + 8, accumulator[group][4]);
-        STORE(row, column + 9, accumulator[group][5]);
-        STORE(row + 8, column + 8, accumulator[group][6]);
-        STORE(row + 8, column + 9, accumulator[group][7]);
+            STORE(row, column, accumulator[group][0]);
+            STORE(row, column + 1, accumulator[group][1]);
+            STORE(row + 8, column, accumulator[group][2]);
+            STORE(row + 8, column + 1, accumulator[group][3]);
+            STORE(row, column + 8, accumulator[group][4]);
+            STORE(row, column + 9, accumulator[group][5]);
+            STORE(row + 8, column + 8, accumulator[group][6]);
+            STORE(row + 8, column + 9, accumulator[group][7]);
 #undef STORE
+        }
     }
 #endif
 }
 
-
 }  // namespace
 
 void gemm_bf16_sm90_cuda(bf16* C, const bf16* A, const bf16* B, int M, int N, int K, cudaStream_t stream) {
-    if (M <= 0 || N <= 0 || K <= 0 || M % BM != 0 || N % BN != 0 || K % BK != 0) {
-        throw std::invalid_argument("SM90 BF16 GEMM requires M divisible by 128, N divisible by 256 and K divisible by 64.");
+    if (M <= 0 || N <= 0 || K <= 0 || M % (BM * GROUP_M) != 0 || N % (BN * GROUP_N) != 0 || K % BK != 0) {
+        throw std::invalid_argument(
+            "SM90 persistent BF16 GEMM requires M and N divisible by 2048 and K divisible by 64.");
     }
     const CUtensorMap A_map = make_tensor_map<BM, BK>(A, M, K);
     const CUtensorMap B_map = make_tensor_map<BK, B_PANEL_N>(B, K, N);
     CUDA_CHECK(cudaFuncSetAttribute(gemm_bf16_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_BYTES));
-    //const dim3 grid(N / BN, M / BM);
     gemm_bf16_kernel<<<PERSISTENT_BLOCKS, NUM_THREADS, SMEM_BYTES, stream>>>(C, A_map, B_map, M, N, K);
     CUDA_CHECK(cudaGetLastError());
 }

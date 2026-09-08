@@ -19,9 +19,9 @@ def cases(args, family):
     try:
         for dtype in dtypes:
             if args.test and dtype == torch.bfloat16 and is_sm90:
-                # Matmul5: initial fill, first ring wrap, and repeated stage reuse.
-                shapes = ((128, 256, 64), (256, 512, 128), (384, 256, 192),
-                          (128, 256, 256), (256, 512, 384), (512, 768, 768))
+                # Matmul6: one wave, persistent reuse, and cross-tile queue wraps.
+                shapes = ((2048, 2048, 64), (2048, 4096, 192),
+                          (4096, 2048, 256))
             elif args.test:
                 shapes = ((128, 256, 64), (640, 128, 128), (1152, 128, 64),
                           (256, 512, 192))
