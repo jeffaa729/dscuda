@@ -1,0 +1,42 @@
+FROM nvidia/cuda:12.8.1-devel-ubuntu22.04
+
+ARG DEEPGEMM_REPOSITORY=https://github.com/deepseek-ai/DeepGEMM.git
+ARG DEEPGEMM_REF=main
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV UV_LINK_MODE=copy
+ENV UV_TOOL_BIN_DIR=/usr/local/bin
+ENV DSCUDA_PYTHON=/opt/dscuda-env/.venv/bin/python
+ENV PATH="/usr/local/bin:${PATH}"
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        curl \
+        git \
+        ninja-build \
+        python3 \
+        python3-venv \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy uv from its official container image.
+COPY --from=ghcr.io/astral-sh/uv:0.12.9 /uv /uvx /usr/local/bin/
+
+# Ubuntu 22.04's CMake is too old for this repository.
+RUN uv tool install cmake==3.31.10
+
+# Cache Python dependencies separately from source code.
+WORKDIR /opt/dscuda-env
+COPY pyproject.toml uv.lock ./
+RUN uv sync --locked --no-install-project
+
+# Install official DeepGEMM into the same environment used by benchmark.sh.
+# Its CUDA kernels are JIT-compiled for the attached H100 on first use.
+RUN git clone --recursive --branch "${DEEPGEMM_REF}" "${DEEPGEMM_REPOSITORY}" /tmp/DeepGEMM \
+    && uv pip install --python "${DSCUDA_PYTHON}" setuptools wheel ninja packaging \
+    && uv pip install --python "${DSCUDA_PYTHON}" --no-build-isolation --no-deps /tmp/DeepGEMM \
+    && "${DSCUDA_PYTHON}" -c 'import deep_gemm; assert hasattr(deep_gemm, "bf16_gemm_nn")' \
+    && rm -rf /tmp/DeepGEMM
+
+WORKDIR /root
+CMD ["/bin/bash"]

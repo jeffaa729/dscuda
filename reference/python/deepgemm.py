@@ -1,11 +1,6 @@
-"""Thin adapters for the official DeepGEMM BF16 NN interfaces."""
+"""Thin adapter for the official DeepGEMM grouped BF16 NN interface."""
 
 import deep_gemm
-
-
-def gemm_nn(left, right, output):
-    deep_gemm.bf16_gemm_nn(left, right, output)
-    return output
 
 
 def grouped_alignment(expected_rows):
