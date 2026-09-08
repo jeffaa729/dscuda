@@ -34,8 +34,8 @@ def cases(args, family):
             if args.test and dtype == torch.float32:
                 shapes += ((17, 33, 65),)
             if args.test and dtype == torch.bfloat16:
-                # Five Hopper stages: full ring, first wrap, and repeated reuse.
-                shapes += ((128, 128, 320), (128, 256, 384), (256, 512, 768))
+                # Five Hopper stages: first wrap, partial rings, and repeated reuse.
+                shapes += ((128, 256, 256), (128, 128, 320), (128, 256, 384), (256, 512, 768))
 
             for m, n, k in shapes:
                 left = torch.randn((m, k), device="cuda", dtype=dtype) * .1
