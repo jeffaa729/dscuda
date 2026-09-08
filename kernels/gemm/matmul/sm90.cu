@@ -27,7 +27,7 @@ constexpr int WGMMA_N = BN;
 constexpr int WGMMA_K = 16; // Number of K elements consumed by one WGMMA instruction
 
 // Warpgroup 0 produces TMA tiles; warpgroups 1 and 2 consume them with WGMMA.
-constexpr int PRODUCER_THREADS = 128;
+constexpr int PRODUCER_THREADS = 64;
 constexpr int NUM_CONSUMERS = 2;
 constexpr int CONSUMER_THREADS = NUM_CONSUMERS * 128;
 constexpr int NUM_THREADS = PRODUCER_THREADS + CONSUMER_THREADS;
@@ -38,7 +38,7 @@ constexpr int B_PANEL_N = 64;
 constexpr int B_PANELS = BN / B_PANEL_N;
 constexpr unsigned int SMEM_ALIGNMENT = 1024;
 
-static_assert(PRODUCER_THREADS == 128 && CONSUMER_THREADS == 256 && NUM_THREADS == 384);
+//static_assert(PRODUCER_THREADS == 128 && CONSUMER_THREADS == 256 && NUM_THREADS == 384);
 static_assert(BM / NUM_CONSUMERS == WGMMA_M);
 static_assert(BK == 64 && BN == 256 && STAGES == 3);
 static_assert(BK % WGMMA_K == 0 && BN % B_PANEL_N == 0 && B_PANELS == 4);

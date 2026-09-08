@@ -7,7 +7,7 @@ __pycache__/
 *.pyc
 /profiles
 .venv/
-/docker
-.dockerignore
+/docker/*
+!/docker/Dockerfile.vast
 /docs
 /tools
