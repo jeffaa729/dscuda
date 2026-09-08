@@ -27,7 +27,7 @@ constexpr int WGMMA_N = BN;
 constexpr int WGMMA_K = 16; // Number of K elements consumed by one WGMMA instruction
 
 // Warpgroup 0 produces TMA tiles; warpgroups 1 and 2 consume them with WGMMA.
-constexpr int PRODUCER_THREADS = 64;
+constexpr int PRODUCER_THREADS = 128;
 constexpr int NUM_CONSUMERS = 2;
 constexpr int CONSUMER_THREADS = NUM_CONSUMERS * 128;
 constexpr int NUM_THREADS = PRODUCER_THREADS + CONSUMER_THREADS;
