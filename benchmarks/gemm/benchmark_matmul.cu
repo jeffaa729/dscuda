@@ -1,4 +1,4 @@
-// Runs row-major NN FP32/BF16 GEMMs and matching cuBLAS workloads for Nsight Compute.
+// Profiles SM89 row-major NN and SM90 fast.cu layouts with matching cuBLAS.
 
 #include "cuda_common.h"
 #include "matmul.h"
@@ -36,6 +36,10 @@ int main(int argc, char** argv) {
         if (!reference && !bf16 && std::strcmp(backend, "fp32") != 0) {
             throw std::runtime_error("backend must be fp32, bf16, cublas_fp32, or cublas_bf16");
         }
+        int device = 0, major = 0;
+        CUDA_CHECK(cudaGetDevice(&device));
+        CUDA_CHECK(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device));
+        const bool fast_layout = bf16 && major == 9;
         const size_t left_elements = static_cast<size_t>(M) * K;
         const size_t right_elements = static_cast<size_t>(K) * N;
         const size_t output_elements = static_cast<size_t>(M) * N;
@@ -67,13 +71,13 @@ int main(int argc, char** argv) {
                 const float alpha = 1.0F;
                 const float beta = 0.0F;
                 const cudaDataType_t type = bf16 ? CUDA_R_16BF : CUDA_R_32F;
-                // Row-major C = A * B becomes column-major C^T = B^T * A^T.
+                // SM90 uses K-contiguous A/B and column-major C, as in fast.cu.
                 cublas_check(cublasGemmEx(
-                    handle, CUBLAS_OP_N, CUBLAS_OP_N,
-                    N, M, K, &alpha,
-                    right, type, N,
-                    left, type, K,
-                    &beta, output, type, N,
+                    handle, fast_layout ? CUBLAS_OP_T : CUBLAS_OP_N, CUBLAS_OP_N,
+                    fast_layout ? M : N, fast_layout ? N : M, K, &alpha,
+                    fast_layout ? left : right, type, fast_layout ? K : N,
+                    fast_layout ? right : left, type, K,
+                    &beta, output, type, fast_layout ? M : N,
                     bf16 ? CUBLAS_COMPUTE_32F : CUBLAS_COMPUTE_32F_PEDANTIC,
                     bf16 ? CUBLAS_GEMM_DEFAULT_TENSOR_OP : CUBLAS_GEMM_DEFAULT));
             } else if (bf16) {

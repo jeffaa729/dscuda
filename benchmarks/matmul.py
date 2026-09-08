@@ -1,4 +1,4 @@
-"""Row-major NN GEMM with a cuBLAS reference."""
+"""SM89 row-major NN and SM90 fast.cu-layout GEMM with matching cuBLAS."""
 
 from common import I, P, Operation, bind, checked, library, pointers, stream, torch
 
@@ -13,7 +13,7 @@ def cases(args, family):
 
     lib = library("operator")
     checked(lib, "operator", bind(lib, "dscuda_cublas_init", [])())
-    gemm = bind(lib, "dscuda_gemm", [P] * 3 + [I] * 5 + [P])
+    gemm = bind(lib, "dscuda_gemm", [P] * 3 + [I] * 5 + [P, I])
     dtypes = (torch.bfloat16,) if is_sm90 else (torch.float32, torch.bfloat16)
 
     try:
@@ -33,16 +33,20 @@ def cases(args, family):
 
             for m, n, k in shapes:
                 left = torch.randn((m, k), device="cuda", dtype=dtype) * .1
-                right = torch.randn((k, n), device="cuda", dtype=dtype) * .1
+                right = torch.randn((n, k) if is_sm90 else (k, n), device="cuda", dtype=dtype) * .1
+                if is_sm90:
+                    right = right.t()  # Logical B[K,N], physical [N,K].
                 expected = (left.float() @ right.float()).to(dtype)
                 # An empty/incomplete SM90 kernel must fail correctness before timing.
-                custom_output = torch.full((m, n), float("nan"), device="cuda", dtype=dtype)
+                custom_output = torch.full((n, m) if is_sm90 else (m, n), float("nan"), device="cuda", dtype=dtype)
+                if is_sm90:
+                    custom_output = custom_output.t()  # Column-major C[M,N].
 
                 def native(output, use_reference):
                     checked(lib, "operator", gemm(
                         *pointers((output, left, right)),
                         m, n, k, int(dtype == torch.bfloat16),
-                        use_reference, stream()))
+                        use_reference, stream(), int(is_sm90)))
                     return output
 
                 functions = {
@@ -56,6 +60,6 @@ def cases(args, family):
                 yield Operation(
                     f"M={m},N={n},K={k}",
                     "bf16" if dtype == torch.bfloat16 else "fp32",
-                    "NN", functions, (expected,), tolerance, tolerance)
+                    "TN (cuBLAS)" if is_sm90 else "NN", functions, (expected,), tolerance, tolerance)
     finally:
         bind(lib, "dscuda_cublas_destroy", [], None)()

@@ -44,7 +44,7 @@ extern "C" int dscuda_cublas_version() {
 
 extern "C" int dscuda_gemm(
     void* output, const void* left, const void* right,
-    int M, int N, int K, int bf16, int reference, cudaStream_t stream) {
+    int M, int N, int K, int bf16, int reference, cudaStream_t stream, int fast_layout = 0) {
     try {
         if (!reference) {
             if (bf16) {
@@ -69,12 +69,12 @@ extern "C" int dscuda_gemm(
             const cudaDataType_t type = bf16 ? CUDA_R_16BF : CUDA_R_32F;
             cublas_check(cublasGemmEx(
                 handle,
+                fast_layout ? CUBLAS_OP_T : CUBLAS_OP_N,
                 CUBLAS_OP_N,
-                CUBLAS_OP_N,
-                N, M, K, &alpha,
-                right, type, N,
-                left, type, K,
-                &beta, output, type, N,
+                fast_layout ? M : N, fast_layout ? N : M, K, &alpha,
+                fast_layout ? left : right, type, fast_layout ? K : N,
+                fast_layout ? right : left, type, K,
+                &beta, output, type, fast_layout ? M : N,
                 bf16 ? CUBLAS_COMPUTE_32F : CUBLAS_COMPUTE_32F_PEDANTIC,
                 bf16 ? CUBLAS_GEMM_DEFAULT_TENSOR_OP : CUBLAS_GEMM_DEFAULT));
         }

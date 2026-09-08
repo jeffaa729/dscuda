@@ -35,8 +35,6 @@ constexpr int NUM_THREADS = PRODUCER_THREADS + CONSUMER_THREADS;
 // The wider B tile limits the circular buffer to three 48-KiB stages.
 constexpr int STAGES = 3;
 
-constexpr int B_PANEL_N = 64;
-constexpr int B_PANELS = BN / B_PANEL_N;
 constexpr unsigned int SMEM_ALIGNMENT = 1024;
 
 constexpr int PERSISTENT_BLOCKS = 128;
@@ -47,13 +45,13 @@ static_assert(PERSISTENT_BLOCKS == GROUP_M * GROUP_N);
 static_assert(PRODUCER_THREADS == 128 && CONSUMER_THREADS == 256 && NUM_THREADS == 384);
 static_assert(BM / NUM_CONSUMERS == WGMMA_M);
 static_assert(BK == 64 && BN == 256 && STAGES == 3);
-static_assert(BK % WGMMA_K == 0 && BN % B_PANEL_N == 0 && B_PANELS == 4);
+static_assert(BK % WGMMA_K == 0);
 
 // Matmul6 reuses this queue across logical output tiles assigned to one CTA.
-// Four B panels preserve row-major input and 1024-byte swizzle alignment.
+// Both operands are K-contiguous, matching fast.cu's A[M,K] and B[N,K].
 struct SharedStorage {
     alignas(SMEM_ALIGNMENT) bf16 A[STAGES][BM * BK];
-    alignas(SMEM_ALIGNMENT) bf16 B[STAGES][B_PANELS][BK * B_PANEL_N];
+    alignas(SMEM_ALIGNMENT) bf16 B[STAGES][BN * BK];
 };
 constexpr size_t SMEM_BYTES = sizeof(SharedStorage) + SMEM_ALIGNMENT - 1;
 
@@ -120,7 +118,7 @@ __device__ __forceinline__ void warpgroup_reg_dealloc() {
 template <int ScaleD, int ScaleA, int ScaleB, int TransA, int TransB>
 __device__ __forceinline__ void wgmma_m64n256k16(float (&accumulator)[16][8], bf16* A, bf16* B) {
     const uint64_t A_descriptor = make_smem_descriptor<16>(A);
-    const uint64_t B_descriptor = make_smem_descriptor<BK * B_PANEL_N * sizeof(bf16)>(B);
+    const uint64_t B_descriptor = make_smem_descriptor<16>(B);
     asm volatile(
         "{\n"
         "wgmma.mma_async.sync.aligned.m64n256k16.f32.bf16.bf16 "
@@ -244,12 +242,8 @@ __global__ __launch_bounds__(NUM_THREADS) void gemm_bf16_kernel(bf16* __restrict
 
                     cde::cp_async_bulk_tensor_2d_global_to_shared(
                         shared.A[stage], &A_map, tile_k * BK, tile_m * BM, full[stage]);
-#pragma unroll
-                    for (int panel = 0; panel < B_PANELS; ++panel) {
-                        cde::cp_async_bulk_tensor_2d_global_to_shared(
-                            shared.B[stage][panel], &B_map,
-                            tile_n * BN + panel * B_PANEL_N, tile_k * BK, full[stage]);
-                    }
+                    cde::cp_async_bulk_tensor_2d_global_to_shared(
+                        shared.B[stage], &B_map, tile_k * BK, tile_n * BN, full[stage]);
 
                     auto ready_token = cuda::device::barrier_arrive_tx(
                         full[stage], 1, sizeof(shared.A[stage]) + sizeof(shared.B[stage]));
@@ -291,8 +285,8 @@ __global__ __launch_bounds__(NUM_THREADS) void gemm_bf16_kernel(bf16* __restrict
             warpgroup_fence();
 #pragma unroll
             for (int k_it = 0; k_it < BK / WGMMA_K; ++k_it) {
-                wgmma_m64n256k16<1, 1, 1, 0, 1>(
-                    accumulator, A_tile + k_it * WGMMA_K, shared.B[stage][0] + k_it * WGMMA_K * B_PANEL_N);
+                wgmma_m64n256k16<1, 1, 1, 0, 0>(
+                    accumulator, A_tile + k_it * WGMMA_K, shared.B[stage] + k_it * WGMMA_K);
             }
             warpgroup_commit();
             warpgroup_wait();
@@ -302,11 +296,11 @@ __global__ __launch_bounds__(NUM_THREADS) void gemm_bf16_kernel(bf16* __restrict
         }
 
         // Store this logical tile while the producer starts filling the next one.
-        bf16* tile_C = C + tile_m * BM * N + tile_n * BN;
+        bf16* tile_C = C + tile_m * BM + tile_n * BN * M;
 #pragma unroll
         for (int group = 0; group < WGMMA_N / 16; ++group) {
             const int column = group * 16 + 2 * (lane & 3);
-#define STORE(Row, Column, Value) tile_C[(Row) * N + (Column)] = __float2bfloat16(Value)
+#define STORE(Row, Column, Value) tile_C[(Column) * M + (Row)] = __float2bfloat16(Value)
             STORE(row, column, accumulator[group][0]);
             STORE(row, column + 1, accumulator[group][1]);
             STORE(row + 8, column, accumulator[group][2]);
@@ -329,7 +323,7 @@ void gemm_bf16_sm90_cuda(bf16* C, const bf16* A, const bf16* B, int M, int N, in
             "SM90 persistent BF16 GEMM requires M and N divisible by 2048 and K divisible by 64.");
     }
     const CUtensorMap A_map = make_tensor_map<BM, BK>(A, M, K);
-    const CUtensorMap B_map = make_tensor_map<BK, B_PANEL_N>(B, K, N);
+    const CUtensorMap B_map = make_tensor_map<BN, BK>(B, N, K);
     CUDA_CHECK(cudaFuncSetAttribute(gemm_bf16_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_BYTES));
     gemm_bf16_kernel<<<PERSISTENT_BLOCKS, NUM_THREADS, SMEM_BYTES, stream>>>(C, A_map, B_map, M, N, K);
     CUDA_CHECK(cudaGetLastError());
