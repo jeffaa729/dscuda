@@ -2,23 +2,19 @@
 #include "cuda_common.h"
 
 #include <cuda.h>
-#include <cuda/barrier>
 #include <cudaTypedefs.h>
 
 #include <cstdint>
 #include <cstring>
 #include <stdexcept>
 #include <string>
-#include <utility>
 
 namespace dscuda {
 namespace {
 
 using bf16 = __nv_bfloat16;
-using barrier = cuda::barrier<cuda::thread_scope_block>;
-namespace cde = cuda::device::experimental;
 
-// Matmul6 keeps 128 CTAs resident and pipelines several output tiles per CTA.
+// Matmul7 keeps 128 CTAs resident and pipelines several output tiles per CTA.
 constexpr int BM = 128;
 constexpr int BN = 256;
 constexpr int BK = 64;
@@ -47,7 +43,7 @@ static_assert(BM / NUM_CONSUMERS == WGMMA_M);
 static_assert(BK == 64 && BN == 256 && STAGES == 3);
 static_assert(BK % WGMMA_K == 0);
 
-// Matmul6 reuses this queue across logical output tiles assigned to one CTA.
+// Matmul7 reuses this queue across logical output tiles assigned to one CTA.
 // Both operands are K-contiguous, matching fast.cu's A[M,K] and B[N,K].
 struct SharedStorage {
     alignas(SMEM_ALIGNMENT) bf16 A[STAGES][BM * BK];
@@ -59,14 +55,14 @@ template <int TileRows, int TileColumns>
 CUtensorMap make_tensor_map(const bf16* pointer, int rows, int columns) {
     CUtensorMap map;
     void* address = const_cast<bf16*>(pointer);
-    const uint64_t global_shape[2] = {static_cast<uint64_t>(columns), static_cast<uint64_t>(rows)};
-    const uint64_t global_stride[1] = {static_cast<uint64_t>(columns) * sizeof(bf16)};
-    const uint32_t box_shape[2] = {TileColumns, TileRows};
-    const uint32_t element_stride[2] = {1, 1};
-
-    const CUresult result =
-        cuTensorMapEncodeTiled(&map, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, address, global_shape, global_stride, box_shape, element_stride,
-                               CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+    static_assert(TileColumns == 64);
+    const uint64_t global_shape[5] = {64, static_cast<uint64_t>(rows), static_cast<uint64_t>(columns / 64), 1, 1};
+    const uint64_t global_stride[4] = {static_cast<uint64_t>(columns) * sizeof(bf16), 64 * sizeof(bf16), 0, 0};
+    const uint32_t box_shape[5] = {64, TileRows, 1, 1, 1};
+    const uint32_t element_stride[5] = {1, 1, 1, 1, 1};
+    const CUresult result = cuTensorMapEncodeTiled(
+        &map, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 5, address, global_shape, global_stride, box_shape, element_stride,
+        CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
     if (result != CUDA_SUCCESS) {
         const char* name = nullptr;
         cuGetErrorName(result, &name);
@@ -76,6 +72,50 @@ CUtensorMap make_tensor_map(const bf16* pointer, int rows, int columns) {
 }
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+
+// Raw shared-memory barriers: one producer arrival, two consumer-group arrivals.
+// Wait parity identifies the generation of a stage as the queue wraps.
+__device__ __forceinline__ uint32_t barrier_address(const uint64_t* bar) {
+    return static_cast<uint32_t>(__cvta_generic_to_shared(bar));
+}
+
+__device__ __forceinline__ void barrier_init(uint64_t* bar, uint32_t count) {
+    asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;" :: "r"(barrier_address(bar)), "r"(count) : "memory");
+}
+
+__device__ __forceinline__ void barrier_arrive(uint64_t* bar) {
+    asm volatile("mbarrier.arrive.release.cta.shared::cta.b64 _, [%0];" :: "r"(barrier_address(bar)) : "memory");
+}
+
+__device__ __forceinline__ void barrier_expect_bytes(uint64_t* bar, uint32_t bytes) {
+    asm volatile("mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [%0], %1;"
+                 :: "r"(barrier_address(bar)), "r"(bytes) : "memory");
+}
+
+__device__ __forceinline__ void barrier_wait(uint64_t* bar, int phase) {
+    asm volatile(
+        "{ .reg .pred done;\n"
+        "wait_loop:\n"
+        "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64 done, [%0], %1;\n"
+        "@!done bra wait_loop;\n}"
+        :: "r"(barrier_address(bar)), "r"(phase) : "memory");
+}
+
+// The descriptor views K as 64-element chunks; no physical repacking is needed.
+__device__ __forceinline__ void tma_load(bf16* dst, const CUtensorMap* map, uint64_t* bar, int k, int row) {
+    const uint32_t destination = static_cast<uint32_t>(__cvta_generic_to_shared(dst));
+    asm volatile(
+        "cp.async.bulk.tensor.5d.shared::cluster.global.tile.mbarrier::complete_tx::bytes "
+        "[%0], [%1, {0, %3, %4, 0, 0}], [%2];"
+        :: "r"(destination), "l"(map), "r"(barrier_address(bar)), "r"(row), "r"(k / 64) : "memory");
+}
+
+__device__ __forceinline__ void advance_stage(int& stage, int& phase) {
+    if (++stage == STAGES) {
+        stage = 0;
+        phase ^= 1;
+    }
+}
 
 __device__ __forceinline__ uint64_t encode_descriptor(uint64_t value) {
     return (value & 0x3FFFFU) >> 4U;
@@ -206,15 +246,15 @@ __global__ __launch_bounds__(NUM_THREADS) void gemm_bf16_kernel(bf16* __restrict
     const unsigned int aligned_address = (storage_address + SMEM_ALIGNMENT - 1) & ~(SMEM_ALIGNMENT - 1);
     auto& shared = *reinterpret_cast<SharedStorage*>(__cvta_shared_to_generic(aligned_address));
 
-    // One producer arrival and 256 consumer arrivals complete each barrier phase.
-    __shared__ barrier full[STAGES];
-    __shared__ barrier empty[STAGES];
+    // Full waits for one producer and all TMA bytes; empty waits for two groups.
+    __shared__ __align__(8) uint64_t full[STAGES];
+    __shared__ __align__(8) uint64_t empty[STAGES];
     if (threadIdx.x == 0) {
         for (int stage = 0; stage < STAGES; ++stage) {
-            init(&full[stage], CONSUMER_THREADS + 1);
-            init(&empty[stage], CONSUMER_THREADS + 1);
+            barrier_init(&full[stage], 1);
+            barrier_init(&empty[stage], NUM_CONSUMERS);
         }
-        cde::fence_proxy_async_shared_cta();
+        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
     }
     __syncthreads();
 
@@ -229,25 +269,17 @@ __global__ __launch_bounds__(NUM_THREADS) void gemm_bf16_kernel(bf16* __restrict
     if (warpgroup_id == 0) {
         warpgroup_reg_dealloc<24>();
         if (warpgroup_thread == 0) {
-            int queue_index = 0;
+            int stage = 0, phase = 0;
             for (int tile_id = scheduler.next(); tile_id >= 0; tile_id = scheduler.next()) {
                 const int tile_m = tile_id / tiles_n;
                 const int tile_n = tile_id % tiles_n;
 
                 for (int tile_k = 0; tile_k < k_tiles; ++tile_k) {
-                    const int stage = queue_index % STAGES;
-                    ++queue_index;
-                    auto free_token = empty[stage].arrive();
-                    empty[stage].wait(std::move(free_token));
-
-                    cde::cp_async_bulk_tensor_2d_global_to_shared(
-                        shared.A[stage], &A_map, tile_k * BK, tile_m * BM, full[stage]);
-                    cde::cp_async_bulk_tensor_2d_global_to_shared(
-                        shared.B[stage], &B_map, tile_k * BK, tile_n * BN, full[stage]);
-
-                    auto ready_token = cuda::device::barrier_arrive_tx(
-                        full[stage], 1, sizeof(shared.A[stage]) + sizeof(shared.B[stage]));
-                    (void)ready_token;
+                    barrier_wait(&empty[stage], phase);
+                    barrier_expect_bytes(&full[stage], sizeof(shared.A[stage]) + sizeof(shared.B[stage]));
+                    tma_load(shared.A[stage], &A_map, &full[stage], tile_k * BK, tile_m * BM);
+                    tma_load(shared.B[stage], &B_map, &full[stage], tile_k * BK, tile_n * BN);
+                    advance_stage(stage, phase);
                 }
             }
         }
@@ -258,12 +290,11 @@ __global__ __launch_bounds__(NUM_THREADS) void gemm_bf16_kernel(bf16* __restrict
     warpgroup_reg_alloc<240>();
     const int consumer_id = warpgroup_id - 1;
     for (int stage = 0; stage < STAGES; ++stage) {
-        auto initial_token = empty[stage].arrive();
-        (void)initial_token;
+        if (warpgroup_thread == 0) barrier_arrive(&empty[stage]);
     }
 
     float accumulator[WGMMA_N / 16][8];
-    int queue_index = 0;
+    int stage = 0, phase = 0;
     static_assert(sizeof(accumulator) * CONSUMER_THREADS == BM * BN * sizeof(float));
     const int lane = warpgroup_thread & 31;
     const int warp = warpgroup_thread >> 5;
@@ -276,10 +307,7 @@ __global__ __launch_bounds__(NUM_THREADS) void gemm_bf16_kernel(bf16* __restrict
         memset(accumulator, 0, sizeof(accumulator));
 
         for (int tile_k = 0; tile_k < k_tiles; ++tile_k) {
-            const int stage = queue_index % STAGES;
-            ++queue_index;
-            auto ready_token = full[stage].arrive();
-            full[stage].wait(std::move(ready_token));
+            barrier_wait(&full[stage], phase);
 
             bf16* A_tile = shared.A[stage] + consumer_id * WGMMA_M * BK;
             warpgroup_fence();
@@ -291,8 +319,8 @@ __global__ __launch_bounds__(NUM_THREADS) void gemm_bf16_kernel(bf16* __restrict
             warpgroup_commit();
             warpgroup_wait();
 
-            auto free_token = empty[stage].arrive();
-            (void)free_token;
+            if (warpgroup_thread == 0) barrier_arrive(&empty[stage]);
+            advance_stage(stage, phase);
         }
 
         // Store this logical tile while the producer starts filling the next one.

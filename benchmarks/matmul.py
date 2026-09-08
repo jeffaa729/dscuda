@@ -19,7 +19,7 @@ def cases(args, family):
     try:
         for dtype in dtypes:
             if args.test and dtype == torch.bfloat16 and is_sm90:
-                # Matmul6: one wave, persistent reuse, and cross-tile queue wraps.
+                # Matmul7: one wave, persistent reuse, and cross-tile queue wraps.
                 shapes = ((2048, 2048, 64), (2048, 4096, 192),
                           (4096, 2048, 256))
             elif args.test:
