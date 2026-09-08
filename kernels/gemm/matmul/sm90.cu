@@ -28,7 +28,7 @@ constexpr int WGMMA_K = 16; // Number of K elements consumed by one WGMMA instru
 // Threads 0-127 form the aligned WGMMA consumer warpgroup.
 // Threads 128-255 form the producer warpgroup; only thread 128 issues TMA.
 constexpr int CONSUMER_THREADS = 128;
-constexpr int PRODUCER_THREADS = 64;
+constexpr int PRODUCER_THREADS = 128;
 constexpr int NUM_THREADS = CONSUMER_THREADS + PRODUCER_THREADS;
 // Matmul4 uses a five-entry circular buffer to hide TMA latency.
 constexpr int STAGES = 2;
