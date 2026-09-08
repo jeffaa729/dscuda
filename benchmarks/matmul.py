@@ -25,17 +25,18 @@ def cases(args, family):
 
     try:
         for dtype in dtypes:
-            shapes = (
-                (128, 256, 64), (640, 128, 128), (1152, 128, 64),
-                (256, 512, 192)
-            ) if args.test else tuple(
-                (n, n, n) for n in (
-                    (2048,) if args.suite == "quick" else (2048, 4096, 8192)))
-            if args.test and dtype == torch.float32:
-                shapes += ((17, 33, 65),)
-            if args.test and dtype == torch.bfloat16:
-                # Five Hopper stages: first wrap, partial rings, and repeated reuse.
-                shapes += ((128, 256, 256), (128, 128, 320), (128, 256, 384), (256, 512, 768))
+            if args.test and dtype == torch.bfloat16 and is_sm90:
+                # Matmul5: initial fill, first ring wrap, and repeated stage reuse.
+                shapes = ((128, 256, 64), (256, 512, 128), (384, 256, 192),
+                          (128, 256, 256), (256, 512, 384), (512, 768, 768))
+            elif args.test:
+                shapes = ((128, 256, 64), (640, 128, 128), (1152, 128, 64),
+                          (256, 512, 192))
+                if dtype == torch.float32:
+                    shapes += ((17, 33, 65),)
+            else:
+                sizes = (2048,) if args.suite == "quick" else (2048, 4096, 8192)
+                shapes = tuple((n, n, n) for n in sizes)
 
             for m, n, k in shapes:
                 left = torch.randn((m, k), device="cuda", dtype=dtype) * .1

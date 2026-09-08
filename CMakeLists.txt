@@ -33,7 +33,7 @@ target_include_directories(dscuda_kernels PUBLIC include)
 set_source_files_properties(kernels/gemm/matmul/sm90.cu PROPERTIES COMPILE_OPTIONS "-lineinfo")
 target_link_libraries(dscuda_kernels PUBLIC CUDA::cudart CUDA::cuda_driver)
 set_target_properties(dscuda_kernels PROPERTIES
-    CUDA_SEPARABLE_COMPILATION ON
+    CUDA_SEPARABLE_COMPILATION OFF
     POSITION_INDEPENDENT_CODE ON
 )
 
