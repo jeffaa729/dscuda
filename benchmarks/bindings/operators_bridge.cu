@@ -1,7 +1,6 @@
 // Exposes GEMM to Python-owned CUDA buffers without a PyTorch extension build.
 // cuBLAS uses the same stream and operand/output precision as the custom GEMM.
 #include "matmul.h"
-#include "../../kernels/gemm/matmul/common.cuh"
 #include "grouped_gemm.h"
 
 #include <cublas_v2.h>
@@ -47,7 +46,7 @@ extern "C" int dscuda_gemm(
     void* output, const void* left, const void* right,
     int M, int N, int K, int bf16, int reference, cudaStream_t stream) {
     try {
-        if (reference == 0) {
+        if (!reference) {
             if (bf16) {
                 dscuda::gemm_bf16_cuda(
                     static_cast<__nv_bfloat16*>(output),
@@ -61,14 +60,7 @@ extern "C" int dscuda_gemm(
                     static_cast<const float*>(right),
                     M, N, K, stream);
             }
-        } else if (reference == 2) {
-            if (!bf16) throw std::invalid_argument("fast.cu Kernel 12 supports BF16 only.");
-            dscuda::gemm_bf16_fast_cu_kernel12_cuda(
-                static_cast<__nv_bfloat16*>(output),
-                static_cast<const __nv_bfloat16*>(left),
-                static_cast<const __nv_bfloat16*>(right),
-                M, N, K, stream);
-        } else if (reference == 1) {
+        } else {
             cublas_check(cublasSetStream(handle, stream));
             cublas_check(cublasSetMathMode(
                 handle, bf16 ? CUBLAS_TENSOR_OP_MATH : CUBLAS_PEDANTIC_MATH));
@@ -85,8 +77,6 @@ extern "C" int dscuda_gemm(
                 &beta, output, type, M,
                 bf16 ? CUBLAS_COMPUTE_32F : CUBLAS_COMPUTE_32F_PEDANTIC,
                 bf16 ? CUBLAS_GEMM_DEFAULT_TENSOR_OP : CUBLAS_GEMM_DEFAULT));
-        } else {
-            throw std::invalid_argument("Unknown GEMM backend.");
         }
         return 0;
     } catch (const std::exception& error) {

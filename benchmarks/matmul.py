@@ -1,4 +1,4 @@
-"""Compare the custom GEMM with cuBLAS and the isolated fast.cu Kernel 12 reference."""
+"""K-contiguous A/B and column-major C, matching fast.cu and cuBLAS TN."""
 
 from common import I, P, Operation, bind, checked, library, pointers, stream, torch
 
@@ -8,12 +8,8 @@ def cases(args, family):
     if args.suite == "h100" and not is_sm90:
         raise ValueError("The H100 GEMM suite requires an SM90 GPU.")
     reference = args.reference or "cublas"
-    if reference not in ("cublas", "fastcu", "both"):
-        raise ValueError("GEMM reference: cublas, fastcu, or both")
-    use_cublas = reference in ("cublas", "both")
-    use_fastcu = reference in ("fastcu", "both")
-    if use_fastcu and not is_sm90:
-        raise ValueError("fast.cu Kernel 12 requires an SM90 GPU.")
+    if reference != "cublas":
+        raise ValueError("GEMM reference: cublas")
 
     lib = library("operator")
     checked(lib, "operator", bind(lib, "dscuda_cublas_init", [])())
@@ -23,7 +19,7 @@ def cases(args, family):
     try:
         for dtype in dtypes:
             if args.test and dtype == torch.bfloat16 and is_sm90:
-                # Exercise one wave, persistent reuse, and cross-tile queue wraps.
+                # Matmul7: one wave, persistent reuse, and cross-tile queue wraps.
                 shapes = ((2048, 2048, 64), (2048, 4096, 192),
                           (4096, 2048, 256))
             elif args.test:
@@ -54,12 +50,9 @@ def cases(args, family):
                 functions = {
                     "custom": lambda output=custom_output: native(output, 0)
                 }
-                if use_cublas:
-                    cublas_output = torch.empty_like(custom_output)
-                    functions["cuBLAS"] = lambda output=cublas_output: native(output, 1)
-                if use_fastcu:
-                    fastcu_output = torch.empty_like(custom_output)
-                    functions["fast.cu K12"] = lambda output=fastcu_output: native(output, 2)
+                cublas_output = torch.empty_like(custom_output)
+                functions["cuBLAS"] = (
+                    lambda output=cublas_output: native(output, 1))
 
                 tolerance = 2e-2 if dtype == torch.bfloat16 else 2e-4
                 yield Operation(
