@@ -7,14 +7,15 @@
 #include <cstdint>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace dscuda {
 namespace {
 
 using bf16 = __nv_bfloat16;
 
-// Kernel 10 adds a shared-memory epilogue and asynchronous TMA output stores
-// to the Kernel 9 compute pipeline while retaining the Kernel 7 scheduler.
+// Kernel 11 keeps the Kernel 10 TMA epilogue and assigns persistent CTAs
+// with a precomputed Hilbert curve to improve concurrent A/B locality in L2.
 constexpr int BM = 128;
 constexpr int BN = 256;
 constexpr int BK = 64;
@@ -34,10 +35,7 @@ constexpr int STAGES = 3;
 constexpr unsigned int SMEM_ALIGNMENT = 1024;
 
 constexpr int PERSISTENT_BLOCKS = 128;
-constexpr int GROUP_M = 16;
-constexpr int GROUP_N = 8;
-
-static_assert(PERSISTENT_BLOCKS == GROUP_M * GROUP_N);
+constexpr int MAX_TILES_PER_BLOCK = 128;
 static_assert(PRODUCER_THREADS == 128 && CONSUMER_THREADS == 256 && NUM_THREADS == 384);
 static_assert(BM / NUM_CONSUMERS == WGMMA_M);
 static_assert(BK == 64 && BN == 256 && STAGES == 3);
@@ -49,6 +47,7 @@ struct SharedStorage {
     alignas(SMEM_ALIGNMENT) bf16 A[STAGES][BM * BK];
     alignas(SMEM_ALIGNMENT) bf16 B[STAGES][BN * BK];
     alignas(SMEM_ALIGNMENT) bf16 C[BM * BN];
+    int schedule[MAX_TILES_PER_BLOCK];
 };
 constexpr size_t SMEM_BYTES = sizeof(SharedStorage) + SMEM_ALIGNMENT - 1;
 
@@ -71,6 +70,73 @@ CUtensorMap make_tensor_map(const bf16* pointer, int rows, int columns) {
         throw std::runtime_error(std::string("cuTensorMapEncodeTiled failed: ") + (name ? name : "unknown driver error"));
     }
     return map;
+}
+
+// Convert one Hilbert-curve distance into a two-dimensional tile coordinate.
+void hilbert_rotate(int scale, int& x, int& y, int rotate_x, int rotate_y) {
+    if (rotate_y == 0) {
+        if (rotate_x == 1) {
+            x = scale - 1 - x;
+            y = scale - 1 - y;
+        }
+        const int temporary = x;
+        x = y;
+        y = temporary;
+    }
+}
+
+void hilbert_coordinate(int dimension, int distance, int& x, int& y) {
+    x = 0;
+    y = 0;
+    for (int scale = 1; scale < dimension; scale <<= 1) {
+        const int rotate_x = (distance >> 1) & 1;
+        const int rotate_y = (distance ^ rotate_x) & 1;
+        hilbert_rotate(scale, x, y, rotate_x, rotate_y);
+        x += scale * rotate_x;
+        y += scale * rotate_y;
+        distance >>= 2;
+    }
+}
+
+std::vector<int> make_hilbert_schedule(int tiles_m, int tiles_n) {
+    std::vector<int> schedule(PERSISTENT_BLOCKS * MAX_TILES_PER_BLOCK, -1);
+    int dimension = 1;
+    const int longest_side = tiles_m > tiles_n ? tiles_m : tiles_n;
+    while (dimension < longest_side) dimension <<= 1;
+
+    int tile = 0;
+    for (int distance = 0; distance < dimension * dimension; ++distance) {
+        int tile_m, tile_n;
+        hilbert_coordinate(dimension, distance, tile_m, tile_n);
+        if (tile_m >= tiles_m || tile_n >= tiles_n) continue;
+
+        const int block = tile % PERSISTENT_BLOCKS;
+        const int iteration = tile / PERSISTENT_BLOCKS;
+        if (iteration >= MAX_TILES_PER_BLOCK) {
+            throw std::invalid_argument("SM90 Hilbert schedule exceeds its per-block capacity.");
+        }
+        schedule[block * MAX_TILES_PER_BLOCK + iteration] = tile_m * tiles_n + tile_n;
+        ++tile;
+    }
+    return schedule;
+}
+
+int* device_schedule = nullptr;
+int scheduled_tiles_m = 0;
+int scheduled_tiles_n = 0;
+
+void prepare_hilbert_schedule(int M, int N) {
+    const int tiles_m = M / BM;
+    const int tiles_n = N / BN;
+    if (tiles_m == scheduled_tiles_m && tiles_n == scheduled_tiles_n) return;
+
+    const std::vector<int> schedule = make_hilbert_schedule(tiles_m, tiles_n);
+    if (device_schedule == nullptr) {
+        CUDA_CHECK(cudaMalloc(&device_schedule, schedule.size() * sizeof(int)));
+    }
+    CUDA_CHECK(cudaMemcpy(device_schedule, schedule.data(), schedule.size() * sizeof(int), cudaMemcpyHostToDevice));
+    scheduled_tiles_m = tiles_m;
+    scheduled_tiles_n = tiles_n;
 }
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
@@ -215,42 +281,22 @@ __device__ __forceinline__ void wgmma_m64n256k16(float (&accumulator)[16][8], bf
             "n"(int32_t(ScaleB)), "n"(int32_t(TransA)), "n"(int32_t(TransB)));
 }
 
-// custom scheduler that hold a iteration counter, each block has to request multiple tiles
+// Every CTA walks one column of the host-generated, locality-preserving schedule.
 struct TileScheduler {
     int iteration;
-    int tiles_m;
-    int tiles_n;
+    const int* schedule;
 
-    __device__ TileScheduler(int M, int N) : iteration(0), tiles_m(M / BM), tiles_n(N / BN) {}
+    __device__ explicit TileScheduler(const int* entries) : iteration(0), schedule(entries) {}
 
     __device__ int next() {
-        const int linear = iteration * PERSISTENT_BLOCKS + blockIdx.x;
-        ++iteration;
-
-        if (linear >= tiles_m * tiles_n) {
-            return -1;
-        }
-
-        const int group_size = GROUP_M * GROUP_N;
-        const int group = linear / group_size;
-        const int position = linear % group_size;
-
-        const int groups_n = tiles_n / GROUP_N;
-        const int group_m = group / groups_n;
-        const int group_n = group % groups_n;
-
-        const int local_m = position / GROUP_N;
-        const int local_n = position % GROUP_N;
-
-        const int tile_m = group_m * GROUP_M + local_m;
-        const int tile_n = group_n * GROUP_N + local_n;
-        return tile_m * tiles_n + tile_n;
+        if (iteration == MAX_TILES_PER_BLOCK) return -1;
+        return schedule[iteration++];
     }
 };
 
 #endif
 
-__global__ __launch_bounds__(NUM_THREADS) void gemm_bf16_kernel(const __grid_constant__ CUtensorMap C_map, const __grid_constant__ CUtensorMap A_map, const __grid_constant__ CUtensorMap B_map, int M, int N, int K) {
+__global__ __launch_bounds__(NUM_THREADS) void gemm_bf16_kernel(const __grid_constant__ CUtensorMap C_map, const __grid_constant__ CUtensorMap A_map, const __grid_constant__ CUtensorMap B_map, const int* global_schedule, int M, int N, int K) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
     extern __shared__ __align__(16) unsigned char storage[];
     // Align the actual shared address: static barriers can shift the dynamic base.
@@ -269,10 +315,13 @@ __global__ __launch_bounds__(NUM_THREADS) void gemm_bf16_kernel(const __grid_con
         }
         asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
     }
+    if (threadIdx.x < MAX_TILES_PER_BLOCK) {
+        shared.schedule[threadIdx.x] = global_schedule[blockIdx.x * MAX_TILES_PER_BLOCK + threadIdx.x];
+    }
     __syncthreads();
 
-    // Every warpgroup follows the same logical-tile sequence independently.
-    TileScheduler scheduler(M, N);
+    // Every warpgroup follows the same precomputed Hilbert sequence independently.
+    TileScheduler scheduler(shared.schedule);
     const int tiles_n = N / BN;
     const int k_tiles = K / BK;
     const int warpgroup_id = threadIdx.x / 128;
@@ -381,15 +430,17 @@ __global__ __launch_bounds__(NUM_THREADS) void gemm_bf16_kernel(const __grid_con
 }  // namespace
 
 void gemm_bf16_sm90_cuda(bf16* C, const bf16* A, const bf16* B, int M, int N, int K, cudaStream_t stream) {
-    if (M <= 0 || N <= 0 || K <= 0 || M % (BM * GROUP_M) != 0 || N % (BN * GROUP_N) != 0 || K % BK != 0) {
+    if (M <= 0 || N <= 0 || K <= 0 || M % BM != 0 || N % BN != 0 || K % BK != 0) {
         throw std::invalid_argument(
-            "SM90 persistent BF16 GEMM requires M and N divisible by 2048 and K divisible by 64.");
+            "SM90 persistent BF16 GEMM requires M divisible by 128, N by 256 and K by 64.");
     }
+    prepare_hilbert_schedule(M, N);
     const CUtensorMap A_map = make_tensor_map<BM, BK>(A, M, K);
     const CUtensorMap B_map = make_tensor_map<BN, BK>(B, N, K);
     const CUtensorMap C_map = make_tensor_map<BN, BM, false>(C, N, M);
     CUDA_CHECK(cudaFuncSetAttribute(gemm_bf16_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_BYTES));
-    gemm_bf16_kernel<<<PERSISTENT_BLOCKS, NUM_THREADS, SMEM_BYTES, stream>>>(C_map, A_map, B_map, M, N, K);
+    gemm_bf16_kernel<<<PERSISTENT_BLOCKS, NUM_THREADS, SMEM_BYTES, stream>>>(
+        C_map, A_map, B_map, device_schedule, M, N, K);
     CUDA_CHECK(cudaGetLastError());
 }
 
