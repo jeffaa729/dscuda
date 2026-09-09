@@ -92,7 +92,7 @@ __device__ __forceinline__ void barrier_arrive_cluster(uint64_t* bar, uint32_t r
     asm volatile(
         "{ .reg .b32 remote;\n"
         "mapa.shared::cluster.u32 remote, %0, %1;\n"
-        "mbarrier.arrive.release.cluster.shared::cluster.b64 _, [remote];\n}"
+        "mbarrier.arrive.shared::cluster.b64 _, [remote], 1;\n}"
         :: "r"(barrier_address(bar)), "r"(rank) : "memory");
 }
 
@@ -101,7 +101,7 @@ __device__ __forceinline__ void cluster_sync() {
 }
 
 __device__ __forceinline__ void barrier_expect_bytes(uint64_t* bar, uint32_t bytes) {
-    asm volatile("mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [%0], %1;"
+    asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;"
                  :: "r"(barrier_address(bar)), "r"(bytes) : "memory");
 }
 
@@ -109,8 +109,10 @@ __device__ __forceinline__ void barrier_wait(uint64_t* bar, int phase) {
     asm volatile(
         "{ .reg .pred done;\n"
         "wait_loop:\n"
-        "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 done, [%0], %1;\n"
-        "@!done bra wait_loop;\n}"
+        "mbarrier.try_wait.parity.shared::cta.b64 done, [%0], %1;\n"
+        "@done bra.uni wait_done;\n"
+        "bra.uni wait_loop;\n"
+        "wait_done:\n}"
         :: "r"(barrier_address(bar)), "r"(phase) : "memory");
 }
 
@@ -131,13 +133,6 @@ __device__ __forceinline__ void tma_load_multicast(bf16* dst, const CUtensorMap*
         "cp.async.bulk.tensor.3d.shared::cluster.global.tile.mbarrier::complete_tx::bytes.multicast::cluster "
         "[%0], [%1, {0, %3, %4}], [%2], %5;"
         :: "r"(destination), "l"(map), "r"(barrier_address(bar)), "r"(row), "r"(k / 64), "h"(mask) : "memory");
-}
-
-__device__ __forceinline__ void advance_stage(int& stage, int& phase) {
-    if (++stage == STAGES) {
-        stage = 0;
-        phase ^= 1;
-    }
 }
 
 __device__ __forceinline__ uint64_t encode_descriptor(uint64_t value) {
@@ -227,34 +222,23 @@ __device__ __forceinline__ void wgmma_m64n256k16(float (&accumulator)[16][8], bf
 
 // Schedule 256x256 cluster tiles; each CTA owns a separate 128-row half.
 struct TileScheduler {
-    int iteration;
+    int iteration = 0;
+    int cluster_id;
     int tiles_m;
     int tiles_n;
 
-    __device__ TileScheduler(int M, int N) : iteration(0), tiles_m(M / (BM * CLUSTER_M)), tiles_n(N / BN) {}
+    __device__ __forceinline__ TileScheduler(int M, int N, int id)
+        : cluster_id(id), tiles_m(M / (BM * CLUSTER_M)), tiles_n(N / BN) {}
 
-    __device__ int next() {
-        const int linear = iteration * (PERSISTENT_BLOCKS / CLUSTER_SIZE) + blockIdx.x / CLUSTER_SIZE;
+    __device__ __forceinline__ bool next(int& tile_m, int& tile_n) {
+        const int linear = iteration * (PERSISTENT_BLOCKS / CLUSTER_SIZE) + cluster_id;
+        if (linear >= tiles_m * tiles_n) return false;
+        const int group = linear / ((GROUP_M / CLUSTER_M) * GROUP_N);
+        const int position = linear % ((GROUP_M / CLUSTER_M) * GROUP_N);
+        tile_m = (group / (tiles_n / GROUP_N)) * (GROUP_M / CLUSTER_M) + position / GROUP_N;
+        tile_n = (group % (tiles_n / GROUP_N)) * GROUP_N + position % GROUP_N;
         ++iteration;
-
-        if (linear >= tiles_m * tiles_n) {
-            return -1;
-        }
-
-        const int group_size = (GROUP_M / CLUSTER_M) * GROUP_N;
-        const int group = linear / group_size;
-        const int position = linear % group_size;
-
-        const int groups_n = tiles_n / GROUP_N;
-        const int group_m = group / groups_n;
-        const int group_n = group % groups_n;
-
-        const int local_m = position / GROUP_N;
-        const int local_n = position % GROUP_N;
-
-        const int tile_m = group_m * (GROUP_M / CLUSTER_M) + local_m;
-        const int tile_n = group_n * GROUP_N + local_n;
-        return tile_m * tiles_n + tile_n;
+        return true;
     }
 };
 
@@ -283,8 +267,9 @@ __global__ __launch_bounds__(NUM_THREADS) __cluster_dims__(CLUSTER_SIZE, 1, 1) v
     cluster_sync();
 
     // Every warpgroup follows the same logical-tile sequence independently.
-    TileScheduler scheduler(M, N);
-    const int tiles_n = N / BN;
+    uint32_t cluster_id;
+    asm volatile("mov.u32 %0, %clusterid.x;" : "=r"(cluster_id));
+    TileScheduler scheduler(M, N, cluster_id);
     uint32_t cluster_rank;
     asm volatile("mov.u32 %0, %cluster_ctarank;" : "=r"(cluster_rank));
     const int k_tiles = K / BK;
@@ -296,18 +281,18 @@ __global__ __launch_bounds__(NUM_THREADS) __cluster_dims__(CLUSTER_SIZE, 1, 1) v
         warpgroup_reg_dealloc<24>();
         if (warpgroup_thread == 0) {
             int stage = 0, phase = 0;
-            for (int tile_id = scheduler.next(); tile_id >= 0; tile_id = scheduler.next()) {
-                const int tile_m = (tile_id / tiles_n) * CLUSTER_M + cluster_rank;
-                const int tile_n = tile_id % tiles_n;
+            int tile_m, tile_n;
+            while (scheduler.next(tile_m, tile_n)) {
+                tile_m = tile_m * CLUSTER_M + cluster_rank;
 
-                for (int tile_k = 0; tile_k < k_tiles; ++tile_k) {
+                for (int tile_k = 0; tile_k < k_tiles; ++tile_k, ++stage) {
+                if (stage == STAGES) { stage = 0; phase ^= 1; }
                     barrier_wait(&empty[stage], phase);
                     barrier_expect_bytes(&full[stage], sizeof(shared.A[stage]) + sizeof(shared.B[stage]));
                     tma_load(shared.A[stage], &A_map, &full[stage], tile_k * BK, tile_m * BM);
                     if (cluster_rank == 0) {
                         tma_load_multicast(shared.B[stage], &B_map, &full[stage], tile_k * BK, tile_n * BN);
                     }
-                    advance_stage(stage, phase);
                 }
             }
         }
@@ -326,13 +311,14 @@ __global__ __launch_bounds__(NUM_THREADS) __cluster_dims__(CLUSTER_SIZE, 1, 1) v
         const int warp = warpgroup_thread >> 5;
         const int row = consumer_id * WGMMA_M + warp * 16 + lane / 4;
 
-        for (int tile_id = scheduler.next(); tile_id >= 0; tile_id = scheduler.next()) {
-            const int tile_m = (tile_id / tiles_n) * CLUSTER_M + cluster_rank;
-            const int tile_n = tile_id % tiles_n;
+        int tile_m, tile_n;
+        while (scheduler.next(tile_m, tile_n)) {
+            tile_m = tile_m * CLUSTER_M + cluster_rank;
 
             memset(accumulator, 0, sizeof(accumulator));
 
-            for (int tile_k = 0; tile_k < k_tiles; ++tile_k) {
+            for (int tile_k = 0; tile_k < k_tiles; ++tile_k, ++stage) {
+                    if (stage == STAGES) { stage = 0; phase ^= 1; }
                 barrier_wait(&full[stage], phase);
 
                 bf16* A_tile = shared.A[stage] + consumer_id * WGMMA_M * BK;
@@ -346,7 +332,6 @@ __global__ __launch_bounds__(NUM_THREADS) __cluster_dims__(CLUSTER_SIZE, 1, 1) v
                 warpgroup_wait();
 
                 if (warpgroup_thread < CLUSTER_SIZE) barrier_arrive_cluster(&empty[stage], warpgroup_thread);
-                advance_stage(stage, phase);
             }
 
             // Store this logical tile while the producer starts filling the next one.
