@@ -69,12 +69,12 @@ extern "C" int dscuda_gemm(
             const cudaDataType_t type = bf16 ? CUDA_R_16BF : CUDA_R_32F;
             cublas_check(cublasGemmEx(
                 handle,
+                CUBLAS_OP_T,
                 CUBLAS_OP_N,
-                CUBLAS_OP_N,
-                N, M, K, &alpha,
-                right, type, N,
+                M, N, K, &alpha,
                 left, type, K,
-                &beta, output, type, N,
+                right, type, K,
+                &beta, output, type, M,
                 bf16 ? CUBLAS_COMPUTE_32F : CUBLAS_COMPUTE_32F_PEDANTIC,
                 bf16 ? CUBLAS_GEMM_DEFAULT_TENSOR_OP : CUBLAS_GEMM_DEFAULT));
         }
@@ -97,17 +97,20 @@ extern "C" int dscuda_grouped_gemm(
                 output, input, weights, device_offsets,
                 rows, experts, N, K, stream);
         } else {
+            cublas_check(cublasSetStream(handle, stream));
+            cublas_check(cublasSetMathMode(handle, CUBLAS_TENSOR_OP_MATH));
             for (int e = 0; e < experts; ++e) {
                 const int begin = host_offsets[e];
                 const int count = host_offsets[e + 1] - begin;
                 if (!count) continue;
                 const auto* x = input + static_cast<size_t>(begin) * K;
                 const auto* w = weights + static_cast<size_t>(e) * K * N;
-                if (dscuda_gemm(
-                        output + static_cast<size_t>(begin) * N,
-                        x, w, count, N, K, 1, 1, stream)) {
-                    return 1;
-                }
+                const float alpha = 1.0F, beta = 0.0F;
+                cublas_check(cublasGemmEx(
+                    handle, CUBLAS_OP_N, CUBLAS_OP_N, N, count, K, &alpha,
+                    w, CUDA_R_16BF, N, x, CUDA_R_16BF, K,
+                    &beta, output + static_cast<size_t>(begin) * N, CUDA_R_16BF, N,
+                    CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
             }
         }
         return 0;

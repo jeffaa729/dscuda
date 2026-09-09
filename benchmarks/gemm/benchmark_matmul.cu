@@ -1,4 +1,4 @@
-// Runs row-major NN FP32/BF16 GEMMs and matching cuBLAS workloads for Nsight Compute.
+// Profiles the fast.cu layout with matching cuBLAS.
 
 #include "cuda_common.h"
 #include "matmul.h"
@@ -67,13 +67,13 @@ int main(int argc, char** argv) {
                 const float alpha = 1.0F;
                 const float beta = 0.0F;
                 const cudaDataType_t type = bf16 ? CUDA_R_16BF : CUDA_R_32F;
-                // Row-major C = A * B becomes column-major C^T = B^T * A^T.
+                // GEMM uses K-contiguous A/B and column-major C, as in fast.cu.
                 cublas_check(cublasGemmEx(
-                    handle, CUBLAS_OP_N, CUBLAS_OP_N,
-                    N, M, K, &alpha,
-                    right, type, N,
+                    handle, CUBLAS_OP_T, CUBLAS_OP_N,
+                    M, N, K, &alpha,
                     left, type, K,
-                    &beta, output, type, N,
+                    right, type, K,
+                    &beta, output, type, M,
                     bf16 ? CUBLAS_COMPUTE_32F : CUBLAS_COMPUTE_32F_PEDANTIC,
                     bf16 ? CUBLAS_GEMM_DEFAULT_TENSOR_OP : CUBLAS_GEMM_DEFAULT));
             } else if (bf16) {

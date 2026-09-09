@@ -1,4 +1,4 @@
-"""Row-major NN GEMM with a cuBLAS reference."""
+"""K-contiguous A/B and column-major C, matching fast.cu and cuBLAS TN."""
 
 from common import I, P, Operation, bind, checked, library, pointers, stream, torch
 
@@ -19,9 +19,9 @@ def cases(args, family):
     try:
         for dtype in dtypes:
             if args.test and dtype == torch.bfloat16 and is_sm90:
-                # Matmul5: initial fill, first ring wrap, and repeated stage reuse.
-                shapes = ((128, 256, 64), (256, 512, 128), (384, 256, 192),
-                          (128, 256, 256), (256, 512, 384), (512, 768, 768))
+                # Matmul7: one wave, persistent reuse, and cross-tile queue wraps.
+                shapes = ((2048, 2048, 64), (2048, 4096, 192),
+                          (4096, 2048, 256))
             elif args.test:
                 shapes = ((128, 256, 64), (640, 128, 128), (1152, 128, 64),
                           (256, 512, 192))
@@ -33,10 +33,12 @@ def cases(args, family):
 
             for m, n, k in shapes:
                 left = torch.randn((m, k), device="cuda", dtype=dtype) * .1
-                right = torch.randn((k, n), device="cuda", dtype=dtype) * .1
+                right = torch.randn((n, k), device="cuda", dtype=dtype) * .1
+                right = right.t()  # Logical B[K,N], physical [N,K].
                 expected = (left.float() @ right.float()).to(dtype)
                 # An empty/incomplete SM90 kernel must fail correctness before timing.
-                custom_output = torch.full((m, n), float("nan"), device="cuda", dtype=dtype)
+                custom_output = torch.full((n, m), float("nan"), device="cuda", dtype=dtype)
+                custom_output = custom_output.t()  # Column-major C[M,N].
 
                 def native(output, use_reference):
                     checked(lib, "operator", gemm(
@@ -56,6 +58,6 @@ def cases(args, family):
                 yield Operation(
                     f"M={m},N={n},K={k}",
                     "bf16" if dtype == torch.bfloat16 else "fp32",
-                    "NN", functions, (expected,), tolerance, tolerance)
+                    "TN", functions, (expected,), tolerance, tolerance)
     finally:
         bind(lib, "dscuda_cublas_destroy", [], None)()
