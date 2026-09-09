@@ -13,7 +13,8 @@ namespace {
 
 using bf16 = __nv_bfloat16;
 
-// Kernel 9 optimizations on the Kernel 7 persistent schedule (no multicast).
+// Kernel 10 adds a shared-memory epilogue and asynchronous TMA output stores
+// to the Kernel 9 compute pipeline while retaining the Kernel 7 scheduler.
 constexpr int BM = 128;
 constexpr int BN = 256;
 constexpr int BK = 64;
@@ -47,21 +48,23 @@ static_assert(BK % WGMMA_K == 0);
 struct SharedStorage {
     alignas(SMEM_ALIGNMENT) bf16 A[STAGES][BM * BK];
     alignas(SMEM_ALIGNMENT) bf16 B[STAGES][BN * BK];
+    alignas(SMEM_ALIGNMENT) bf16 C[BM * BN];
 };
 constexpr size_t SMEM_BYTES = sizeof(SharedStorage) + SMEM_ALIGNMENT - 1;
 
-template <int TileRows, int TileColumns>
+template <int TileRows, int TileColumns, bool Swizzle = true>
 CUtensorMap make_tensor_map(const bf16* pointer, int rows, int columns) {
     CUtensorMap map;
     void* address = const_cast<bf16*>(pointer);
-    static_assert(TileColumns == 64);
+    static_assert(TileColumns >= 64 && TileColumns % 64 == 0);
     const uint64_t global_shape[5] = {64, static_cast<uint64_t>(rows), static_cast<uint64_t>(columns / 64), 1, 1};
     const uint64_t global_stride[4] = {static_cast<uint64_t>(columns) * sizeof(bf16), 64 * sizeof(bf16), 0, 0};
-    const uint32_t box_shape[5] = {64, TileRows, 1, 1, 1};
+    const uint32_t box_shape[5] = {64, TileRows, TileColumns / 64, 1, 1};
     const uint32_t element_stride[5] = {1, 1, 1, 1, 1};
     const CUresult result = cuTensorMapEncodeTiled(
         &map, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 5, address, global_shape, global_stride, box_shape, element_stride,
-        CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+        CU_TENSOR_MAP_INTERLEAVE_NONE, Swizzle ? CU_TENSOR_MAP_SWIZZLE_128B : CU_TENSOR_MAP_SWIZZLE_NONE,
+        CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
     if (result != CUDA_SUCCESS) {
         const char* name = nullptr;
         cuGetErrorName(result, &name);
@@ -107,6 +110,17 @@ __device__ __forceinline__ void tma_load(bf16* dst, const CUtensorMap* map, uint
         "cp.async.bulk.tensor.5d.shared::cluster.global.tile.mbarrier::complete_tx::bytes "
         "[%0], [%1, {0, %3, %4, 0, 0}], [%2];"
         :: "r"(destination), "l"(map), "r"(barrier_address(bar)), "r"(row), "r"(k / 64) : "memory");
+}
+
+// TMA reads the complete C tile from shared memory and writes it asynchronously.
+// C uses an unswizzled [64, BN, BM / 64] tensor-map layout: one 64-row band
+// from each consumer warpgroup is contiguous in shared memory.
+__device__ __forceinline__ void tma_store(const CUtensorMap* map, bf16* src, int row, int column) {
+    const uint32_t source = static_cast<uint32_t>(__cvta_generic_to_shared(src));
+    asm volatile(
+        "cp.async.bulk.tensor.5d.global.shared::cta.tile.bulk_group "
+        "[%0, {0, %2, %3, 0, 0}], [%1];"
+        :: "l"(map), "r"(source), "r"(row), "r"(column / 64) : "memory");
 }
 
 __device__ __forceinline__ void advance_stage(int& stage, int& phase) {
@@ -236,7 +250,7 @@ struct TileScheduler {
 
 #endif
 
-__global__ __launch_bounds__(NUM_THREADS) void gemm_bf16_kernel(bf16* __restrict__ C, const __grid_constant__ CUtensorMap A_map, const __grid_constant__ CUtensorMap B_map, int M, int N, int K) {
+__global__ __launch_bounds__(NUM_THREADS) void gemm_bf16_kernel(const __grid_constant__ CUtensorMap C_map, const __grid_constant__ CUtensorMap A_map, const __grid_constant__ CUtensorMap B_map, int M, int N, int K) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
     extern __shared__ __align__(16) unsigned char storage[];
     // Align the actual shared address: static barriers can shift the dynamic base.
@@ -297,7 +311,7 @@ __global__ __launch_bounds__(NUM_THREADS) void gemm_bf16_kernel(bf16* __restrict
     static_assert(sizeof(accumulator) * CONSUMER_THREADS == BM * BN * sizeof(float));
     const int lane = warpgroup_thread & 31;
     const int warp = warpgroup_thread >> 5;
-    const int row = consumer_id * WGMMA_M + warp * 16 + lane / 4;
+    const int row = warp * 16 + lane / 4;
 
     for (int tile_id = scheduler.next(); tile_id >= 0; tile_id = scheduler.next()) {
         const int tile_m = tile_id / tiles_n;
@@ -337,22 +351,28 @@ __global__ __launch_bounds__(NUM_THREADS) void gemm_bf16_kernel(bf16* __restrict
             advance_stage(stage, phase);
         }
 
-        // Store this logical tile while the producer starts filling the next one.
-        bf16* tile_C = C + tile_m * BM + tile_n * BN * M;
+        // Wait before reusing C shared memory from the previous asynchronous store.
+        asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");
+        bf16* consumer_C = shared.C + consumer_id * WGMMA_M * BN;
 #pragma unroll
         for (int group = 0; group < WGMMA_N / 16; ++group) {
             const int column = group * 16 + 2 * (lane & 3);
-// Kernel 9: write-through stores, paired by column in fast.cu's order.
-#define STORE(Row, Column, Value) __stwt(&tile_C[(Column) * M + (Row)], __float2bfloat16(Value))
-            STORE(row + 8, column, accumulator[group][2]);
+// Kernel 10: stage the WGMMA register layout in shared memory for one TMA store.
+#define STORE(Row, Column, Value) consumer_C[(Column) * WGMMA_M + (Row)] = __float2bfloat16(Value)
             STORE(row, column, accumulator[group][0]);
-            STORE(row + 8, column + 1, accumulator[group][3]);
+            STORE(row + 8, column, accumulator[group][2]);
             STORE(row, column + 1, accumulator[group][1]);
-            STORE(row + 8, column + 8, accumulator[group][6]);
+            STORE(row + 8, column + 1, accumulator[group][3]);
             STORE(row, column + 8, accumulator[group][4]);
-            STORE(row + 8, column + 9, accumulator[group][7]);
+            STORE(row + 8, column + 8, accumulator[group][6]);
             STORE(row, column + 9, accumulator[group][5]);
+            STORE(row + 8, column + 9, accumulator[group][7]);
 #undef STORE
+        }
+        asm volatile("bar.sync 10, %0;" :: "n"(CONSUMER_THREADS) : "memory");
+        if (threadIdx.x == PRODUCER_THREADS) {
+            tma_store(&C_map, shared.C, tile_n * BN, tile_m * BM);
+            asm volatile("cp.async.bulk.commit_group;" ::: "memory");
         }
     }
 #endif
@@ -367,8 +387,9 @@ void gemm_bf16_sm90_cuda(bf16* C, const bf16* A, const bf16* B, int M, int N, in
     }
     const CUtensorMap A_map = make_tensor_map<BM, BK>(A, M, K);
     const CUtensorMap B_map = make_tensor_map<BN, BK>(B, N, K);
+    const CUtensorMap C_map = make_tensor_map<BN, BM, false>(C, N, M);
     CUDA_CHECK(cudaFuncSetAttribute(gemm_bf16_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_BYTES));
-    gemm_bf16_kernel<<<PERSISTENT_BLOCKS, NUM_THREADS, SMEM_BYTES, stream>>>(C, A_map, B_map, M, N, K);
+    gemm_bf16_kernel<<<PERSISTENT_BLOCKS, NUM_THREADS, SMEM_BYTES, stream>>>(C_map, A_map, B_map, M, N, K);
     CUDA_CHECK(cudaGetLastError());
 }
 
