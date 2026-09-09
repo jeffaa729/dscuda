@@ -5,7 +5,6 @@
 #include <cudaTypedefs.h>
 
 #include <cstdint>
-#include <cstring>
 #include <stdexcept>
 #include <string>
 
@@ -14,7 +13,7 @@ namespace {
 
 using bf16 = __nv_bfloat16;
 
-// Matmul7 keeps 128 CTAs resident and pipelines several output tiles per CTA.
+// Kernel 9 optimizations on the Kernel 7 persistent schedule (no multicast).
 constexpr int BM = 128;
 constexpr int BN = 256;
 constexpr int BK = 64;
@@ -304,9 +303,24 @@ __global__ __launch_bounds__(NUM_THREADS) void gemm_bf16_kernel(bf16* __restrict
         const int tile_m = tile_id / tiles_n;
         const int tile_n = tile_id % tiles_n;
 
-        memset(accumulator, 0, sizeof(accumulator));
+        // First WGMMA overwrites C (ScaleD=0), avoiding explicit register clearing.
+        // Peel the first K tile so all remaining iterations accumulate unconditionally.
+        {
+            barrier_wait(&full[stage], phase);
+            bf16* A_tile = shared.A[stage] + consumer_id * WGMMA_M * BK;
+            warpgroup_fence();
+            wgmma_m64n256k16<0, 1, 1, 0, 0>(accumulator, A_tile, shared.B[stage]);
+#pragma unroll
+            for (int k_it = 1; k_it < BK / WGMMA_K; ++k_it) {
+                wgmma_m64n256k16<1, 1, 1, 0, 0>(accumulator, A_tile + k_it * WGMMA_K, shared.B[stage] + k_it * WGMMA_K);
+            }
+            warpgroup_commit();
+            warpgroup_wait();
+            if (warpgroup_thread == 0) barrier_arrive(&empty[stage]);
+            advance_stage(stage, phase);
+        }
 
-        for (int tile_k = 0; tile_k < k_tiles; ++tile_k) {
+        for (int tile_k = 1; tile_k < k_tiles; ++tile_k) {
             barrier_wait(&full[stage], phase);
 
             bf16* A_tile = shared.A[stage] + consumer_id * WGMMA_M * BK;
@@ -328,15 +342,16 @@ __global__ __launch_bounds__(NUM_THREADS) void gemm_bf16_kernel(bf16* __restrict
 #pragma unroll
         for (int group = 0; group < WGMMA_N / 16; ++group) {
             const int column = group * 16 + 2 * (lane & 3);
-#define STORE(Row, Column, Value) tile_C[(Column) * M + (Row)] = __float2bfloat16(Value)
-            STORE(row, column, accumulator[group][0]);
-            STORE(row, column + 1, accumulator[group][1]);
+// Kernel 9: write-through stores, paired by column in fast.cu's order.
+#define STORE(Row, Column, Value) __stwt(&tile_C[(Column) * M + (Row)], __float2bfloat16(Value))
             STORE(row + 8, column, accumulator[group][2]);
+            STORE(row, column, accumulator[group][0]);
             STORE(row + 8, column + 1, accumulator[group][3]);
-            STORE(row, column + 8, accumulator[group][4]);
-            STORE(row, column + 9, accumulator[group][5]);
+            STORE(row, column + 1, accumulator[group][1]);
             STORE(row + 8, column + 8, accumulator[group][6]);
+            STORE(row, column + 8, accumulator[group][4]);
             STORE(row + 8, column + 9, accumulator[group][7]);
+            STORE(row, column + 9, accumulator[group][5]);
 #undef STORE
         }
     }
