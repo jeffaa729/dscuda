@@ -1,7 +1,10 @@
-FROM nvidia/cuda:12.8.1-devel-ubuntu22.04
+FROM nvidia/cuda:12.8.1-devel-ubuntu24.04
 
 ARG DEEPGEMM_REPOSITORY=https://github.com/deepseek-ai/DeepGEMM.git
-ARG DEEPGEMM_REF=main
+ARG DEEPGEMM_REF=559d79fb6994a58b8a15b4b93bf13ccc16edf247
+ARG FLASH_ATTENTION_REPOSITORY=https://github.com/Dao-AILab/flash-attention.git
+ARG FLASH_ATTENTION_REF=main
+ARG CUDA_BUILD_JOBS=4
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV UV_LINK_MODE=copy
@@ -14,6 +17,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
         curl \
         git \
+        libdw-dev \
         ninja-build \
         python3 \
         python3-dev \
@@ -23,7 +27,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Copy uv from its official container image.
 COPY --from=ghcr.io/astral-sh/uv:0.12.9 /uv /uvx /usr/local/bin/
 
-# Ubuntu 22.04's CMake is too old for this repository.
+# Keep a modern, reproducible CMake version for this repository.
 RUN uv tool install cmake==3.31.10
 
 # Cache Python dependencies separately from source code.
@@ -33,11 +37,20 @@ RUN uv sync --locked --no-install-project
 
 # Install official DeepGEMM into the same environment used by benchmark.sh.
 # Its CUDA kernels are JIT-compiled for the attached H100 on first use.
-RUN git clone --recursive --branch "${DEEPGEMM_REF}" "${DEEPGEMM_REPOSITORY}" /tmp/DeepGEMM \
+RUN git clone --filter=blob:none --no-checkout "${DEEPGEMM_REPOSITORY}" /tmp/DeepGEMM \
+    && git -C /tmp/DeepGEMM checkout --detach "${DEEPGEMM_REF}" \
+    && git -C /tmp/DeepGEMM submodule update --init --recursive \
     && uv pip install --python "${DSCUDA_PYTHON}" setuptools wheel ninja packaging \
     && uv pip install --python "${DSCUDA_PYTHON}" --no-build-isolation --no-deps /tmp/DeepGEMM \
-    && "${DSCUDA_PYTHON}" -c 'import deep_gemm; assert hasattr(deep_gemm, "bf16_gemm_nn")' \
+    && "${DSCUDA_PYTHON}" -c 'import deep_gemm; assert hasattr(deep_gemm, "m_grouped_bf16_gemm_nn_contiguous")' \
     && rm -rf /tmp/DeepGEMM
+
+# H100 references are separate packages: generic flash-attn remains FA2,
+# flash-attn-3 provides Hopper CUDA kernels, and flash-attn-4 provides CuTeDSL.
+RUN git clone --recursive --branch "${FLASH_ATTENTION_REF}" "${FLASH_ATTENTION_REPOSITORY}" /tmp/FlashAttention \
+    && MAX_JOBS="${CUDA_BUILD_JOBS}" uv pip install --python "${DSCUDA_PYTHON}" --no-build-isolation /tmp/FlashAttention/hopper \
+    && uv pip install --python "${DSCUDA_PYTHON}" flash-attn-4 \
+    && rm -rf /tmp/FlashAttention
 
 WORKDIR /root
 CMD ["/bin/bash"]
