@@ -3,8 +3,10 @@
 namespace dscuda {
 
 void flash_attention_forward_cuda(__nv_bfloat16* output, float* logsumexp, const __nv_bfloat16* query, const __nv_bfloat16* key, const __nv_bfloat16* value,
-                                  int batch_size, int sequence_length, int heads, int head_size, float scale, cudaStream_t stream) {
-    flash_attention_forward_sm89_cuda(output, logsumexp, query, key, value, batch_size, sequence_length, heads, head_size, scale, stream);
+                                  int batch_size, int sequence_length, int query_heads, int key_value_heads, int head_size, float scale,
+                                  cudaStream_t stream) {
+    flash_attention_forward_sm89_cuda(output, logsumexp, query, key, value, batch_size, sequence_length, query_heads, key_value_heads, head_size, scale,
+                                      stream);
 }
 
 void flash_attention_backward_cuda(__nv_bfloat16* query_gradient, __nv_bfloat16* key_gradient, __nv_bfloat16* value_gradient,

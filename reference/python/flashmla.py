@@ -1,15 +1,7 @@
-"""Optional official FlashMLA adapters; no silent PyTorch fallback.
-
-Dense decode uses paged BF16 C512/R64 storage and SM90. Sparse prefill uses
-the upstream BF16 MQA interface on SM90/SM100. Both return BF16 output.
-"""
+"""Official FlashMLA dense decode adapter."""
 
 import torch
-from flash_mla import (
-    flash_mla_sparse_fwd,
-    flash_mla_with_kvcache,
-    get_mla_metadata,
-)
+from flash_mla import flash_mla_with_kvcache, get_mla_metadata
 
 
 def load_decode(device=None):
@@ -25,19 +17,6 @@ def require_hopper(x):
         )
     if x.dtype != torch.bfloat16:
         raise ValueError("this adapter requires BF16 inputs")
-
-
-def flatten_sparse_indices(indices, kv_length):
-    valid = (indices >= 0) & (indices < kv_length)
-    offsets = (
-        torch.arange(indices.shape[0], device=indices.device)[:, None, None] * kv_length
-    )
-    return (
-        torch.where(valid, indices + offsets, -1)
-        .reshape(-1, 1, indices.shape[-1])
-        .int()
-        .contiguous()
-    )
 
 
 class FlashMLADecode:
@@ -82,45 +61,3 @@ class FlashMLADecode:
             causal=False,
             is_fp8_kvcache=False,
         )
-
-
-class FlashMLASparse:
-    """Prepared sparse prefill with flattened batches; selection is outside timing.
-
-    Q/KV width is 576 (DSA) or 512 (V4); values are the first 512 channels.
-    Converts the upstream sink-excluding LSE to our sink-inclusive convention.
-    """
-
-    def __init__(self, q, kv, indices, scale=None, sink=None):
-        require_hopper(q)
-        if q.shape[-1] not in (512, 576) or kv.shape[-1] != q.shape[-1]:
-            raise ValueError("FlashMLA sparse requires Dqk=512/576 and Dv=512")
-        if kv.dtype != q.dtype or kv.device != q.device or kv.shape[0] != q.shape[0]:
-            raise ValueError("Q/KV must share batch size, device and BF16 dtype")
-        if (
-            q.shape[2] not in (64, 128)
-            or indices.shape[-1] == 0
-            or indices.shape[-1] % 128
-        ):
-            raise ValueError(
-                "this adapter targets upstream H=64/128 and topk multiples of 128"
-            )
-        self.call = flash_mla_sparse_fwd
-        self.shape = q.shape[:3]
-        self.q = q.flatten(0, 1).contiguous()
-        self.kv = kv.flatten(0, 1).unsqueeze(1).contiguous()
-        self.indices = flatten_sparse_indices(indices, kv.shape[1])
-        self.scale = q.shape[-1] ** -0.5 if scale is None else scale
-        self.sink = (
-            None
-            if sink is None
-            else sink.to(device=q.device, dtype=torch.float32).contiguous()
-        )
-
-    def __call__(self):
-        out, _, lse = self.call(
-            self.q, self.kv, self.indices, self.scale, 512, self.sink
-        )
-        if self.sink is not None:
-            lse = torch.logaddexp(lse, self.sink[None])
-        return out.reshape(*self.shape, 512), lse.reshape(*self.shape).transpose(1, 2)
