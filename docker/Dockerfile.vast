@@ -2,6 +2,9 @@ FROM nvidia/cuda:12.8.1-devel-ubuntu22.04
 
 ARG DEEPGEMM_REPOSITORY=https://github.com/deepseek-ai/DeepGEMM.git
 ARG DEEPGEMM_REF=main
+ARG FLASH_ATTENTION_REPOSITORY=https://github.com/Dao-AILab/flash-attention.git
+ARG FLASH_ATTENTION_REF=main
+ARG CUDA_BUILD_JOBS=4
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV UV_LINK_MODE=copy
@@ -38,6 +41,13 @@ RUN git clone --recursive --branch "${DEEPGEMM_REF}" "${DEEPGEMM_REPOSITORY}" /t
     && uv pip install --python "${DSCUDA_PYTHON}" --no-build-isolation --no-deps /tmp/DeepGEMM \
     && "${DSCUDA_PYTHON}" -c 'import deep_gemm; assert hasattr(deep_gemm, "bf16_gemm_nn")' \
     && rm -rf /tmp/DeepGEMM
+
+# H100 references are separate packages: generic flash-attn remains FA2,
+# flash-attn-3 provides Hopper CUDA kernels, and flash-attn-4 provides CuTeDSL.
+RUN git clone --recursive --branch "${FLASH_ATTENTION_REF}" "${FLASH_ATTENTION_REPOSITORY}" /tmp/FlashAttention \
+    && MAX_JOBS="${CUDA_BUILD_JOBS}" uv pip install --python "${DSCUDA_PYTHON}" --no-build-isolation /tmp/FlashAttention/hopper \
+    && uv pip install --python "${DSCUDA_PYTHON}" flash-attn-4 \
+    && rm -rf /tmp/FlashAttention
 
 WORKDIR /root
 CMD ["/bin/bash"]

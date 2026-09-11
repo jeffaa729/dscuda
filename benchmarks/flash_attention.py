@@ -1,16 +1,43 @@
-"""Causal D128 BF16 MHA/GQA/MQA: PyTorch correctness, FlashAttention runtime."""
+"""Causal D128 BF16 MHA/GQA/MQA: PyTorch correctness and official FA runtime."""
+
+import importlib
 
 from common import F, I, P, Operation, bind, checked, library, pointers, stream, torch
-from flash_attn import flash_attn_func
+
+
+def load_reference_apis(reference):
+    aliases = {
+        "flash_attention": "flash_attention_2",
+        "fa2": "flash_attention_2",
+        "fa3": "flash_attention_3",
+        "fa4": "flash_attention_4",
+    }
+    reference = aliases.get(reference, reference)
+    valid = ("pytorch", "flash_attention_2", "flash_attention_3", "flash_attention_4", "all")
+    if reference not in valid:
+        raise ValueError("FlashAttention references: pytorch, fa2, fa3, fa4, or all")
+
+    selected = (
+        ("flash_attention_2", "flash_attention_3", "flash_attention_4")
+        if reference == "all" else (reference,)
+    )
+    apis = {}
+    if "flash_attention_2" in selected:
+        apis["FlashAttention-2"] = importlib.import_module("flash_attn").flash_attn_func
+    if "flash_attention_3" in selected:
+        module = importlib.import_module("flash_attn_3.flash_attn_interface")
+        apis["FlashAttention-3"] = module.flash_attn_func
+    if "flash_attention_4" in selected:
+        apis["FlashAttention-4"] = importlib.import_module("flash_attn.cute").flash_attn_func
+    return reference, apis
 
 
 def cases(args, family):
     lib = library("flash_attention")
     forward = bind(lib, "dscuda_flash_forward", [P] * 5 + [I] * 5 + [F, P])
     backward = bind(lib, "dscuda_flash_backward", [P] * 9 + [I] * 4 + [F, P])
-    reference = args.reference or ("pytorch" if args.test else "flash_attention")
-    if reference not in ("pytorch", "flash_attention"):
-        raise ValueError("FlashAttention references: pytorch or flash_attention")
+    default_reference = "pytorch" if args.test else ("all" if args.suite == "h100" else "flash_attention_2")
+    reference, reference_apis = load_reference_apis(args.reference or default_reference)
 
     if args.test:
         shapes = (
@@ -61,29 +88,37 @@ def cases(args, family):
                 b, t, query_heads, key_value_heads, d, scale, stream()))
             return output, lse
 
-        functions = {"custom": custom_forward, "PyTorch": pytorch_forward}
-        label = "PyTorch"
-        official_inputs = None
-        official_saved = None
-        if reference == "flash_attention":
+        functions = {"custom": custom_forward}
+        reference_inputs = {}
+        if reference == "pytorch":
+            functions["PyTorch"] = pytorch_forward
+
+        for label, api in reference_apis.items():
             official_inputs = tuple(x.detach().requires_grad_() for x in inputs)
-
-            def official_forward():
-                result = flash_attn_func(
-                    *official_inputs, dropout_p=0., softmax_scale=scale,
-                    causal=True, return_attn_probs=True)
-                return result[:2]
-
-            official_saved = official_forward()
-            functions = {"custom": custom_forward, "FlashAttention": official_forward}
-            label = "FlashAttention"
+            reference_inputs[label] = official_inputs
+            if label == "FlashAttention-2":
+                def official_forward(tensors=official_inputs, function=api):
+                    return function(
+                        *tensors, dropout_p=0., softmax_scale=scale,
+                        causal=True, return_attn_probs=True)[:2]
+            elif label == "FlashAttention-3":
+                def official_forward(tensors=official_inputs, function=api):
+                    return function(
+                        *tensors, softmax_scale=scale, causal=True,
+                        return_attn_probs=True)[:2]
+            else:
+                def official_forward(tensors=official_inputs, function=api):
+                    return function(
+                        *tensors, softmax_scale=scale, causal=True,
+                        return_lse=True)[:2]
+            functions[label] = official_forward
 
         size = f"B={b},T={t},Hq={query_heads},Hkv={key_value_heads},D={d}"
         yield Operation(size, "bf16", "forward", functions, expected,
                         (1e-2, 1e-4), (1e-2, 1e-5))
 
-        # Backward remains MHA-only until shared dK/dV reduction is implemented.
-        if query_heads != key_value_heads:
+        # Backward remains MHA-only and keeps its existing PyTorch/FA2 path.
+        if query_heads != key_value_heads or reference not in ("pytorch", "flash_attention_2"):
             continue
 
         dout = (torch.randn(query_shape, device="cuda") * .5).bfloat16()
@@ -102,13 +137,18 @@ def cases(args, family):
             return gradients
 
         custom_forward()
-        backward_functions = {"custom": custom_backward, "PyTorch": pytorch_backward}
-        if reference == "flash_attention":
+        backward_functions = {"custom": custom_backward}
+        if reference == "pytorch":
+            backward_functions["PyTorch"] = pytorch_backward
+        else:
+            official_inputs = reference_inputs["FlashAttention-2"]
+            official_saved = functions["FlashAttention-2"]()
+
             def official_backward():
                 return torch.autograd.grad(
                     official_saved[0], official_inputs, dout, retain_graph=True)
 
-            backward_functions = {"custom": custom_backward, label: official_backward}
+            backward_functions["FlashAttention-2"] = official_backward
 
         yield Operation(size, "bf16", "backward", backward_functions,
                         expected_gradients, 1e-2, 1e-2)
