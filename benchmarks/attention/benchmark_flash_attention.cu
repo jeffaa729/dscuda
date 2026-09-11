@@ -199,6 +199,7 @@ int main(int argc, char** argv) {
                 batch_size,
                 sequence_length,
                 heads,
+                heads,
                 head_size,
                 scale);
         };
