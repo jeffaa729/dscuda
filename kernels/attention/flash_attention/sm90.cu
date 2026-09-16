@@ -35,8 +35,8 @@ struct SharedStorage {
     alignas(SMEM_ALIGNMENT) bf16 Q[2][BM * HALF_D];
     alignas(SMEM_ALIGNMENT) bf16 K[STAGES][2][BN * HALF_D];
     alignas(128) bf16 V[STAGES][2][BN * HALF_D];
-    alignas(128) bf16 Vt[STAGES][D * BN];
-    alignas(128) bf16 P[BM * BN];
+    alignas(SMEM_ALIGNMENT) bf16 Vt[STAGES][D * BN];
+    alignas(SMEM_ALIGNMENT) bf16 P[BM * BN];
 };
 
 constexpr size_t SMEM_BYTES = sizeof(SharedStorage) + SMEM_ALIGNMENT - 1;
@@ -111,14 +111,18 @@ __device__ __forceinline__ uint64_t encode_descriptor(uint64_t value) {
     return (value & 0x3FFFFU) >> 4U;
 }
 
-template <bool Swizzle>
 __device__ __forceinline__ uint64_t make_smem_descriptor(bf16* pointer) {
     const uint32_t address = static_cast<uint32_t>(__cvta_generic_to_shared(pointer));
     uint64_t descriptor = encode_descriptor(address);
     descriptor |= encode_descriptor(16) << 16U;
     descriptor |= encode_descriptor(1024) << 32U;
-    if constexpr (Swizzle) descriptor |= 1ULL << 62U;
+    descriptor |= 1ULL << 62U;
     return descriptor;
+}
+
+__device__ __forceinline__ int swizzle_128b_bf16(int row, int column) {
+    // Match the K-major 128-byte swizzle encoded in the WGMMA descriptor.
+    return row * 64 + (column ^ ((row & 7) << 3));
 }
 
 __device__ __forceinline__ void warpgroup_fence() {
@@ -138,10 +142,10 @@ __device__ __forceinline__ void consumer_sync() {
     asm volatile("bar.sync 1, 128;" ::: "memory");
 }
 
-template <int ScaleD, bool SwizzleA, bool SwizzleB>
+template <int ScaleD>
 __device__ __forceinline__ void wgmma_m64n64k16(float (&accumulator)[GROUPS][8], bf16* A, bf16* B) {
-    const uint64_t A_descriptor = make_smem_descriptor<SwizzleA>(A);
-    const uint64_t B_descriptor = make_smem_descriptor<SwizzleB>(B);
+    const uint64_t A_descriptor = make_smem_descriptor(A);
+    const uint64_t B_descriptor = make_smem_descriptor(B);
     asm volatile(
         "wgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 "
         "{%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, "
@@ -160,14 +164,14 @@ __device__ __forceinline__ void wgmma_m64n64k16(float (&accumulator)[GROUPS][8],
 
 __device__ __forceinline__ void issue_qk(float (&scores)[GROUPS][8], SharedStorage& shared, int stage) {
     warpgroup_fence();
-    wgmma_m64n64k16<0, true, true>(scores, shared.Q[0], shared.K[stage][0]);
+    wgmma_m64n64k16<0>(scores, shared.Q[0], shared.K[stage][0]);
 #pragma unroll
     for (int k = 1; k < HALF_D / WGMMA_K; ++k) {
-        wgmma_m64n64k16<1, true, true>(scores, shared.Q[0] + k * WGMMA_K, shared.K[stage][0] + k * WGMMA_K);
+        wgmma_m64n64k16<1>(scores, shared.Q[0] + k * WGMMA_K, shared.K[stage][0] + k * WGMMA_K);
     }
 #pragma unroll
     for (int k = 0; k < HALF_D / WGMMA_K; ++k) {
-        wgmma_m64n64k16<1, true, true>(scores, shared.Q[1] + k * WGMMA_K, shared.K[stage][1] + k * WGMMA_K);
+        wgmma_m64n64k16<1>(scores, shared.Q[1] + k * WGMMA_K, shared.K[stage][1] + k * WGMMA_K);
     }
     warpgroup_commit();
 }
@@ -178,8 +182,8 @@ __device__ __forceinline__ void issue_pv(float (&output)[2][GROUPS][8], SharedSt
     for (int k = 0; k < BN / WGMMA_K; ++k) {
 #pragma unroll
         for (int half = 0; half < 2; ++half) {
-            wgmma_m64n64k16<1, false, false>(
-                output[half], shared.P + k * WGMMA_K, shared.Vt[value_stage] + half * 64 * BN + k * WGMMA_K);
+            wgmma_m64n64k16<1>(output[half], shared.P + k * WGMMA_K,
+                                shared.Vt[value_stage] + half * 64 * BN + k * WGMMA_K);
         }
     }
     warpgroup_commit();
@@ -190,7 +194,12 @@ __device__ __forceinline__ void transpose_value(SharedStorage& shared, int stage
     for (int index = consumer_thread; index < D * BN; index += CONSUMER_THREADS) {
         const int column = index / BN;
         const int token = index % BN;
-        shared.Vt[stage][index] = shared.V[stage][column / HALF_D][token * HALF_D + column % HALF_D];
+        const int half = column / HALF_D;
+        const int row = column % HALF_D;
+        // P@V consumes V as [output column, key token], in the same swizzled
+        // K-major layout that QK uses for its two shared-memory operands.
+        shared.Vt[stage][half * HALF_D * BN + swizzle_128b_bf16(row, token)] =
+            shared.V[stage][half][token * HALF_D + row];
     }
     consumer_sync();
 }
@@ -255,7 +264,7 @@ __device__ __forceinline__ void write_probabilities(SharedStorage& shared, const
     const int lane = consumer_thread & 31;
     const int warp = consumer_thread >> 5;
     const int row = warp * 16 + lane / 4;
-#define STORE_P(Row, Column, Value) shared.P[(Row) * BN + (Column)] = __float2bfloat16(Value)
+#define STORE_P(Row, Column, Value) shared.P[swizzle_128b_bf16((Row), (Column))] = __float2bfloat16(Value)
 #pragma unroll
     for (int group = 0; group < GROUPS; ++group) {
         const int column = group * 16 + 2 * (lane & 3);
