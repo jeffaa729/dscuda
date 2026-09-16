@@ -25,7 +25,7 @@ def load_reference_apis(reference):
     if "flash_attention_2" in selected:
         apis["FlashAttention-2"] = importlib.import_module("flash_attn").flash_attn_func
     if "flash_attention_3" in selected:
-        module = importlib.import_module("flash_attn_3.flash_attn_interface")
+        module = importlib.import_module("flash_attn_interface")
         apis["FlashAttention-3"] = module.flash_attn_func
     if "flash_attention_4" in selected:
         apis["FlashAttention-4"] = importlib.import_module("flash_attn.cute").flash_attn_func
