@@ -2,9 +2,6 @@ FROM nvidia/cuda:12.8.1-devel-ubuntu24.04
 
 ARG DEEPGEMM_REPOSITORY=https://github.com/deepseek-ai/DeepGEMM.git
 ARG DEEPGEMM_REF=559d79fb6994a58b8a15b4b93bf13ccc16edf247
-ARG FLASH_ATTENTION_REPOSITORY=https://github.com/Dao-AILab/flash-attention.git
-ARG FLASH_ATTENTION_REF=main
-ARG CUDA_BUILD_JOBS=4
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV UV_LINK_MODE=copy
@@ -45,28 +42,9 @@ RUN git clone --filter=blob:none --no-checkout "${DEEPGEMM_REPOSITORY}" /tmp/Dee
     && "${DSCUDA_PYTHON}" -c 'import deep_gemm; assert hasattr(deep_gemm, "m_grouped_bf16_gemm_nn_contiguous")' \
     && rm -rf /tmp/DeepGEMM
 
-# H100 references are separate packages: generic flash-attn remains FA2,
-# FA3 exposes the top-level flash_attn_interface module, while FA4 uses flash_attn.cute.
-# This project benchmarks fixed-length BF16 forward with D=128, so skip unrelated
-# FA3 types, dimensions and backward kernels to keep the image build manageable.
-RUN git clone --filter=blob:none --no-checkout "${FLASH_ATTENTION_REPOSITORY}" /tmp/FlashAttention \
-    && git -C /tmp/FlashAttention fetch --depth 1 origin "${FLASH_ATTENTION_REF}" \
-    && git -C /tmp/FlashAttention checkout --detach FETCH_HEAD \
-    && git -C /tmp/FlashAttention submodule update --init --depth 1 csrc/cutlass \
-    && BUILD_TARGET=cuda \
-       MAX_JOBS="${CUDA_BUILD_JOBS}" \
-       FLASH_ATTENTION_DISABLE_BACKWARD=TRUE \
-       FLASH_ATTENTION_DISABLE_FP16=TRUE \
-       FLASH_ATTENTION_DISABLE_FP8=TRUE \
-       FLASH_ATTENTION_DISABLE_VARLEN=TRUE \
-       FLASH_ATTENTION_DISABLE_HDIM64=TRUE \
-       FLASH_ATTENTION_DISABLE_HDIM96=TRUE \
-       FLASH_ATTENTION_DISABLE_HDIM192=TRUE \
-       FLASH_ATTENTION_DISABLE_HDIM256=TRUE \
-       uv pip install --python "${DSCUDA_PYTHON}" --no-build-isolation /tmp/FlashAttention/hopper \
-    && "${DSCUDA_PYTHON}" -c 'import flash_attn_interface; assert hasattr(flash_attn_interface, "flash_attn_func")' \
-    && uv pip install --python "${DSCUDA_PYTHON}" flash-attn-4 \
-    && rm -rf /tmp/FlashAttention
+# FA3 and FA4 are intentionally not built into this image. After cloning dscuda
+# on an H100 instance, install those Hopper-only references with:
+# bash scripts/install_hopper_flash_attention.sh
 
 WORKDIR /root
 CMD ["/bin/bash"]
