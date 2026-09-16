@@ -18,6 +18,7 @@ add_library(dscuda_kernels STATIC
     kernels/common/cuda_common.cu
     kernels/attention/flash_attention/dispatch.cu
     kernels/attention/flash_attention/sm89.cu
+    kernels/attention/flash_attention/sm90.cu
     kernels/attention/mla/dispatch.cu
     kernels/attention/mla/sm89.cu
     kernels/gemm/matmul/dispatch.cu
@@ -30,7 +31,7 @@ add_library(dscuda_kernels STATIC
 )
 target_include_directories(dscuda_kernels PUBLIC include)
 # Attribute Hopper memory faults to source lines without disabling optimization.
-set_source_files_properties(kernels/gemm/matmul/sm90.cu PROPERTIES COMPILE_OPTIONS "-lineinfo")
+set_source_files_properties(kernels/gemm/matmul/sm90.cu kernels/attention/flash_attention/sm90.cu PROPERTIES COMPILE_OPTIONS "-lineinfo")
 target_link_libraries(dscuda_kernels PUBLIC CUDA::cudart CUDA::cuda_driver)
 set_target_properties(dscuda_kernels PROPERTIES
     CUDA_SEPARABLE_COMPILATION OFF
