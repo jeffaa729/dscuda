@@ -1,5 +1,5 @@
-// Implements BF16 D128 causal FlashAttention-3 forward on Hopper with raw CUDA/PTX.
-// A producer warp group feeds TMA while a consumer overlaps QK, PV and online softmax.
+// Implements the SM90 BF16 D128 causal FlashAttention-3 forward path with raw CUDA/PTX.
+// A producer warp group feeds TMA while consumers overlap QK, online softmax, and P@V.
 
 #include "common.cuh"
 #include "cuda_common.h"

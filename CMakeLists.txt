@@ -17,8 +17,10 @@ enable_testing()
 add_library(dscuda_kernels STATIC
     kernels/common/cuda_common.cu
     kernels/attention/flash_attention/dispatch.cu
-    kernels/attention/flash_attention/sm89.cu
-    kernels/attention/flash_attention/sm90.cu
+    kernels/attention/flash_attention/sm89_forward.cu
+    kernels/attention/flash_attention/sm89_backward.cu
+    kernels/attention/flash_attention/sm90_forward.cu
+    kernels/attention/flash_attention/sm90_backward.cu
     kernels/attention/mla/dispatch.cu
     kernels/attention/mla/sm89.cu
     kernels/gemm/matmul/dispatch.cu
@@ -31,7 +33,11 @@ add_library(dscuda_kernels STATIC
 )
 target_include_directories(dscuda_kernels PUBLIC include)
 # Attribute Hopper memory faults to source lines without disabling optimization.
-set_source_files_properties(kernels/gemm/matmul/sm90.cu kernels/attention/flash_attention/sm90.cu PROPERTIES COMPILE_OPTIONS "-lineinfo")
+set_source_files_properties(
+    kernels/gemm/matmul/sm90.cu
+    kernels/attention/flash_attention/sm90_forward.cu
+    kernels/attention/flash_attention/sm90_backward.cu
+    PROPERTIES COMPILE_OPTIONS "-lineinfo")
 target_link_libraries(dscuda_kernels PUBLIC CUDA::cudart CUDA::cuda_driver)
 set_target_properties(dscuda_kernels PROPERTIES
     CUDA_SEPARABLE_COMPILATION OFF
@@ -63,7 +69,7 @@ target_link_libraries(dscuda_expert_dispatch_bench PRIVATE dscuda_kernels)
 # Tests and benchmarks share cases and compare numerical results with PyTorch.
 set(DSCUDA_PYTHON "${CMAKE_CURRENT_SOURCE_DIR}/.venv/bin/python" CACHE FILEPATH "Python from uv sync")
 if(EXISTS "${DSCUDA_PYTHON}")
-    foreach(name matmul grouped_gemm flash_attention mla expert_dispatch kda)
+    foreach(name matmul grouped_gemm flash_attention mla expert_dispatch)
         add_test(NAME ${name} COMMAND ${DSCUDA_PYTHON}
             ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks/run.py ${name} --test)
         set_tests_properties(${name} PROPERTIES RESOURCE_LOCK gpu)

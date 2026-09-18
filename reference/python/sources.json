@@ -17,11 +17,6 @@
     "source": "https://github.com/deepseek-ai/DeepSeek-V3/blob/main/inference/model.py",
     "contract": "V3 sigmoid routing with selection bias, optional group limiting, no capacity drops, SwiGLU experts. The native grouped comparison measures only packed GEMMs, not routing/dispatch."
   },
-  "kda": {
-    "source": "https://github.com/fla-org/flash-linear-attention/tree/v0.5.2/fla/ops/kda",
-    "package": "fla-core==0.5.2 (uv.lock)",
-    "contract": "Independent recurrent oracle plus official FLA chunk forward/backward, prepared normalized q/k and activated log-decay/beta. FP32 final state in key-first layout."
-  },
   "flashmla": {
     "source": "https://github.com/deepseek-ai/FlashMLA/tree/15f13e5030374295491c5ce31b02d7e63a7772c6",
     "contract": "Official deepseek-ai/FlashMLA BF16 paged dense decode on SM90, Q=1, C512/R64, one shared KV head. MLA --reference flashmla selects the library alone; both/all also includes PyTorch. The h100 runtime suite defaults to both with H=64/128 and KV=1024/4096/8192. Custom/PyTorch output casts to BF16 are timed; packing and scheduler initialization are outside CUDA Graph timing. Every backend is checked against PyTorch output and natural-log FP32 LSE. Default local tests cover cache-page boundaries and the BF16 output contract without a mock library. Dense prefill/backward remains PyTorch-only: upstream dense prefill is SM100 MHA, not this absorbed-query contract. H100 execution is not verified on SM89."
