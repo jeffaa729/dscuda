@@ -11,10 +11,6 @@ namespace flash_attention_sm89 {
 constexpr int WARP_SIZE = 32;
 constexpr int HEAD_SIZE = 128;
 
-__device__ __forceinline__ float as_float(__nv_bfloat16 value) {
-    return __bfloat162float(value);
-}
-
 namespace tensor_core {
 
 constexpr int BM = 64;
@@ -30,8 +26,6 @@ constexpr int OUTPUT_N_TILES = D / MMA_N;
 constexpr int HEAD_K_TILES = D / MMA_K;
 constexpr int TOKEN_K_TILES = BN / MMA_K;
 constexpr int VECTOR_ELEMENTS = 8;
-constexpr float LOG2E = 1.4426950408889634F;
-constexpr int BACKWARD_SHARED_BYTES = 4 * BM * D * sizeof(__nv_bfloat16);
 
 template <int STRIDE = D>
 __device__ __forceinline__ int swizzle(int offset) {
@@ -111,11 +105,6 @@ __device__ __forceinline__ void copy_bf16_tile(__nv_bfloat16* shared, const __nv
     cp_async_commit();
 }
 
-__device__ __forceinline__ void copy_gradient_tile(__nv_bfloat16* shared, const __nv_bfloat16* global, int batch, int first_token, int head,
-                                                   int sequence_length, int heads) {
-    copy_bf16_tile(shared, global, batch, first_token, head, sequence_length, heads);
-}
-
 template <int COLUMNS = D>
 __device__ __forceinline__ void load_left_fragments(unsigned int (&fragments)[COLUMNS / MMA_K][4], const __nv_bfloat16* shared, int warp_row, int lane) {
 #pragma unroll
@@ -171,28 +160,6 @@ __device__ __forceinline__ void matrix_product_right(float (&accumulators)[N_TIL
             mma(accumulators[tile_column], left[tile_inner], right_fragments);
             mma(accumulators[tile_column + 1], left[tile_inner], right_fragments + 2);
         }
-    }
-}
-
-__device__ __forceinline__ void pack_row_matrix(unsigned int (&fragments)[TOKEN_K_TILES][4], const float2 (&top)[SCORE_N_TILES],
-                                                const float2 (&bottom)[SCORE_N_TILES]) {
-#pragma unroll
-    for (int tile = 0; tile < TOKEN_K_TILES; ++tile) {
-        fragments[tile][0] = pack_bf16x2(top[tile * 2]);
-        fragments[tile][1] = pack_bf16x2(bottom[tile * 2]);
-        fragments[tile][2] = pack_bf16x2(top[tile * 2 + 1]);
-        fragments[tile][3] = pack_bf16x2(bottom[tile * 2 + 1]);
-    }
-}
-
-__device__ __forceinline__ void pack_score_matrix(unsigned int (&fragments)[TOKEN_K_TILES][4], const float (&scores)[SCORE_N_TILES][4]) {
-#pragma unroll
-    for (int tile = 0; tile < TOKEN_K_TILES; ++tile) {
-        const int first = tile * 2;
-        fragments[tile][0] = pack_bf16x2(make_float2(scores[first][0], scores[first][1]));
-        fragments[tile][1] = pack_bf16x2(make_float2(scores[first][2], scores[first][3]));
-        fragments[tile][2] = pack_bf16x2(make_float2(scores[first + 1][0], scores[first + 1][1]));
-        fragments[tile][3] = pack_bf16x2(make_float2(scores[first + 1][2], scores[first + 1][3]));
     }
 }
 

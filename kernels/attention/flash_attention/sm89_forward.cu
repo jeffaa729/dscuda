@@ -9,6 +9,19 @@ namespace dscuda {
 namespace flash_attention_sm89 {
 namespace tensor_core {
 
+constexpr float LOG2E = 1.4426950408889634F;
+
+__device__ __forceinline__ void pack_score_matrix(unsigned int (&fragments)[TOKEN_K_TILES][4], const float (&scores)[SCORE_N_TILES][4]) {
+#pragma unroll
+    for (int tile = 0; tile < TOKEN_K_TILES; ++tile) {
+        const int first = tile * 2;
+        fragments[tile][0] = pack_bf16x2(make_float2(scores[first][0], scores[first][1]));
+        fragments[tile][1] = pack_bf16x2(make_float2(scores[first][2], scores[first][3]));
+        fragments[tile][2] = pack_bf16x2(make_float2(scores[first + 1][0], scores[first + 1][1]));
+        fragments[tile][3] = pack_bf16x2(make_float2(scores[first + 1][2], scores[first + 1][3]));
+    }
+}
+
 template <bool FIRST_TILE, bool MASKED_TILE>
 __device__ __forceinline__ void online_softmax_tile(float (&scores)[SCORE_N_TILES][4], float (&output_accumulators)[OUTPUT_N_TILES][4],
                                                     float (&row_max)[2], float (&row_sum)[2], const __nv_bfloat16* shared_value, int warp_row,

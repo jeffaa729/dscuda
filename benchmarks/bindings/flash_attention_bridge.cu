@@ -31,12 +31,13 @@ extern "C" int dscuda_flash_forward(
 
 extern "C" int dscuda_flash_backward(
     __nv_bfloat16* dq, __nv_bfloat16* dk, __nv_bfloat16* dv,
+    float* dq_accumulator, float* row_delta,
     const __nv_bfloat16* dout, const __nv_bfloat16* output, const float* logsumexp,
     const __nv_bfloat16* query, const __nv_bfloat16* key, const __nv_bfloat16* value,
     int batch, int sequence, int heads, int dimension, float scale, cudaStream_t stream) {
     try {
         dscuda::flash_attention_backward_cuda(
-            dq, dk, dv, dout, output, logsumexp, query, key, value,
+            dq, dk, dv, dq_accumulator, row_delta, dout, output, logsumexp, query, key, value,
             batch, sequence, heads, dimension, scale, stream);
         return 0;
     } catch (const std::exception& error) {

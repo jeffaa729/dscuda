@@ -167,6 +167,10 @@ int main(int argc, char** argv) {
             dscuda::device_malloc(activations * sizeof(__nv_bfloat16)));
         auto* value_gradient = static_cast<__nv_bfloat16*>(
             dscuda::device_malloc(activations * sizeof(__nv_bfloat16)));
+        auto* query_gradient_accumulator = static_cast<float*>(
+            dscuda::device_malloc(activations * sizeof(float)));
+        auto* row_delta = static_cast<float*>(
+            dscuda::device_malloc(rows * sizeof(float)));
 
         CUDA_CHECK(cudaMemcpy(
             query,
@@ -208,6 +212,8 @@ int main(int argc, char** argv) {
                 query_gradient,
                 key_gradient,
                 value_gradient,
+                query_gradient_accumulator,
+                row_delta,
                 output_gradient,
                 output,
                 logsumexp,
@@ -289,6 +295,8 @@ int main(int argc, char** argv) {
             dump_values(dump, value_gradient, activations);
         }
 
+        dscuda::device_free(row_delta);
+        dscuda::device_free(query_gradient_accumulator);
         dscuda::device_free(value_gradient);
         dscuda::device_free(key_gradient);
         dscuda::device_free(query_gradient);

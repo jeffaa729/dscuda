@@ -35,7 +35,7 @@ def load_reference_apis(reference):
 def cases(args, family):
     lib = library("flash_attention")
     forward = bind(lib, "dscuda_flash_forward", [P] * 5 + [I] * 5 + [F, P])
-    backward = bind(lib, "dscuda_flash_backward", [P] * 9 + [I] * 4 + [F, P])
+    backward = bind(lib, "dscuda_flash_backward", [P] * 11 + [I] * 4 + [F, P])
     default_reference = "pytorch" if args.test else ("all" if args.suite == "h100" else "flash_attention_2")
     reference, reference_apis = load_reference_apis(args.reference or default_reference)
 
@@ -129,10 +129,12 @@ def cases(args, family):
 
         expected_gradients = pytorch_backward()
         gradients = tuple(torch.empty_like(x) for x in inputs)
+        query_gradient_accumulator = torch.empty(query_shape, device="cuda")
+        row_delta = torch.empty(b, query_heads, t, device="cuda")
 
         def custom_backward():
             checked(lib, "flash", backward(
-                *pointers((*gradients, dout, output, lse, *inputs)),
+                *pointers((*gradients, query_gradient_accumulator, row_delta, dout, output, lse, *inputs)),
                 b, t, query_heads, d, scale, stream()))
             return gradients
 

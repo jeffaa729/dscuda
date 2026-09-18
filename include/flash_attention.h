@@ -23,10 +23,12 @@ void flash_attention_forward_cuda(
     float scale,
     cudaStream_t stream = nullptr);
 
-// Recomputes probabilities from Q, K, and LSE. dO/dQ/dK/dV use BF16 and each
-// gradient element has one writer, so the output gradient buffers are replaced.
+// Recomputes probabilities from Q, K, and LSE. dO/dQ/dK/dV use BF16.
+// dq_accumulator is FP32 [B,T,H,128] and row_delta is FP32 [B,H,T];
+// callers own both workspaces so the complete pipeline is CUDA-Graph-safe.
 void flash_attention_backward_cuda(
     __nv_bfloat16* query_gradient, __nv_bfloat16* key_gradient, __nv_bfloat16* value_gradient,
+    float* query_gradient_accumulator, float* row_delta,
     const __nv_bfloat16* output_gradient, const __nv_bfloat16* output, const float* logsumexp,
     const __nv_bfloat16* query, const __nv_bfloat16* key, const __nv_bfloat16* value,
     int batch_size, int sequence_length, int heads, int head_size,
