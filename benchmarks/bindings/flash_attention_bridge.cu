@@ -28,19 +28,3 @@ extern "C" int dscuda_flash_forward(
         return 1;
     }
 }
-
-extern "C" int dscuda_flash_backward(
-    __nv_bfloat16* dq, __nv_bfloat16* dk, __nv_bfloat16* dv,
-    const __nv_bfloat16* dout, const __nv_bfloat16* output, const float* logsumexp,
-    const __nv_bfloat16* query, const __nv_bfloat16* key, const __nv_bfloat16* value,
-    int batch, int sequence, int heads, int dimension, float scale, cudaStream_t stream) {
-    try {
-        dscuda::flash_attention_backward_cuda(
-            dq, dk, dv, dout, output, logsumexp, query, key, value,
-            batch, sequence, heads, dimension, scale, stream);
-        return 0;
-    } catch (const std::exception& error) {
-        last_error = error.what();
-        return 1;
-    }
-}

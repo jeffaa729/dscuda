@@ -91,10 +91,7 @@ def arguments():
 def short_kernel_name(full_name):
     patterns = (
         (r"flash_attention_forward(?:_tensor_core)?_kernel", "flash_fwd"),
-        (r"flash_attention_backward_query(?:_tensor_core)?_kernel", "flash_bwd_dq"),
-        (r"flash_attention_backward_key_value(?:_tensor_core)?_kernel", "flash_bwd_dkv"),
         (r"flash_fwd", "official_flash_fwd"),
-        (r"flash_bwd", "official_flash_bwd"),
         (r"grouped_linear_bf16_tensor_core_kernel", "grouped_gemm_bf16"),
         (r"build_dispatch_map_kernel", "dispatch_map"),
         (r"dispatch_copy_kernel", "dispatch_copy"),

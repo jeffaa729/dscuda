@@ -245,10 +245,10 @@ profile_flash_attention() {
             custom_dump="${TMPDIR:-/tmp}/dscuda_${stem}_custom.bin"
             official_dump="${TMPDIR:-/tmp}/dscuda_${stem}_official.bin"
             "$build_dir/benchmark_flash_attention" \
-                "$batch" "$sequence" "$heads" "$dimension" all \
+                "$batch" "$sequence" "$heads" "$dimension" forward \
                 "$custom_dump" >/dev/null
             "$python_bin" "$repo_root/reference/python/flash_attention_official.py" \
-                "$batch" "$sequence" "$heads" "$dimension" all \
+                "$batch" "$sequence" "$heads" "$dimension" forward \
                 "$official_dump" >/dev/null
             if ! "$python_bin" "$repo_root/scripts/compare_attention_dumps.py" \
                 "$custom_dump" "$official_dump" \
@@ -260,7 +260,7 @@ profile_flash_attention() {
             rm -f -- "$custom_dump" "$official_dump"
         fi
 
-        for operation in forward backward; do
+        for operation in forward; do
             profile_case \
                 "$shape/custom/$operation" "${stem}_custom_${operation}" \
                 'regex:flash_attention_.*_kernel' \
