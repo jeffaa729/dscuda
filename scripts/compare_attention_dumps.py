@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 """Compares custom and official FlashAttention raw correctness dumps.
-Each dump stores output, dQ, dK, and dV as four consecutive FP32 arrays."""
+Each dump stores the forward output as FP32."""
 
 import argparse
 import array
@@ -30,7 +30,7 @@ def main():
     custom = read(args.custom)
     official = read(args.official)
     elements = args.batch * args.sequence * args.heads * args.head_size
-    expected = 4 * elements
+    expected = elements
     if len(custom) != expected or len(official) != expected:
         raise SystemExit(
             f"expected {expected} floats per dump; got "
@@ -40,7 +40,7 @@ def main():
     passed = True
     print("FlashAttention cross-implementation correctness")
     print(f"{'tensor':<10} {'max abs':>12} {'RMS':>12} {'result':>9}")
-    for tensor_index, name in enumerate(("output", "dQ", "dK", "dV")):
+    for tensor_index, name in enumerate(("output",)):
         begin = tensor_index * elements
         end = begin + elements
         squared_error = 0.0

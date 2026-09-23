@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 """Profile official FlashAttention on tensors shared with the CUDA benchmark.
-The optional raw dump contains output, dQ, dK, and dV as consecutive FP32 arrays."""
+The optional raw dump contains the BF16 output converted to FP32."""
 
 import argparse
 import math
@@ -16,8 +16,7 @@ def arguments():
     parser.add_argument("sequence", type=int)
     parser.add_argument("heads", type=int)
     parser.add_argument("head_size", type=int)
-    parser.add_argument(
-        "operation", choices=("forward", "backward", "all"))
+    parser.add_argument("operation", choices=("forward",))
     parser.add_argument("dump", nargs="?", type=Path)
     return parser.parse_args()
 
@@ -44,10 +43,9 @@ def main():
             args.batch, args.sequence, args.heads, args.head_size
         )
 
-    query = bf16_values(17, 101, 50, 64).requires_grad_(True)
-    key = bf16_values(23, 97, 48, 61).requires_grad_(True)
-    value = bf16_values(31, 89, 44, 59).requires_grad_(True)
-    output_gradient = bf16_values(37, 83, 41, 67)
+    query = bf16_values(17, 101, 50, 64)
+    key = bf16_values(23, 97, 48, 61)
+    value = bf16_values(31, 89, 44, 59)
     scale = 1.0 / math.sqrt(args.head_size)
 
     def forward():
@@ -60,47 +58,19 @@ def main():
             causal=True,
         )
 
-    def backward(output, retain_graph=False):
-        return torch.autograd.grad(
-            output,
-            (query, key, value),
-            output_gradient,
-            retain_graph=retain_graph,
-        )
-
-    backward_output = None
-    if args.operation == "forward":
-        with torch.no_grad():
-            forward()
-    elif args.operation == "backward":
-        backward_output = forward()
-        backward(backward_output, retain_graph=True)
-    else:
-        backward(forward())
-    torch.cuda.synchronize()
-
     cudart = torch.cuda.cudart()
     checked_profiler_call(cudart.cudaProfilerStart, "cudaProfilerStart")
-    if args.operation == "forward":
-        with torch.no_grad():
-            forward()
-    elif args.operation == "backward":
-        backward(backward_output)
-    else:
-        backward(forward())
+    with torch.no_grad():
+        forward()
     torch.cuda.synchronize()
     checked_profiler_call(cudart.cudaProfilerStop, "cudaProfilerStop")
 
     if args.dump is not None:
         output = forward()
-        gradients = backward(output)
         torch.cuda.synchronize()
         args.dump.parent.mkdir(parents=True, exist_ok=True)
         with args.dump.open("wb") as destination:
-            for tensor in (output, *gradients):
-                destination.write(
-                    tensor.detach().float().cpu().contiguous().numpy().tobytes()
-                )
+            destination.write(output.float().cpu().contiguous().numpy().tobytes())
 
 
 

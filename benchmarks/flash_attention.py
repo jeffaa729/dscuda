@@ -35,7 +35,6 @@ def load_reference_apis(reference):
 def cases(args, family):
     lib = library("flash_attention")
     forward = bind(lib, "dscuda_flash_forward", [P] * 5 + [I] * 5 + [F, P])
-    backward = bind(lib, "dscuda_flash_backward", [P] * 11 + [I] * 4 + [F, P])
     default_reference = "pytorch" if args.test else ("all" if args.suite == "h100" else "flash_attention_2")
     reference, reference_apis = load_reference_apis(args.reference or default_reference)
 
@@ -63,7 +62,7 @@ def cases(args, family):
         key = (torch.randn(key_value_shape, device="cuda") * .5).bfloat16()
         value = (torch.randn(key_value_shape, device="cuda") * .5).bfloat16()
         inputs = (query, key, value)
-        oracle = tuple(x.float().detach().requires_grad_() for x in inputs)
+        oracle = tuple(x.float() for x in inputs)
         group_size = query_heads // key_value_heads
         scale = d**-.5
         mask = torch.ones(t, t, device="cuda", dtype=torch.bool).tril()
@@ -77,8 +76,7 @@ def cases(args, family):
             scores = (q @ k.transpose(-1, -2) * scale).masked_fill(~mask, -torch.inf)
             return (scores.softmax(-1) @ v).transpose(1, 2).bfloat16(), scores.logsumexp(-1)
 
-        saved_oracle = pytorch_forward(oracle)
-        expected = tuple(x.detach() for x in saved_oracle)
+        expected = tuple(x.detach() for x in pytorch_forward(oracle))
         output = torch.empty(query_shape, device="cuda", dtype=torch.bfloat16)
         lse = torch.empty(b, query_heads, t, device="cuda")
 
@@ -89,25 +87,22 @@ def cases(args, family):
             return output, lse
 
         functions = {"custom": custom_forward}
-        reference_inputs = {}
         if reference == "pytorch":
             functions["PyTorch"] = pytorch_forward
 
         for label, api in reference_apis.items():
-            official_inputs = tuple(x.detach().requires_grad_() for x in inputs)
-            reference_inputs[label] = official_inputs
             if label == "FlashAttention-2":
-                def official_forward(tensors=official_inputs, function=api):
+                def official_forward(tensors=inputs, function=api):
                     return function(
                         *tensors, dropout_p=0., softmax_scale=scale,
                         causal=True, return_attn_probs=True)[:2]
             elif label == "FlashAttention-3":
-                def official_forward(tensors=official_inputs, function=api):
+                def official_forward(tensors=inputs, function=api):
                     return function(
                         *tensors, softmax_scale=scale, causal=True,
                         return_attn_probs=True)[:2]
             else:
-                def official_forward(tensors=official_inputs, function=api):
+                def official_forward(tensors=inputs, function=api):
                     return function(
                         *tensors, softmax_scale=scale, causal=True,
                         return_lse=True)[:2]
@@ -116,41 +111,3 @@ def cases(args, family):
         size = f"B={b},T={t},Hq={query_heads},Hkv={key_value_heads},D={d}"
         yield Operation(size, "bf16", "forward", functions, expected,
                         (1e-2, 1e-4), (1e-2, 1e-5))
-
-        # Backward remains MHA-only and keeps its existing PyTorch/FA2 path.
-        if query_heads != key_value_heads or reference not in ("pytorch", "flash_attention_2"):
-            continue
-
-        dout = (torch.randn(query_shape, device="cuda") * .5).bfloat16()
-
-        def pytorch_backward():
-            return tuple(x.bfloat16() for x in torch.autograd.grad(
-                saved_oracle[0], oracle, dout, retain_graph=True))
-
-        expected_gradients = pytorch_backward()
-        gradients = tuple(torch.empty_like(x) for x in inputs)
-        query_gradient_accumulator = torch.empty(query_shape, device="cuda")
-        row_delta = torch.empty(b, query_heads, t, device="cuda")
-
-        def custom_backward():
-            checked(lib, "flash", backward(
-                *pointers((*gradients, query_gradient_accumulator, row_delta, dout, output, lse, *inputs)),
-                b, t, query_heads, d, scale, stream()))
-            return gradients
-
-        custom_forward()
-        backward_functions = {"custom": custom_backward}
-        if reference == "pytorch":
-            backward_functions["PyTorch"] = pytorch_backward
-        else:
-            official_inputs = reference_inputs["FlashAttention-2"]
-            official_saved = functions["FlashAttention-2"]()
-
-            def official_backward():
-                return torch.autograd.grad(
-                    official_saved[0], official_inputs, dout, retain_graph=True)
-
-            backward_functions["FlashAttention-2"] = official_backward
-
-        yield Operation(size, "bf16", "backward", backward_functions,
-                        expected_gradients, 1e-2, 1e-2)
