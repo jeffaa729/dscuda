@@ -1,5 +1,5 @@
-// Computes variable-row expert GEMMs with FP32 scalar and BF16 Tensor Core paths.
-// The backward kernels compute input and weight gradients using the same expert-grouped layout.
+// Computes variable-row expert BF16 GEMMs with Tensor Core accumulation.
+// A packed block selects its expert from device-side offsets and writes BF16 output.
 
 #include "cuda_common.h"
 #include "common.cuh"
@@ -15,22 +15,6 @@ constexpr int WARP_SIZE = 32;
 constexpr int GROUPED_BM = 64;
 constexpr int GROUPED_BN = 64;
 constexpr int GROUPED_WARPS = 8;
-
-__global__ void grouped_linear_forward_kernel(float* output, const float* input, const float* weight, const int* slot_expert, int dispatched_rows,
-                                              int output_size, int input_size) {
-    const int row = blockIdx.x * TILE + threadIdx.y;
-    const int column = blockIdx.y * TILE + threadIdx.x;
-    if (row >= dispatched_rows || column >= output_size) {
-        return;
-    }
-    const int expert = slot_expert[row];
-    const float* expert_weight = weight + static_cast<std::size_t>(expert) * input_size * output_size;
-    float sum = 0.0F;
-    for (int inner = 0; inner < input_size; ++inner) {
-        sum += input[row * input_size + inner] * expert_weight[inner * output_size + column];
-    }
-    output[row * output_size + column] = sum;
-}
 
 __global__ void grouped_linear_bf16_tensor_core_kernel(__nv_bfloat16* output, const __nv_bfloat16* input, const __nv_bfloat16* weight,
                                                        const int* expert_offsets, int packed_row_blocks, int experts, int output_size, int input_size) {
@@ -118,50 +102,7 @@ __global__ void grouped_linear_bf16_tensor_core_kernel(__nv_bfloat16* output, co
     }
 }
 
-__global__ void grouped_linear_input_backward_kernel(float* input_gradient, const float* output_gradient, const float* weight, const int* slot_expert,
-                                                     int dispatched_rows, int output_size, int input_size, bool accumulate) {
-    const int row = blockIdx.x * TILE + threadIdx.y;
-    const int inner = blockIdx.y * TILE + threadIdx.x;
-    if (row >= dispatched_rows || inner >= input_size) {
-        return;
-    }
-    const int expert = slot_expert[row];
-    const float* expert_weight = weight + static_cast<std::size_t>(expert) * input_size * output_size;
-    float sum = 0.0F;
-    for (int column = 0; column < output_size; ++column) {
-        sum += output_gradient[row * output_size + column] * expert_weight[inner * output_size + column];
-    }
-    if (accumulate) {
-        input_gradient[row * input_size + inner] += sum;
-    } else {
-        input_gradient[row * input_size + inner] = sum;
-    }
-}
-
-__global__ void grouped_linear_weight_backward_kernel(float* weight_gradient, const float* output_gradient, const float* input, const int* expert_offsets,
-                                                      int experts, int output_size, int input_size) {
-    const int inner = blockIdx.x * TILE + threadIdx.y;
-    const int column = blockIdx.y * TILE + threadIdx.x;
-    const int expert = blockIdx.z;
-    if (expert >= experts || inner >= input_size || column >= output_size) {
-        return;
-    }
-    float sum = 0.0F;
-    for (int row = expert_offsets[expert]; row < expert_offsets[expert + 1]; ++row) {
-        sum += input[row * input_size + inner] * output_gradient[row * output_size + column];
-    }
-    weight_gradient[(static_cast<std::size_t>(expert) * input_size + inner) * output_size + column] += sum;
-}
-
 }  // namespace
-
-void grouped_linear_forward_sm89_cuda(float* output, const float* input, const float* weight, const int* slot_expert, int dispatched_rows, int output_size,
-                                      int input_size, cudaStream_t stream) {
-    const dim3 block(TILE, TILE);
-    const dim3 grid((dispatched_rows + TILE - 1) / TILE, (output_size + TILE - 1) / TILE);
-    grouped_linear_forward_kernel<<<grid, block, 0, stream>>>(output, input, weight, slot_expert, dispatched_rows, output_size, input_size);
-    CUDA_CHECK(cudaGetLastError());
-}
 
 void grouped_linear_bf16_forward_sm89_cuda(__nv_bfloat16* output, const __nv_bfloat16* input, const __nv_bfloat16* weight, const int* expert_offsets,
                                            int dispatched_rows, int experts, int output_size, int input_size, cudaStream_t stream) {
@@ -169,20 +110,6 @@ void grouped_linear_bf16_forward_sm89_cuda(__nv_bfloat16* output, const __nv_bfl
     const dim3 grid(packed_row_blocks, (output_size + GROUPED_BN - 1) / GROUPED_BN);
     grouped_linear_bf16_tensor_core_kernel<<<grid, GROUPED_WARPS * WARP_SIZE, 0, stream>>>(output, input, weight, expert_offsets, packed_row_blocks, experts,
                                                                                            output_size, input_size);
-    CUDA_CHECK(cudaGetLastError());
-}
-
-void grouped_linear_backward_sm89_cuda(float* input_gradient, float* weight_gradient, const float* output_gradient, const float* input, const float* weight,
-                                       const int* expert_offsets, const int* slot_expert, int dispatched_rows, int experts, int output_size, int input_size,
-                                       bool accumulate_input, cudaStream_t stream) {
-    const dim3 block(TILE, TILE);
-    const dim3 input_grid((dispatched_rows + TILE - 1) / TILE, (input_size + TILE - 1) / TILE);
-    grouped_linear_input_backward_kernel<<<input_grid, block, 0, stream>>>(input_gradient, output_gradient, weight, slot_expert, dispatched_rows, output_size,
-                                                                           input_size, accumulate_input);
-    CUDA_CHECK(cudaGetLastError());
-    const dim3 weight_grid((input_size + TILE - 1) / TILE, (output_size + TILE - 1) / TILE, experts);
-    grouped_linear_weight_backward_kernel<<<weight_grid, block, 0, stream>>>(weight_gradient, output_gradient, input, expert_offsets, experts, output_size,
-                                                                             input_size);
     CUDA_CHECK(cudaGetLastError());
 }
 

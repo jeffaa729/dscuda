@@ -24,10 +24,9 @@ add_library(dscuda_kernels STATIC
     kernels/gemm/matmul/dispatch.cu
     kernels/gemm/matmul/sm89.cu
     kernels/gemm/matmul/sm90.cu
-    kernels/moe/expert_dispatch/dispatch.cu
-    kernels/moe/expert_dispatch/sm89.cu
     kernels/moe/grouped_gemm/dispatch.cu
     kernels/moe/grouped_gemm/sm89.cu
+    kernels/moe/swiglu.cu
 )
 target_include_directories(dscuda_kernels PUBLIC include)
 # Attribute Hopper memory faults to source lines without disabling optimization.
@@ -60,13 +59,15 @@ add_library(dscuda_operator_bench SHARED benchmarks/bindings/operators_bridge.cu
 target_link_libraries(dscuda_operator_bench PRIVATE dscuda_kernels CUDA::cublas)
 add_library(dscuda_mla_bench SHARED benchmarks/bindings/mla_bridge.cu)
 target_link_libraries(dscuda_mla_bench PRIVATE dscuda_kernels)
-add_library(dscuda_expert_dispatch_bench SHARED benchmarks/bindings/expert_dispatch_bridge.cu)
-target_link_libraries(dscuda_expert_dispatch_bench PRIVATE dscuda_kernels)
+add_library(dscuda_moe_swiglu_bench SHARED benchmarks/bindings/moe_swiglu_bridge.cu)
+target_link_libraries(dscuda_moe_swiglu_bench PRIVATE dscuda_kernels)
 
 # Tests and benchmarks share cases and compare numerical results with PyTorch.
 set(DSCUDA_PYTHON "${CMAKE_CURRENT_SOURCE_DIR}/.venv/bin/python" CACHE FILEPATH "Python from uv sync")
 if(EXISTS "${DSCUDA_PYTHON}")
-    foreach(name matmul grouped_gemm flash_attention mla expert_dispatch)
+    add_test(NAME moe_reference COMMAND ${DSCUDA_PYTHON} -m unittest discover -s tests -p test_moe_reference.py)
+    set_tests_properties(moe_reference PROPERTIES WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
+    foreach(name matmul grouped_gemm flash_attention mla)
         add_test(NAME ${name} COMMAND ${DSCUDA_PYTHON}
             ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks/run.py ${name} --test)
         set_tests_properties(${name} PROPERTIES RESOURCE_LOCK gpu)
