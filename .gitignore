@@ -11,4 +11,5 @@ __pycache__/
 !/docker/Dockerfile.vast
 /docs
 /tools
-/scripts
+/scripts/*
+!/scripts/benchmark_moe.sh

@@ -4,7 +4,7 @@ import importlib
 
 from common import measure, record, save_report, torch
 
-NATIVE = ("matmul", "grouped_gemm", "flash_attention", "mla", "expert_dispatch")
+NATIVE = ("matmul", "grouped_gemm", "flash_attention", "mla")
 FAMILIES = NATIVE
 
 

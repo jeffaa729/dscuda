@@ -5,7 +5,7 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 python_bin="${DSCUDA_PYTHON:-$repo_root/.venv/bin/python}"
 if [[ $# == 0 || "$1" == "--help" || "$1" == "-h" ]]; then
     echo "usage: bash scripts/benchmark.sh FAMILY [quick|full|h100] [options]"
-    echo "families: matmul, grouped_gemm, flash_attention, mla, expert_dispatch, all"
+    echo "families: matmul, grouped_gemm, flash_attention, mla, all"
     echo "options: --reference pytorch|cublas|deepgemm|fa2|fa3|fa4|flashmla|both|all, --operation NAME"
     echo "matmul: cuBLAS is the only reference"
     echo "grouped_gemm: quick/full default to cuBLAS; h100 defaults to cuBLAS and DeepGEMM"
